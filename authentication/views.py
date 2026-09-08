@@ -27,6 +27,8 @@ from .serializers import (
     LogoutInputSerializer,
     TokenRefreshInputSerializer,
     UserSerializer,
+    RegisterSerializer,
+    PasswordLoginSerializer,
 )
 from .services import GoogleAuthService, InvalidGoogleTokenException
 
@@ -207,6 +209,54 @@ class GoogleLoginView(APIView):
         )
 
 
+class RegisterView(APIView):
+    """Registo de novo utilizador."""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        serializer = RegisterSerializer(data=request.data)
+        if serializer.is_valid():
+            user = serializer.save()
+            tokens = get_tokens_for_user(user)
+            user_data = UserSerializer(user).data
+            return Response(
+                {
+                    "access": tokens["access"],
+                    "refresh": tokens["refresh"],
+                    "is_new_user": True,
+                    "user": user_data,
+                },
+                status=status.HTTP_201_CREATED,
+            )
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class PasswordLoginView(APIView):
+    """Login com Email e Senha."""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        serializer = PasswordLoginSerializer(data=request.data, context={"request": request})
+        if serializer.is_valid():
+            user = serializer.validated_data["user"]
+            tokens = get_tokens_for_user(user)
+            user_data = UserSerializer(user).data
+            return Response(
+                {
+                    "access": tokens["access"],
+                    "refresh": tokens["refresh"],
+                    "is_new_user": False,
+                    "user": user_data,
+                },
+                status=status.HTTP_200_OK,
+            )
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
 class TokenRefreshView(APIView):
     """Renovação do access token."""
 
@@ -256,8 +306,13 @@ class TokenRefreshView(APIView):
 
         try:
             token = RefreshToken(refresh_token)
-            new_access = str(token.access_token)
-            return Response({"access": new_access}, status=status.HTTP_200_OK)
+            token.blacklist()
+            user = User.objects.get(id=token["user_id"])
+            new_token = RefreshToken.for_user(user)
+            return Response({
+                "access": str(new_token.access_token),
+                "refresh": str(new_token)
+            }, status=status.HTTP_200_OK)
         except Exception as e:
             logger.warning(f"Refresh token inválido: {e}")
             return Response(

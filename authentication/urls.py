@@ -9,6 +9,8 @@ from .views import (
     LogoutView,
     MeView,
     TokenRefreshView,
+    RegisterView,
+    PasswordLoginView,
 )
 
 app_name = "authentication"
@@ -17,6 +19,10 @@ router = DefaultRouter()
 router.register(r"crm/customers", CustomerCRMViewSet, basename="crm-customers")
 
 urlpatterns = [
+    # POST - Registo de novo utilizador
+    path("register/", RegisterView.as_view(), name="register"),
+    # POST - Login com email e senha
+    path("login/", PasswordLoginView.as_view(), name="login"),
     # POST - Recebe id_token do Google e retorna JWT + dados do user
     path("google/", GoogleLoginView.as_view(), name="google-login"),
     # POST - Renova o access token com o refresh token
