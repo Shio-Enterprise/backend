@@ -1,6 +1,5 @@
-from rest_framework import serializers
-
 from orders.models import CustomerOrder
+from rest_framework import serializers
 
 from .models import Address, User, UserProfile
 
@@ -22,13 +21,24 @@ class UserSerializer(serializers.ModelSerializer):
             "email",
             "name",
             "avatar_url",
+            "is_staff",
+            "is_superuser",
+            "is_admin",
             "is_new_user",
             "phone_number",
             "cpf",
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "email", "created_at", "updated_at"]
+        read_only_fields = [
+            "id",
+            "email",
+            "is_staff",
+            "is_superuser",
+            "is_admin",
+            "created_at",
+            "updated_at",
+        ]
 
     def update(self, instance, validated_data):
         profile_data = validated_data.pop("profile", {})
