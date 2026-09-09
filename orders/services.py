@@ -1,4 +1,4 @@
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from uuid import UUID
 
 import requests
@@ -6,7 +6,12 @@ from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 from django.shortcuts import get_object_or_404
+from rest_framework.exceptions import APIException, ValidationError
 
+from orders.correios import (
+    fetch_shipping_deadline_by_service_and_ceps,
+    fetch_shipping_price_by_service_and_ceps,
+)
 from orders.models import (
     Cart,
     CartItem,
@@ -16,6 +21,116 @@ from orders.models import (
     PaymentStatus,
 )
 from products.models import ProductVariation
+
+
+def normalize_money(value):
+    """Valida reais e arredonda centavos sem passar por ponto flutuante."""
+    try:
+        amount = Decimal(str(value).replace(",", "."))
+        if not amount.is_finite() or amount < 0:
+            raise ValueError("Valor monetário inválido.")
+        amount = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        if amount > Decimal("99999999.99"):
+            raise ValueError("Valor monetário acima do limite.")
+        return amount
+    except (InvalidOperation, TypeError) as exc:
+        raise ValueError("Valor monetário inválido.") from exc
+
+
+def money_to_cents(value):
+    return int(normalize_money(value) * Decimal("100"))
+
+
+class CheckoutShippingUnavailable(APIException):
+    status_code = 503
+    default_detail = "Serviço de cálculo de frete temporariamente indisponível."
+    default_code = "shipping_unavailable"
+
+
+def calculate_checkout(user, address_id):
+    """Calcula a compra atual sem salvar cotação, pedido ou alterar estoque."""
+    cart = Cart.objects.filter(user=user, status="ACTIVE").first()
+    if not cart:
+        raise ValidationError({"message": "Carrinho vazio."})
+    cart_items = list(cart.items.select_related("variation__product"))
+    if not cart_items:
+        raise ValidationError({"message": "Carrinho vazio."})
+    address = user.addresses.filter(id=address_id).first()
+    if not address:
+        raise ValidationError({"message": "Endereço inválido."})
+
+    items = []
+    subtotal = Decimal("0.00")
+    for item in cart_items:
+        variation = item.variation
+        if item.quantity < 1 or variation.stock_quantity < item.quantity:
+            raise ValidationError(
+                {"message": f"Estoque insuficiente para {variation.product.name}."}
+            )
+        try:
+            unit_price = normalize_money(variation.product.base_price)
+            total_price = normalize_money(unit_price * item.quantity)
+            subtotal = normalize_money(subtotal + total_price)
+        except ValueError as exc:
+            raise ValidationError({"message": "Preço de produto inválido."}) from exc
+        items.append(
+            {
+                "variation": variation,
+                "variation_id": variation.id,
+                "product_id": variation.product_id,
+                "product_name": variation.product.name,
+                "size": variation.size,
+                "sku": variation.sku,
+                "stock_quantity": variation.stock_quantity,
+                "quantity": item.quantity,
+                "unit_price": unit_price,
+                "total_price": total_price,
+            }
+        )
+
+    destination = address.zip_code.replace("-", "").strip()
+    if len(destination) != 8 or not destination.isdigit():
+        raise ValidationError({"message": "CEP do endereço inválido."})
+    origin = settings.CORREIOS_REMETENTE_CEP.replace("-", "").strip()
+    try:
+        if len(origin) != 8 or not origin.isdigit():
+            raise ValueError("CEP do remetente inválido.")
+        price = fetch_shipping_price_by_service_and_ceps(
+            settings.CORREIOS_CODIGO_SERVICO,
+            origin,
+            destination,
+            settings.CORREIOS_PESO_PADRAO_GRAMAS,
+        )
+        shipping_cost = normalize_money(price["pcFinal"])
+        deadline = fetch_shipping_deadline_by_service_and_ceps(
+            settings.CORREIOS_CODIGO_SERVICO,
+            origin,
+            destination,
+        )
+        deadline_days = deadline.get("prazoEntrega")
+        if deadline_days is not None:
+            deadline_days = int(deadline_days)
+            if deadline_days < 0:
+                raise ValueError("Prazo de entrega inválido.")
+    except Exception as exc:
+        raise CheckoutShippingUnavailable() from exc
+
+    # Desconto PIX em espera: nenhuma promoção é aplicada apenas pela interface.
+    discount_amount = Decimal("0.00")
+    try:
+        total_amount = normalize_money(subtotal + shipping_cost - discount_amount)
+    except ValueError as exc:
+        raise ValidationError({"message": "Total do pedido acima do limite."}) from exc
+    return {
+        "cart": cart,
+        "address": address,
+        "items": items,
+        "subtotal": subtotal,
+        "shipping_cost": shipping_cost,
+        "discount_amount": discount_amount,
+        "total_amount": total_amount,
+        "prazo_dias": deadline_days,
+    }
 
 
 def create_infinitepay_checkout(order, request):
@@ -29,7 +144,7 @@ def create_infinitepay_checkout(order, request):
         items_data.append(
             {
                 "quantity": item.quantity,
-                "price": int(item.unit_price * 100),
+                "price": money_to_cents(item.unit_price),
                 "description": item.product_name,
             }
         )
@@ -38,7 +153,7 @@ def create_infinitepay_checkout(order, request):
         items_data.append(
             {
                 "quantity": 1,
-                "price": int(order.shipping_cost * 100),
+                "price": money_to_cents(order.shipping_cost),
                 "description": "Frete",
             }
         )

@@ -1,7 +1,9 @@
 import uuid
+from decimal import Decimal
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.test import override_settings
 from rest_framework import status
 from rest_framework.test import APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -52,13 +54,32 @@ class CheckoutAPITests(APITestCase):
         )
 
         self.url = "/api/orders/checkout/"
+        shipping_patch = patch(
+            "orders.services.fetch_shipping_price_by_service_and_ceps"
+        )
+        self.mock_shipping = shipping_patch.start()
+        self.addCleanup(shipping_patch.stop)
+        self.mock_shipping.return_value = {"pcFinal": "15,00"}
+        deadline_patch = patch(
+            "orders.services.fetch_shipping_deadline_by_service_and_ceps"
+        )
+        self.mock_deadline = deadline_patch.start()
+        self.addCleanup(deadline_patch.stop)
+        self.mock_deadline.return_value = {"prazoEntrega": 3}
+        shipping_settings = override_settings(
+            CORREIOS_REMETENTE_CEP="70000000",
+            CORREIOS_CODIGO_SERVICO="03220",
+            CORREIOS_PESO_PADRAO_GRAMAS="300",
+        )
+        shipping_settings.enable()
+        self.addCleanup(shipping_settings.disable)
 
     @patch("orders.views.create_infinitepay_checkout")
     def test_checkout_sucesso_gera_pedido_e_reduz_estoque(self, mock_create_checkout):
         """Deve retornar 201, criar o pedido, finalizar o carrinho e deduzir estoque."""
         mock_create_checkout.return_value = "https://pay.infinitepay.io/mock-url"
 
-        payload = {"address_id": str(self.address.id), "shipping_cost": 15.00}
+        payload = {"address_id": str(self.address.id)}
 
         response = self.client.post(self.url, payload, format="json")
 
@@ -81,7 +102,7 @@ class CheckoutAPITests(APITestCase):
         """Deve retornar 400 se o usuário não tiver itens no carrinho ativo."""
         self.cart.items.all().delete()
 
-        payload = {"address_id": str(self.address.id), "shipping_cost": 15.00}
+        payload = {"address_id": str(self.address.id)}
 
         response = self.client.post(self.url, payload, format="json")
 
@@ -93,7 +114,7 @@ class CheckoutAPITests(APITestCase):
         self.cart_item.quantity = 20
         self.cart_item.save()
 
-        payload = {"address_id": str(self.address.id), "shipping_cost": 15.00}
+        payload = {"address_id": str(self.address.id)}
 
         response = self.client.post(self.url, payload, format="json")
 
@@ -110,7 +131,7 @@ class CheckoutAPITests(APITestCase):
         """Deve proteger o banco de dados se a API da InfinitePay cair."""
         mock_create_checkout.side_effect = Exception("InfinitePay Timeout")
 
-        payload = {"address_id": str(self.address.id), "shipping_cost": 15.00}
+        payload = {"address_id": str(self.address.id)}
 
         response = self.client.post(self.url, payload, format="json")
 
@@ -119,6 +140,146 @@ class CheckoutAPITests(APITestCase):
 
         self.variation.refresh_from_db()
         self.assertEqual(self.variation.stock_quantity, 10)
+
+    def test_rejeita_valores_e_parametros_logisticos_do_cliente(self):
+        for field in (
+            "shipping_cost",
+            "subtotal",
+            "discount_amount",
+            "total_amount",
+            "cep_origem",
+            "peso",
+            "codigo_servico",
+        ):
+            for url in (self.url, "/api/orders/checkout/calculate/"):
+                with self.subTest(field=field, url=url):
+                    response = self.client.post(
+                        url,
+                        {"address_id": str(self.address.id), field: -100},
+                        format="json",
+                    )
+                    self.assertEqual(response.status_code, 400)
+                    self.assertIn(field, response.data)
+        self.assertEqual(CustomerOrder.objects.count(), 0)
+        self.mock_shipping.assert_not_called()
+
+    def test_calculo_reconsulta_preco_e_nao_altera_carrinho_ou_estoque(self):
+        self.product.base_price = Decimal("19.99")
+        self.product.save()
+        self.mock_shipping.return_value = {"pcFinal": "19,92"}
+        response = self.client.post(
+            "/api/orders/checkout/calculate/",
+            {"address_id": str(self.address.id)},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["subtotal"], "39.98")
+        self.assertEqual(response.data["shipping_cost"], "19.92")
+        self.assertEqual(response.data["prazo_dias"], 3)
+        self.assertEqual(response.data["discount_amount"], "0.00")
+        self.assertEqual(response.data["total_amount"], "59.90")
+        self.assertEqual(response.data["items"][0]["unit_price"], "19.99")
+        self.assertEqual(CustomerOrder.objects.count(), 0)
+        self.cart.refresh_from_db()
+        self.cart_item.refresh_from_db()
+        self.variation.refresh_from_db()
+        self.assertEqual(self.cart.status, "ACTIVE")
+        self.assertEqual(self.cart_item.unit_price, Decimal("100.00"))
+        self.assertEqual(self.variation.stock_quantity, 10)
+        self.mock_shipping.assert_called_once_with(
+            "03220", "70000000", "71000000", "300"
+        )
+
+    @patch("orders.services.requests.post")
+    def test_calculo_pedido_e_gateway_usam_mesmos_valores(self, mock_post):
+        self.product.base_price = Decimal("19.99")
+        self.product.save()
+        self.mock_shipping.return_value = {"pcFinal": "19,92"}
+        mock_post.return_value.json.return_value = {
+            "url": "https://pay.infinitepay.io/mock-url"
+        }
+        preview = self.client.post(
+            "/api/orders/checkout/calculate/",
+            {"address_id": str(self.address.id)},
+            format="json",
+        )
+        response = self.client.post(
+            self.url, {"address_id": str(self.address.id)}, format="json"
+        )
+        self.assertEqual(response.status_code, 201)
+        order = CustomerOrder.objects.get()
+        self.assertEqual(order.total_amount, Decimal(preview.data["total_amount"]))
+        self.assertEqual(order.payment.total_amount, Decimal("59.90"))
+        self.assertEqual(order.items.get().unit_price, Decimal("19.99"))
+        sent = mock_post.call_args.kwargs["json"]["items"]
+        self.assertEqual(sent[0]["price"], 1999)
+        self.assertEqual(sent[1]["price"], 1992)
+        self.assertEqual(sum(i["quantity"] * i["price"] for i in sent), 5990)
+
+    @patch("orders.views.create_infinitepay_checkout")
+    def test_frete_invalido_ou_indisponivel_nao_cria_pedido(self, mock_gateway):
+        for price in (
+            {},
+            {"pcFinal": None},
+            {"pcFinal": "NaN"},
+            {"pcFinal": "Infinity"},
+            {"pcFinal": "-1"},
+            {"pcFinal": "abc"},
+        ):
+            with self.subTest(price=price):
+                self.mock_shipping.return_value = price
+                response = self.client.post(
+                    self.url, {"address_id": str(self.address.id)}, format="json"
+                )
+                self.assertEqual(response.status_code, 503)
+        self.mock_shipping.side_effect = TimeoutError()
+        response = self.client.post(
+            self.url, {"address_id": str(self.address.id)}, format="json"
+        )
+        self.assertEqual(response.status_code, 503)
+        mock_gateway.assert_not_called()
+        self.assertEqual(CustomerOrder.objects.count(), 0)
+        self.cart.refresh_from_db()
+        self.variation.refresh_from_db()
+        self.assertEqual(self.cart.status, "ACTIVE")
+        self.assertEqual(self.variation.stock_quantity, 10)
+
+    def test_rejeita_endereco_invalido_ou_de_outro_usuario(self):
+        other = User.objects.create_user(email="outro@checkout.test", name="Outro")
+        self.address.user = other
+        self.address.save()
+        for address_id in (str(self.address.id), "nao-e-uuid"):
+            for url in (self.url, "/api/orders/checkout/calculate/"):
+                with self.subTest(address=address_id, url=url):
+                    response = self.client.post(
+                        url, {"address_id": address_id}, format="json"
+                    )
+                    self.assertEqual(response.status_code, 400)
+        self.mock_shipping.assert_not_called()
+
+    def test_calculo_exige_autenticacao(self):
+        self.client.force_authenticate(user=None)
+        for url in (self.url, "/api/orders/checkout/calculate/"):
+            response = self.client.post(
+                url, {"address_id": str(self.address.id)}, format="json"
+            )
+            self.assertEqual(response.status_code, 401)
+
+    def test_frete_zero_explicito_e_arredondamento(self):
+        for raw, expected in (
+            ("0.00", "200.00"),
+            ("0.005", "200.01"),
+            ("19,925", "219.93"),
+        ):
+            with self.subTest(raw=raw):
+                self.mock_shipping.return_value = {"pcFinal": raw}
+                response = self.client.post(
+                    "/api/orders/checkout/calculate/",
+                    {"address_id": str(self.address.id)},
+                    format="json",
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.data["total_amount"], expected)
 
 
 class PaymentSuccessRedirectTests(APITestCase):
@@ -713,6 +874,7 @@ class OrderDispatchViewTests(APITestCase):
         self.assertEqual(self.order.status, OrderStatus.SHIPPED)
 
         from orders.models import OrderStatusLog
+
         log = OrderStatusLog.objects.filter(order=self.order).first()
         self.assertIsNotNone(log)
         self.assertEqual(log.new_status, OrderStatus.SHIPPED)
@@ -813,6 +975,7 @@ class CepLookupViewTests(APITestCase):
     @patch("orders.correios_views.fetch_address_data_by_cep")
     def test_cep_inexistente_retorna_404(self, mock_fetch):
         from orders.correios import CorreiosCepNotFoundError
+
         mock_fetch.side_effect = CorreiosCepNotFoundError("CEP não encontrado")
 
         response = self.client.get(self.cep_url("00000000"))
@@ -829,7 +992,9 @@ class CepLookupViewTests(APITestCase):
 class ShippingOptionsViewTests(APITestCase):
     def setUp(self):
         self.user = User.objects.create_user(
-            email="frete_user@shio.com", name="Usuario Frete", password="senha_forte_123"
+            email="frete_user@shio.com",
+            name="Usuario Frete",
+            password="senha_forte_123",
         )
         self.url = "/api/orders/correios/frete/"
 

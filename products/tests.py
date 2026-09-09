@@ -620,6 +620,12 @@ class ProductListTests(APITestCase):
 
     def test_ordering_por_created_at_desc(self):
         """Mais recente primeiro."""
+        # Datas explícitas evitam empates quando a criação ocorre no mesmo instante.
+        now = timezone.now()
+        Product.objects.filter(pk=self.ativo.pk).update(
+            created_at=now - timedelta(seconds=1)
+        )
+        Product.objects.filter(name="Camisa Preta").update(created_at=now)
         response = self.client.get(self.url)
         results = response.json()["results"]
         ids_returned = [r["id"] for r in results]
@@ -704,8 +710,18 @@ class ProductCreateTests(APITestCase):
                 "description": "Algodão",
                 "base_price": "120.00",
                 "variations": [
-                    {"size": "P", "color": "Azul", "sku": "CAM-P", "stock_quantity": 10},
-                    {"size": "M", "color": "Vermelho", "sku": "CAM-M", "stock_quantity": 5},
+                    {
+                        "size": "P",
+                        "color": "Azul",
+                        "sku": "CAM-P",
+                        "stock_quantity": 10,
+                    },
+                    {
+                        "size": "M",
+                        "color": "Vermelho",
+                        "sku": "CAM-M",
+                        "stock_quantity": 5,
+                    },
                 ],
             },
             format="json",

@@ -9,6 +9,7 @@ from .views import (
     CartItemAddAPIView,
     CartItemDetailAPIView,
     CheckoutAPIView,
+    CheckoutCalculationView,
     OrderDispatchView,
     OrderTrackingView,
     PaymentSuccessRedirectView,
@@ -21,6 +22,11 @@ app_name = "orders"
 urlpatterns = [
     path("dashboard/summary/", AdminDashboardView.as_view(), name="dashboard_summary"),
     path("checkout/", CheckoutAPIView.as_view(), name="checkout"),
+    path(
+        "checkout/calculate/",
+        CheckoutCalculationView.as_view(),
+        name="checkout-calculate",
+    ),
     path(
         "pagamento-sucesso/",
         PaymentSuccessRedirectView.as_view(),

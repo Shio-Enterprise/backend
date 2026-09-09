@@ -28,7 +28,6 @@ from .correios import (
     get_order_tracking_data,
 )
 from .models import (
-    Cart,
     CustomerOrder,
     OrderItem,
     OrderStatus,
@@ -39,6 +38,8 @@ from .serializers import (
     CartItemAddSerializer,
     CartItemUpdateSerializer,
     CartRepresentationSerializer,
+    CheckoutCalculationSerializer,
+    CheckoutInputSerializer,
     DashboardLowStockSerializer,
     DashboardRecentOrderSerializer,
     OrderDetailSerializer,
@@ -46,6 +47,7 @@ from .serializers import (
 )
 from .services import (
     add_item_to_cart,
+    calculate_checkout,
     check_payment_status,
     clear_cart,
     create_infinitepay_checkout,
@@ -320,6 +322,28 @@ class AdminOrderDetailView(APIView):
         return Response(OrderDetailSerializer(order).data, status=status.HTTP_200_OK)
 
 
+class CheckoutCalculationView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        summary="Calcular valores atuais da compra",
+        description="Calcula preços e frete no servidor, sem criar cotação persistida ou pedido.",
+        request=CheckoutInputSerializer,
+        responses={
+            200: CheckoutCalculationSerializer,
+            400: OpenApiTypes.OBJECT,
+            503: OpenApiTypes.OBJECT,
+        },
+    )
+    def post(self, request):
+        serializer = CheckoutInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        calculation = calculate_checkout(
+            request.user, serializer.validated_data["address_id"]
+        )
+        return Response(CheckoutCalculationSerializer(calculation).data)
+
+
 class CheckoutAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -330,73 +354,34 @@ class CheckoutAPIView(APIView):
             "Gera o pedido (CustomerOrder), faz o snapshot do endereço de entrega e debita o estoque. "
             "Por fim, comunica-se com a API da InfinitePay para gerar o link de checkout.\n\n"
             "**Fluxo:**\n"
-            "1. Envie o `address_id` (UUID do endereço do perfil) e o `shipping_cost`.\n"
-            "2. O backend valida os itens e gera a cobrança.\n"
+            "1. Envie somente `address_id` (UUID do endereço do perfil).\n"
+            "2. O backend recalcula preços e frete e gera a cobrança.\n"
             "3. O utilizador é redirecionado para a `checkout_url` retornada."
         ),
-        request={
-            "application/json": {
-                "type": "object",
-                "properties": {
-                    "address_id": {
-                        "type": "string",
-                        "format": "uuid",
-                        "description": "UUID do endereço de entrega salvo no perfil",
-                    },
-                    "shipping_cost": {
-                        "type": "number",
-                        "format": "float",
-                        "description": "Valor calculado do frete (em Reais)",
-                    },
-                },
-                "required": ["address_id"],
-            }
-        },
+        request=CheckoutInputSerializer,
         responses={
             201: OpenApiTypes.OBJECT,
             400: OpenApiTypes.OBJECT,
             500: OpenApiTypes.OBJECT,
+            503: OpenApiTypes.OBJECT,
         },
     )
     @transaction.atomic
     def post(self, request):
         user = request.user
-        cart = (
-            Cart.objects.filter(user=user, status="ACTIVE")
-            .prefetch_related("items__variation__product")
-            .first()
-        )
-
-        if not cart or not cart.items.exists():
-            return Response(
-                {"success": False, "message": "Carrinho vazio."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        address_id = request.data.get("address_id")
-        if not address_id:
-            return Response(
-                {"success": False, "message": "Endereço não informado."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        address = user.addresses.filter(id=address_id).first()
-        if not address:
-            return Response(
-                {"success": False, "message": "Endereço inválido."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        subtotal = sum(item.quantity * item.unit_price for item in cart.items.all())
-        shipping_cost = request.data.get("shipping_cost", 0.00)
-        total_amount = float(subtotal) + float(shipping_cost)
+        serializer = CheckoutInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        calculation = calculate_checkout(user, serializer.validated_data["address_id"])
+        cart = calculation["cart"]
+        address = calculation["address"]
 
         order = CustomerOrder.objects.create(
             user=user,
             address=address,
-            subtotal=subtotal,
-            shipping_cost=shipping_cost,
-            total_amount=total_amount,
+            subtotal=calculation["subtotal"],
+            shipping_cost=calculation["shipping_cost"],
+            discount_amount=calculation["discount_amount"],
+            total_amount=calculation["total_amount"],
             shipping_zip_code=address.zip_code,
             shipping_street=address.street,
             shipping_number=address.address_number,
@@ -406,27 +391,18 @@ class CheckoutAPIView(APIView):
             shipping_state=address.state,
         )
 
-        for item in cart.items.all():
-            if item.variation.stock_quantity < item.quantity:
-                transaction.set_rollback(True)
-                return Response(
-                    {
-                        "success": False,
-                        "message": f"Estoque insuficiente para {item.variation.product.name}.",
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            item.variation.stock_quantity -= item.quantity
-            item.variation.save()
+        for item in calculation["items"]:
+            variation = item["variation"]
+            variation.stock_quantity -= item["quantity"]
+            variation.save()
 
             OrderItem.objects.create(
                 order=order,
-                variation=item.variation,
-                quantity=item.quantity,
-                unit_price=item.unit_price,
-                product_name=f"{item.variation.product.name} - {item.variation.size}",
-                sku_snapshot=item.variation.sku,
+                variation=variation,
+                quantity=item["quantity"],
+                unit_price=item["unit_price"],
+                product_name=f"{variation.product.name} - {variation.size}",
+                sku_snapshot=variation.sku,
             )
 
         cart.status = "FINISHED"
@@ -666,7 +642,7 @@ class OrderDispatchView(APIView):
             "Restrito a administradores. Use este endpoint em vez do PATCH de rastreio manual "
             "quando quiser que o sistema gere o código automaticamente."
         ),
-        request=None, 
+        request=None,
         responses={
             200: OpenApiTypes.OBJECT,
             400: OpenApiTypes.OBJECT,
@@ -887,5 +863,3 @@ class CartItemDetailAPIView(APIView):
         return Response(
             CartRepresentationSerializer(cart_data).data, status=status.HTTP_200_OK
         )
-
-
