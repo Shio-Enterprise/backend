@@ -1,10 +1,15 @@
 import uuid
+from datetime import timedelta
 from decimal import Decimal
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.core.exceptions import ImproperlyConfigured
+from django.db import IntegrityError, transaction
 from django.test import override_settings
+from django.utils import timezone
 from rest_framework import status
+from rest_framework.exceptions import ValidationError
 from rest_framework.test import APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
@@ -17,6 +22,12 @@ from orders.models import (
     OrderStatus,
     Payment,
     PaymentStatus,
+    ShippingQuote,
+)
+from orders.services import (
+    CheckoutShippingUnavailable,
+    create_shipping_quote,
+    validate_shipping_quote,
 )
 from products.models import Category, Product, ProductVariation
 
@@ -280,6 +291,348 @@ class CheckoutAPITests(APITestCase):
                 )
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(response.data["total_amount"], expected)
+
+
+@override_settings(
+    CORREIOS_MOCK_ENABLED=False,
+    CORREIOS_REMETENTE_CEP="70000000",
+    CORREIOS_CODIGO_SERVICO="03220",
+    CORREIOS_PESO_PADRAO_GRAMAS="300",
+    SHIPPING_QUOTE_TTL_SECONDS=900,
+)
+class ShippingQuoteTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(email="cotacao@shio.com", name="Cliente")
+        self.other_user = User.objects.create_user(email="outro@shio.com", name="Outro")
+        self.address = Address.objects.create(
+            user=self.user,
+            zip_code="71000000",
+            street="Rua Teste",
+            address_number="123",
+            neighborhood="Centro",
+            city="Brasília",
+            state="DF",
+        )
+        self.product = Product.objects.create(
+            name="Camiseta", base_price=Decimal("19.99")
+        )
+        self.variation = ProductVariation.objects.create(
+            product=self.product, size="M", sku="COTACAO-M", stock_quantity=10
+        )
+        self.cart = Cart.objects.create(user=self.user)
+        self.cart_item = CartItem.objects.create(
+            cart=self.cart,
+            variation=self.variation,
+            quantity=2,
+            unit_price=Decimal("10.00"),
+        )
+        for target, value, attr in (
+            (
+                "fetch_shipping_price_by_service_and_ceps",
+                {"pcFinal": "15,005"},
+                "mock_price",
+            ),
+            (
+                "fetch_shipping_deadline_by_service_and_ceps",
+                {"prazoEntrega": 3},
+                "mock_deadline",
+            ),
+        ):
+            patcher = patch(f"orders.services.{target}", return_value=value)
+            setattr(self, attr, patcher.start())
+            self.addCleanup(patcher.stop)
+
+    def assert_quote_rejected(self, quote, code, **kwargs):
+        arguments = {
+            "user": self.user,
+            "quote_id": quote.pk,
+            "cart_id": self.cart.pk,
+            "address_id": self.address.pk,
+            **kwargs,
+        }
+        with self.assertRaises(ValidationError) as error:
+            validate_shipping_quote(**arguments)
+        self.assertEqual(error.exception.get_codes()["shipping_quote_id"], code)
+
+    def test_persiste_valores_do_servidor_sem_alterar_compra(self):
+        now = timezone.now()
+        with patch("orders.services.timezone.now", return_value=now):
+            quote = create_shipping_quote(self.user, self.address.pk)
+        quote.refresh_from_db()
+        self.assertEqual(quote.user_id, self.user.pk)
+        self.assertEqual(quote.cart_id, self.cart.pk)
+        self.assertEqual(quote.address_id, self.address.pk)
+        self.assertEqual(quote.subtotal, Decimal("39.98"))
+        self.assertEqual(quote.shipping_cost, Decimal("15.01"))
+        self.assertEqual(quote.discount_amount, Decimal("0.00"))
+        self.assertEqual(quote.total_amount, Decimal("54.99"))
+        self.assertEqual(quote.prazo_dias, 3)
+        self.assertEqual(quote.expires_at, now + timedelta(minutes=15))
+        self.assertIsNone(quote.invalidated_at)
+        self.cart.refresh_from_db()
+        self.cart_item.refresh_from_db()
+        self.variation.refresh_from_db()
+        self.assertEqual(self.cart.status, "ACTIVE")
+        self.assertEqual(self.cart_item.unit_price, Decimal("10.00"))
+        self.assertEqual(self.cart_item.quantity, 2)
+        self.assertEqual(self.variation.stock_quantity, 10)
+        self.assertFalse(CustomerOrder.objects.exists())
+        self.assertFalse(Payment.objects.exists())
+        self.mock_price.assert_called_once_with("03220", "70000000", "71000000", "300")
+
+    def test_validacao_reutiliza_valores_sem_chamar_correios(self):
+        quote = create_shipping_quote(self.user, self.address.pk)
+        self.mock_price.reset_mock()
+        self.mock_deadline.reset_mock()
+        validated = validate_shipping_quote(
+            self.user, str(quote.pk), str(self.cart.pk), str(self.address.pk)
+        )
+        self.assertEqual(validated.pk, quote.pk)
+        self.assertEqual(validated.total_amount, quote.total_amount)
+        self.assertEqual(ShippingQuote.objects.count(), 1)
+        self.mock_price.assert_not_called()
+        self.mock_deadline.assert_not_called()
+
+    @override_settings(SHIPPING_QUOTE_TTL_SECONDS=60)
+    def test_validade_configuravel_e_limite_exato(self):
+        now = timezone.now()
+        with patch("orders.services.timezone.now", return_value=now):
+            quote = create_shipping_quote(self.user, self.address.pk)
+        self.assertEqual(quote.expires_at, now + timedelta(seconds=60))
+        with patch(
+            "orders.services.timezone.now",
+            return_value=quote.expires_at - timedelta(microseconds=1),
+        ):
+            validate_shipping_quote(self.user, quote.pk, self.cart.pk, self.address.pk)
+        for elapsed in (0, 1):
+            with (
+                self.subTest(elapsed=elapsed),
+                patch(
+                    "orders.services.timezone.now",
+                    return_value=quote.expires_at + timedelta(seconds=elapsed),
+                ),
+            ):
+                self.assert_quote_rejected(quote, "quote_expired")
+
+    def test_rejeita_configuracao_de_validade_invalida(self):
+        for ttl in (0, -1, True, "900", 1.5):
+            with (
+                self.subTest(ttl=ttl),
+                override_settings(SHIPPING_QUOTE_TTL_SECONDS=ttl),
+            ):
+                with self.assertRaises(ImproperlyConfigured):
+                    create_shipping_quote(self.user, self.address.pk)
+        self.mock_price.assert_not_called()
+        self.assertFalse(ShippingQuote.objects.exists())
+
+    def test_rejeita_outro_usuario_e_id_invalido_sem_expor_cotacao(self):
+        quote = create_shipping_quote(self.user, self.address.pk)
+        self.assert_quote_rejected(quote, "quote_invalid", user=self.other_user)
+        for quote_id in (uuid.uuid4(), "invalido", None):
+            with self.subTest(quote_id=quote_id):
+                self.assert_quote_rejected(quote, "quote_invalid", quote_id=quote_id)
+        quote.refresh_from_db()
+        self.assertIsNone(quote.invalidated_at)
+
+    def test_rejeita_cotacao_para_outro_carrinho_ou_endereco(self):
+        quote = create_shipping_quote(self.user, self.address.pk)
+        cart = Cart.objects.create(user=self.user)
+        address = Address.objects.create(
+            user=self.user,
+            zip_code=self.address.zip_code,
+            street="Outra rua",
+            address_number="456",
+            neighborhood="Centro",
+            city="Brasília",
+            state="DF",
+        )
+        self.assert_quote_rejected(quote, "quote_mismatch", cart_id=cart.pk)
+        self.assert_quote_rejected(quote, "quote_mismatch", address_id=address.pk)
+
+    def test_invalida_alteracao_de_quantidade_e_nao_reativa(self):
+        quote = create_shipping_quote(self.user, self.address.pk)
+        CartItem.objects.filter(pk=self.cart_item.pk).update(quantity=3)
+        self.assert_quote_rejected(quote, "quote_changed")
+        quote.refresh_from_db()
+        self.assertIsNotNone(quote.invalidated_at)
+        self.assertEqual(quote.total_amount, Decimal("54.99"))
+        CartItem.objects.filter(pk=self.cart_item.pk).update(quantity=2)
+        self.assert_quote_rejected(quote, "quote_invalidated")
+
+    def test_detecta_edicao_revertida_antes_de_validar(self):
+        quote = create_shipping_quote(self.user, self.address.pk)
+        self.cart_item.quantity = 3
+        self.cart_item.save()
+        self.cart_item.quantity = 2
+        self.cart_item.save()
+        self.assert_quote_rejected(quote, "quote_changed")
+
+    def test_invalida_adicao_e_remocao_de_itens(self):
+        quote = create_shipping_quote(self.user, self.address.pk)
+        variation = ProductVariation.objects.create(
+            product=self.product, size="G", sku="COTACAO-G", stock_quantity=5
+        )
+        item = CartItem.objects.create(
+            cart=self.cart,
+            variation=variation,
+            quantity=1,
+            unit_price=self.product.base_price,
+        )
+        self.assert_quote_rejected(quote, "quote_changed")
+        quote = create_shipping_quote(self.user, self.address.pk)
+        item.delete()
+        self.assert_quote_rejected(quote, "quote_changed")
+
+    def test_invalida_alteracao_de_preco(self):
+        quote = create_shipping_quote(self.user, self.address.pk)
+        Product.objects.filter(pk=self.product.pk).update(base_price=Decimal("20.00"))
+        self.assert_quote_rejected(quote, "quote_changed")
+        replacement = create_shipping_quote(self.user, self.address.pk)
+        self.assertNotEqual(replacement.pk, quote.pk)
+        self.assertEqual(replacement.subtotal, Decimal("40.00"))
+        self.assertEqual(replacement.total_amount, Decimal("55.01"))
+
+    def test_invalida_troca_de_variacao_mesmo_com_total_igual(self):
+        quote = create_shipping_quote(self.user, self.address.pk)
+        variation = ProductVariation.objects.create(
+            product=self.product, size="G", sku="COTACAO-G", stock_quantity=10
+        )
+        CartItem.objects.filter(pk=self.cart_item.pk).update(variation=variation)
+        self.assert_quote_rejected(quote, "quote_changed")
+        replacement = create_shipping_quote(self.user, self.address.pk)
+        self.assertEqual(replacement.total_amount, quote.total_amount)
+
+    def test_invalida_edicao_dos_dados_de_entrega(self):
+        for field, value in (
+            ("zip_code", "72000000"),
+            ("street", "Nova rua"),
+            ("address_number", "999"),
+            ("complement", "Apto 10"),
+            ("neighborhood", "Outro bairro"),
+            ("city", "Outra cidade"),
+            ("state", "SP"),
+        ):
+            with self.subTest(field=field):
+                quote = create_shipping_quote(self.user, self.address.pk)
+                Address.objects.filter(pk=self.address.pk).update(**{field: value})
+                self.assert_quote_rejected(quote, "quote_changed")
+
+    def test_invalida_alteracao_de_parametros_do_frete(self):
+        for setting, value in (
+            ("CORREIOS_REMETENTE_CEP", "72000000"),
+            ("CORREIOS_CODIGO_SERVICO", "03298"),
+            ("CORREIOS_PESO_PADRAO_GRAMAS", "600"),
+            ("CORREIOS_API_BASE_URL", "https://correios.example.test"),
+            ("CORREIOS_MOCK_ENABLED", True),
+        ):
+            with self.subTest(setting=setting):
+                quote = create_shipping_quote(self.user, self.address.pk)
+                with override_settings(**{setting: value}):
+                    self.assert_quote_rejected(quote, "quote_changed")
+
+    def test_rejeita_carrinho_finalizado_vazio_ou_sem_estoque(self):
+        quote = create_shipping_quote(self.user, self.address.pk)
+        self.cart.status = "FINISHED"
+        self.cart.save()
+        self.assert_quote_rejected(quote, "quote_changed")
+        self.cart.status = "ACTIVE"
+        self.cart.save()
+        quote = create_shipping_quote(self.user, self.address.pk)
+        ProductVariation.objects.filter(pk=self.variation.pk).update(stock_quantity=1)
+        self.assert_quote_rejected(quote, "quote_changed")
+        ProductVariation.objects.filter(pk=self.variation.pk).update(stock_quantity=10)
+        quote = create_shipping_quote(self.user, self.address.pk)
+        self.cart_item.delete()
+        self.assert_quote_rejected(quote, "quote_changed")
+
+    def test_estoque_suficiente_pode_mudar_sem_reserva(self):
+        quote = create_shipping_quote(self.user, self.address.pk)
+        ProductVariation.objects.filter(pk=self.variation.pk).update(stock_quantity=8)
+        validate_shipping_quote(self.user, quote.pk, self.cart.pk, self.address.pk)
+        self.variation.refresh_from_db()
+        self.assertEqual(self.variation.stock_quantity, 8)
+
+    def test_nao_persiste_cotacao_quando_frete_falha(self):
+        for response in (
+            {},
+            {"pcFinal": None},
+            {"pcFinal": "NaN"},
+            {"pcFinal": "-1.00"},
+        ):
+            with self.subTest(response=response):
+                self.mock_price.return_value = response
+                with self.assertRaises(CheckoutShippingUnavailable):
+                    create_shipping_quote(self.user, self.address.pk)
+        self.mock_price.side_effect = TimeoutError()
+        with self.assertRaises(CheckoutShippingUnavailable):
+            create_shipping_quote(self.user, self.address.pk)
+        self.assertFalse(ShippingQuote.objects.exists())
+        self.assertFalse(CustomerOrder.objects.exists())
+        self.assertFalse(Payment.objects.exists())
+
+    def test_frete_zero_explicito_e_prazo_ausente_sao_preservados(self):
+        self.mock_price.return_value = {"pcFinal": "0.00"}
+        self.mock_deadline.return_value = {}
+        quote = create_shipping_quote(self.user, self.address.pk)
+        quote.refresh_from_db()
+        self.assertEqual(quote.shipping_cost, Decimal("0.00"))
+        self.assertEqual(quote.total_amount, Decimal("39.98"))
+        self.assertIsNone(quote.prazo_dias)
+
+    def test_falha_no_prazo_nao_persiste_cotacao_parcial(self):
+        self.mock_deadline.side_effect = TimeoutError()
+        with self.assertRaises(CheckoutShippingUnavailable):
+            create_shipping_quote(self.user, self.address.pk)
+        self.assertFalse(ShippingQuote.objects.exists())
+
+    def test_rejeita_compra_alterada_durante_consulta_externa(self):
+        def update_price(*args):
+            Product.objects.filter(pk=self.product.pk).update(
+                base_price=Decimal("25.00")
+            )
+            return {"pcFinal": "15.00"}
+
+        self.mock_price.side_effect = update_price
+        with self.assertRaises(ValidationError) as error:
+            create_shipping_quote(self.user, self.address.pk)
+        self.assertEqual(
+            error.exception.get_codes()["shipping_quote_id"], "quote_changed"
+        )
+        self.assertFalse(ShippingQuote.objects.exists())
+
+    def test_nao_cria_cotacao_com_endereco_de_outro_usuario(self):
+        cart = Cart.objects.create(user=self.other_user)
+        CartItem.objects.create(
+            cart=cart, variation=self.variation, quantity=1, unit_price=Decimal("19.99")
+        )
+        with self.assertRaises(ValidationError):
+            create_shipping_quote(self.other_user, self.address.pk)
+        self.mock_price.assert_not_called()
+        self.assertFalse(ShippingQuote.objects.exists())
+
+    def test_banco_rejeita_valores_negativos(self):
+        quote = create_shipping_quote(self.user, self.address.pk)
+        for field in ("subtotal", "shipping_cost", "discount_amount", "total_amount"):
+            with (
+                self.subTest(field=field),
+                self.assertRaises(IntegrityError),
+                transaction.atomic(),
+            ):
+                ShippingQuote.objects.filter(pk=quote.pk).update(
+                    **{field: Decimal("-0.01")}
+                )
+
+    def test_rota_atual_de_calculo_permanece_sem_persistencia(self):
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post(
+            "/api/orders/checkout/calculate/",
+            {"address_id": str(self.address.pk)},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["total_amount"], "54.99")
+        self.assertNotIn("shipping_quote_id", response.data)
+        self.assertFalse(ShippingQuote.objects.exists())
 
 
 class PaymentSuccessRedirectTests(APITestCase):

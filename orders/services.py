@@ -1,11 +1,14 @@
+from datetime import timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from uuid import UUID
 
 import requests
 from django.conf import settings
-from django.core.exceptions import ObjectDoesNotExist
+from django.core.exceptions import ImproperlyConfigured, ObjectDoesNotExist
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework.exceptions import APIException, ValidationError
 
 from orders.correios import (
@@ -19,6 +22,7 @@ from orders.models import (
     OrderStatusLog,
     Payment,
     PaymentStatus,
+    ShippingQuote,
 )
 from products.models import ProductVariation
 
@@ -47,9 +51,11 @@ class CheckoutShippingUnavailable(APIException):
     default_code = "shipping_unavailable"
 
 
-def calculate_checkout(user, address_id):
-    """Calcula a compra atual sem salvar cotação, pedido ou alterar estoque."""
-    cart = Cart.objects.filter(user=user, status="ACTIVE").first()
+def _get_checkout_contents(user, address_id, cart_id=None):
+    carts = Cart.objects.filter(user=user, status="ACTIVE")
+    if cart_id is not None:
+        carts = carts.filter(id=cart_id)
+    cart = carts.first()
     if not cart:
         raise ValidationError({"message": "Carrinho vazio."})
     cart_items = list(cart.items.select_related("variation__product"))
@@ -76,6 +82,8 @@ def calculate_checkout(user, address_id):
         items.append(
             {
                 "variation": variation,
+                "cart_item_id": str(item.id),
+                "cart_item_updated_at": item.updated_at.isoformat(),
                 "variation_id": variation.id,
                 "product_id": variation.product_id,
                 "product_name": variation.product.name,
@@ -91,19 +99,38 @@ def calculate_checkout(user, address_id):
     destination = address.zip_code.replace("-", "").strip()
     if len(destination) != 8 or not destination.isdigit():
         raise ValidationError({"message": "CEP do endereço inválido."})
-    origin = settings.CORREIOS_REMETENTE_CEP.replace("-", "").strip()
+    return {
+        "cart": cart,
+        "address": address,
+        "items": items,
+        "subtotal": subtotal,
+        "shipping_parameters": {
+            "origin": settings.CORREIOS_REMETENTE_CEP.replace("-", "").strip(),
+            "destination": destination,
+            "service": str(settings.CORREIOS_CODIGO_SERVICO),
+            "weight": str(settings.CORREIOS_PESO_PADRAO_GRAMAS),
+            "mock_enabled": settings.CORREIOS_MOCK_ENABLED,
+            "base_url": settings.CORREIOS_API_BASE_URL,
+        },
+    }
+
+
+def _calculate_checkout(contents):
+    shipping_parameters = contents["shipping_parameters"]
+    origin = shipping_parameters["origin"]
+    destination = shipping_parameters["destination"]
     try:
         if len(origin) != 8 or not origin.isdigit():
             raise ValueError("CEP do remetente inválido.")
         price = fetch_shipping_price_by_service_and_ceps(
-            settings.CORREIOS_CODIGO_SERVICO,
+            shipping_parameters["service"],
             origin,
             destination,
-            settings.CORREIOS_PESO_PADRAO_GRAMAS,
+            shipping_parameters["weight"],
         )
         shipping_cost = normalize_money(price["pcFinal"])
         deadline = fetch_shipping_deadline_by_service_and_ceps(
-            settings.CORREIOS_CODIGO_SERVICO,
+            shipping_parameters["service"],
             origin,
             destination,
         )
@@ -118,19 +145,140 @@ def calculate_checkout(user, address_id):
     # Desconto PIX em espera: nenhuma promoção é aplicada apenas pela interface.
     discount_amount = Decimal("0.00")
     try:
-        total_amount = normalize_money(subtotal + shipping_cost - discount_amount)
+        total_amount = normalize_money(
+            contents["subtotal"] + shipping_cost - discount_amount
+        )
     except ValueError as exc:
         raise ValidationError({"message": "Total do pedido acima do limite."}) from exc
     return {
-        "cart": cart,
-        "address": address,
-        "items": items,
-        "subtotal": subtotal,
+        **contents,
         "shipping_cost": shipping_cost,
         "discount_amount": discount_amount,
         "total_amount": total_amount,
         "prazo_dias": deadline_days,
     }
+
+
+def calculate_checkout(user, address_id):
+    """Calcula a compra atual sem salvar cotação, pedido ou alterar estoque."""
+    return _calculate_checkout(_get_checkout_contents(user, address_id))
+
+
+def _shipping_quote_snapshot(contents):
+    address = contents["address"]
+    return {
+        "items": sorted(
+            [
+                {
+                    "cart_item_id": item["cart_item_id"],
+                    "updated_at": item["cart_item_updated_at"],
+                    "variation_id": str(item["variation_id"]),
+                    "product_id": str(item["product_id"]),
+                    "product_updated_at": item[
+                        "variation"
+                    ].product.updated_at.isoformat(),
+                    "product_is_active": item["variation"].product.is_active,
+                    "quantity": item["quantity"],
+                    "unit_price": str(item["unit_price"]),
+                    "size": item["size"],
+                    "color": item["variation"].color,
+                    "sku": item["sku"],
+                }
+                for item in contents["items"]
+            ],
+            key=lambda item: item["cart_item_id"],
+        ),
+        "address": {
+            field: getattr(address, field)
+            for field in (
+                "zip_code",
+                "street",
+                "address_number",
+                "complement",
+                "neighborhood",
+                "city",
+                "state",
+            )
+        },
+        "address_updated_at": address.updated_at.isoformat(),
+        "shipping_parameters": contents["shipping_parameters"],
+    }
+
+
+def create_shipping_quote(user, address_id):
+    """Persiste o cálculo do servidor sem criar pedido ou reservar estoque."""
+    ttl = settings.SHIPPING_QUOTE_TTL_SECONDS
+    if isinstance(ttl, bool) or not isinstance(ttl, int) or ttl <= 0:
+        raise ImproperlyConfigured(
+            "SHIPPING_QUOTE_TTL_SECONDS deve ser inteiro positivo."
+        )
+
+    contents = _get_checkout_contents(user, address_id)
+    snapshot = _shipping_quote_snapshot(contents)
+    calculation = _calculate_checkout(contents)
+    current = _get_checkout_contents(user, address_id, contents["cart"].id)
+    if snapshot != _shipping_quote_snapshot(current):
+        raise ValidationError(
+            {
+                "shipping_quote_id": "A compra mudou durante o cálculo. Calcule novamente."
+            },
+            code="quote_changed",
+        )
+    return ShippingQuote.objects.create(
+        user=user,
+        cart=contents["cart"],
+        address=contents["address"],
+        snapshot=snapshot,
+        subtotal=calculation["subtotal"],
+        shipping_cost=calculation["shipping_cost"],
+        discount_amount=calculation["discount_amount"],
+        total_amount=calculation["total_amount"],
+        prazo_dias=calculation["prazo_dias"],
+        expires_at=timezone.now() + timedelta(seconds=ttl),
+    )
+
+
+def validate_shipping_quote(user, quote_id, cart_id, address_id):
+    """Valida o estado atual; não consome a cotação nem confirma o checkout."""
+    try:
+        quote = ShippingQuote.objects.filter(id=quote_id, user=user).first()
+    except (DjangoValidationError, ValueError, TypeError):
+        quote = None
+    if quote is None:
+        raise ValidationError(
+            {"shipping_quote_id": "Cotação inválida."}, code="quote_invalid"
+        )
+    if str(quote.cart_id) != str(cart_id) or str(quote.address_id) != str(address_id):
+        raise ValidationError(
+            {
+                "shipping_quote_id": "Cotação não pertence ao carrinho e endereço informados."
+            },
+            code="quote_mismatch",
+        )
+    if quote.invalidated_at is not None:
+        raise ValidationError(
+            {"shipping_quote_id": "Cotação invalidada. Calcule novamente."},
+            code="quote_invalidated",
+        )
+    if quote.expires_at <= timezone.now():
+        raise ValidationError(
+            {"shipping_quote_id": "Cotação expirada. Calcule novamente."},
+            code="quote_expired",
+        )
+    try:
+        contents = _get_checkout_contents(user, quote.address_id, quote.cart_id)
+        matches = quote.snapshot == _shipping_quote_snapshot(contents)
+    except ValidationError:
+        matches = False
+    if not matches:
+        ShippingQuote.objects.filter(pk=quote.pk, invalidated_at__isnull=True).update(
+            invalidated_at=timezone.now()
+        )
+        raise ValidationError(
+            {"shipping_quote_id": "A compra mudou. Calcule novamente."},
+            code="quote_changed",
+        )
+    return quote
 
 
 def create_infinitepay_checkout(order, request):
