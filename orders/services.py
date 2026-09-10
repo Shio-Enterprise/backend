@@ -10,6 +10,8 @@ from django.shortcuts import get_object_or_404
 from orders.models import (
     Cart,
     CartItem,
+    Coupon,
+    CustomerOrder,
     OrderStatus,
     OrderStatusLog,
     Payment,
@@ -397,3 +399,23 @@ def update_status(order, new_status, changed_by=None, tracking_code=None, commen
         tracking_code=tracking_code,
         comment=comment,
     )
+
+
+def get_welcome_discount(user, subtotal):
+    """Retorna (coupon, discount_amount) para o desconto de boas-vindas,
+    ou (None, Decimal('0.00')) se o usuário não for elegível."""
+    if not user.is_authenticated:
+        return None, Decimal("0.00")
+
+    has_previous_order = CustomerOrder.objects.filter(user=user).exists()
+    if has_previous_order:
+        return None, Decimal("0.00")
+
+    coupon = Coupon.objects.filter(code="BEMVINDO10", is_active=True).first()
+    if not coupon:
+        return None, Decimal("0.00")
+
+    discount = (subtotal * (coupon.discount_value / Decimal("100"))).quantize(
+        Decimal("0.01")
+    )
+    return coupon, discount

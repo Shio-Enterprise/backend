@@ -75,7 +75,8 @@ class CheckoutAPITests(APITestCase):
 
         order = CustomerOrder.objects.get(user=self.user)
         self.assertEqual(order.status, OrderStatus.AWAITING_PAYMENT)
-        self.assertEqual(order.total_amount, 215.00)
+        self.assertEqual(order.total_amount, 195.00)
+        self.assertEqual(order.discount_amount, 20.00)
 
     def test_checkout_com_carrinho_vazio_retorna_400(self):
         """Deve retornar 400 se o usuário não tiver itens no carrinho ativo."""
@@ -119,6 +120,40 @@ class CheckoutAPITests(APITestCase):
 
         self.variation.refresh_from_db()
         self.assertEqual(self.variation.stock_quantity, 10)
+
+    @patch("orders.views.create_infinitepay_checkout")
+    def test_primeira_compra_aplica_desconto_de_boas_vindas(self, mock_create_checkout):
+        mock_create_checkout.return_value = "https://pay.infinitepay.io/mock-url"
+
+        payload = {"address_id": str(self.address.id), "shipping_cost": 15.00}
+        response = self.client.post(self.url, payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        order = CustomerOrder.objects.get(user=self.user)
+        self.assertEqual(order.discount_amount, 20.00)  # 10% de 200.00
+        self.assertEqual(order.total_amount, 195.00)  # 200 - 20 + 15
+        self.assertEqual(order.coupon.code, "BEMVINDO10")
+
+    @patch("orders.views.create_infinitepay_checkout")
+    def test_segunda_compra_nao_aplica_desconto(self, mock_create_checkout):
+        mock_create_checkout.return_value = "https://pay.infinitepay.io/mock-url"
+
+        CustomerOrder.objects.create(
+            user=self.user,
+            subtotal=50.00,
+            total_amount=50.00,
+            status=OrderStatus.PAID,
+        )
+
+        payload = {"address_id": str(self.address.id), "shipping_cost": 15.00}
+        response = self.client.post(self.url, payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        new_order = CustomerOrder.objects.filter(user=self.user).exclude(
+            subtotal=50.00
+        ).first()
+        self.assertEqual(new_order.discount_amount, 0)
+        self.assertIsNone(new_order.coupon)
 
 
 class PaymentSuccessRedirectTests(APITestCase):
