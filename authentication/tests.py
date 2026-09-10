@@ -12,9 +12,12 @@ from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
+from django.utils.dateparse import parse_datetime
 from rest_framework import status
 from rest_framework.test import APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
+
+from orders.models import CustomerOrder, OrderStatus
 
 from .models import UserProfile, UserRole
 from .services import GoogleAuthService, InvalidGoogleTokenException
@@ -342,6 +345,62 @@ class PermissionTests(TestCase):
         from authentication.permissions import IsStaffOrSuperUser
 
         self.assertFalse(IsStaffOrSuperUser().has_permission(request, None))
+
+
+class CustomerCRMViewSetTests(APITestCase):
+    """Garante que métricas do CRM representem vendas, não tentativas de compra."""
+
+    url = "/api/auth/crm/customers/"
+
+    def setUp(self):
+        self.admin = User.objects.create_user(
+            email="crm-admin@example.com", name="CRM Admin", is_staff=True
+        )
+        UserProfile.objects.create(user=self.admin, role=UserRole.ADMIN)
+
+        self.customer = User.objects.create_user(
+            email="crm-customer@example.com", name="CRM Customer"
+        )
+        UserProfile.objects.create(user=self.customer, role=UserRole.CUSTOMER)
+        self.client.force_authenticate(user=self.admin)
+
+    def create_order(self, status_value, total_amount):
+        return CustomerOrder.objects.create(
+            user=self.customer,
+            status=status_value,
+            subtotal=total_amount,
+            total_amount=total_amount,
+            shipping_zip_code="70000-000",
+            shipping_street="Rua Teste",
+            shipping_number="1",
+            shipping_neighborhood="Centro",
+            shipping_city="Brasília",
+            shipping_state="DF",
+        )
+
+    def test_metricas_consideram_somente_status_aceitos_como_venda(self):
+        paid_order = self.create_order(OrderStatus.PAID, "120.00")
+        self.create_order(OrderStatus.AWAITING_PAYMENT, "80.00")
+        self.create_order(OrderStatus.CANCELED, "60.00")
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        payload = response.json()
+        customer = payload[0] if isinstance(payload, list) else payload["results"][0]
+        self.assertEqual(customer["total_orders"], 1)
+        self.assertEqual(customer["total_spent"], "120.00")
+        self.assertEqual(parse_datetime(customer["last_purchase_date"]), paid_order.created_at)
+
+    def test_filtro_de_frequencia_usa_apenas_vendas(self):
+        self.create_order(OrderStatus.AWAITING_PAYMENT, "80.00")
+
+        response = self.client.get(self.url, {"min_frequency": 1})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        payload = response.json()
+        customers = payload if isinstance(payload, list) else payload["results"]
+        self.assertEqual(customers, [])
 
 
 class LogoutViewTests(APITestCase):

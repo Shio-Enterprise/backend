@@ -27,6 +27,7 @@ from .correios import (
     dispatch_order_and_get_tracking_code,
     get_order_tracking_data,
 )
+from .metrics import SALES_ORDER_STATUSES
 from .models import (
     Cart,
     CustomerOrder,
@@ -103,16 +104,9 @@ class AdminDashboardView(APIView):
     def get(self, request):
         thirty_days_ago = timezone.now() - datetime.timedelta(days=30)
 
-        active_statuses = [
-            OrderStatus.PAID,
-            OrderStatus.PREPARING,
-            OrderStatus.SHIPPED,
-            OrderStatus.DELIVERED,
-        ]
-
         valid_orders_period = CustomerOrder.objects.filter(
             created_at__gte=thirty_days_ago,
-            status__in=active_statuses,
+            status__in=SALES_ORDER_STATUSES,
         )
         total_revenue = (
             valid_orders_period.aggregate(total=Sum("total_amount"))["total"] or 0
@@ -130,7 +124,7 @@ class AdminDashboardView(APIView):
         ).count()
 
         recent_orders_qs = (
-            CustomerOrder.objects.filter(status__in=active_statuses)
+            CustomerOrder.objects.filter(status__in=SALES_ORDER_STATUSES)
             .select_related("user")
             .order_by("-created_at")[:10]
         )
@@ -887,5 +881,3 @@ class CartItemDetailAPIView(APIView):
         return Response(
             CartRepresentationSerializer(cart_data).data, status=status.HTTP_200_OK
         )
-
-

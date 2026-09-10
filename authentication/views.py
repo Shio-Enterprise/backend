@@ -2,7 +2,7 @@ import logging
 
 from django.contrib.auth import get_user_model
 from django.db import models
-from django.db.models import Count, Max, Sum
+from django.db.models import Count, Max, Q, Sum
 from django.db.models.functions import Coalesce
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import (
@@ -17,6 +17,7 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from authentication.signals import google_login_completed
+from orders.metrics import SALES_ORDER_STATUSES
 
 from .permissions import IsStaffOrSuperUser
 from .serializers import (
@@ -25,10 +26,10 @@ from .serializers import (
     CustomerCRMSerializer,
     GoogleAuthSerializer,
     LogoutInputSerializer,
+    PasswordLoginSerializer,
+    RegisterSerializer,
     TokenRefreshInputSerializer,
     UserSerializer,
-    RegisterSerializer,
-    PasswordLoginSerializer,
 )
 from .services import GoogleAuthService, InvalidGoogleTokenException
 
@@ -524,12 +525,15 @@ class CustomerCRMViewSet(viewsets.ReadOnlyModelViewSet):
     }
 
     def get_queryset(self):
+        sales_orders = Q(orders__status__in=SALES_ORDER_STATUSES)
         qs = User.objects.filter(profile__role="CUSTOMER").annotate(
-            total_orders=Count("orders"),
+            total_orders=Count("orders", filter=sales_orders),
             total_spent=Coalesce(
-                Sum("orders__total_amount"), 0.0, output_field=models.DecimalField()
+                Sum("orders__total_amount", filter=sales_orders),
+                0.0,
+                output_field=models.DecimalField(),
             ),
-            last_purchase_date=Max("orders__created_at"),
+            last_purchase_date=Max("orders__created_at", filter=sales_orders),
         )
 
         min_freq = self.request.query_params.get("min_frequency")
