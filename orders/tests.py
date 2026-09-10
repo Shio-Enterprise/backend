@@ -1250,3 +1250,14 @@ class MergeSessionCartTests(APITestCase):
         # Verify DB cart quantity is summed
         cart_item = CartItem.objects.get(cart=db_cart, variation=self.variation)
         self.assertEqual(cart_item.quantity, 3)
+
+
+class WelcomeCouponSeedTests(APITestCase):
+    def test_seed_cria_cupom_bemvindo10(self):
+        from orders.models import Coupon
+
+        coupon = Coupon.objects.filter(code="BEMVINDO10").first()
+        self.assertIsNotNone(coupon)
+        self.assertEqual(coupon.discount_type, "PERCENTAGE")
+        self.assertEqual(coupon.discount_value, 10)
+        self.assertTrue(coupon.is_active)
