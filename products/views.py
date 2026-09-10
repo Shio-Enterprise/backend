@@ -15,6 +15,7 @@ from rest_framework.views import APIView
 
 from authentication.permissions import IsStaffOrSuperUser
 
+from .catalog import CatalogPagination, filter_catalog
 from .models import (
     Category,
     DropCampaign,
@@ -29,6 +30,7 @@ from .serializers import (
     DropCampaignSerializer,
     ProductDetailSerializer,
     ProductImageSerializer,
+    ProductListQuerySerializer,
     ProductListSerializer,
     ProductVariationSerializer,
     ProductWriteSerializer,
@@ -399,6 +401,8 @@ class DropProductManageView(APIView):
 class ProductListCreateView(APIView):
     """Listar produtos (público, com filtros) e criar (admin)."""
 
+    pagination_class = CatalogPagination
+
     def get_permissions(self):
         if self.request.method == "POST":
             return [IsStaffOrSuperUser()]
@@ -417,13 +421,27 @@ class ProductListCreateView(APIView):
         description=(
             "Lista paginada do catálogo. Endpoint público — só retorna produtos "
             "com `is_active=True` para chamadas não autenticadas e clientes.\n\n"
-            "Filtros via query: `category={uuid}`, `drop={uuid}`, `search={text}` "
-            "(busca em name/description), `is_active=true|false` (só admin pode passar false).\n\n"
-            "Ordenação padrão: `-created_at`."
+            "Categoria por slug; valores reconhecidos como UUID são sempre IDs legados. "
+            "Drop por UUID. Busca sem distinção de maiúsculas em name/description. "
+            "Cores exatas repetidas: `color=Preto&color=Azul`; tamanho e cor na mesma "
+            "variação. Preços inclusivos, não negativos, com até duas casas decimais. "
+            "Página inicial 1, tamanho padrão 20 e máximo 100 (valores maiores são limitados). "
+            "Parâmetros inválidos retornam 400; página inexistente retorna 404. "
+            "Ordenação padrão -created_at, com id como desempate; preços e vendas "
+            "desempatam por -created_at e id. Vendas somam quantidades de pedidos PAID, "
+            "PREPARING, SHIPPED e DELIVERED. "
+            "`is_active=true|false` mantém o comportamento administrativo existente."
         ),
-        responses={200: ProductListSerializer(many=True)},
+        parameters=[ProductListQuerySerializer],
+        responses={
+            200: ProductListSerializer(many=True),
+            400: OpenApiResponse(description="Parâmetros de consulta inválidos."),
+            404: OpenApiResponse(description="Página inexistente."),
+        },
     )
     def get(self, request):
+        query = ProductListQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
         qs = Product.objects.select_related("category", "drop").prefetch_related(
             "variations", "images"
         )
@@ -435,20 +453,8 @@ class ProductListCreateView(APIView):
         elif not is_admin:
             qs = qs.filter(is_active=True)
 
-        category = request.query_params.get("category")
-        if category:
-            qs = qs.filter(category_id=category)
-
-        drop = request.query_params.get("drop")
-        if drop:
-            qs = qs.filter(drop_id=drop)
-
-        search = request.query_params.get("search")
-        if search:
-            qs = qs.filter(Q(name__icontains=search) | Q(description__icontains=search))
-
-        qs = qs.order_by("-created_at")
-        paginator = PageNumberPagination()
+        qs = filter_catalog(qs, query.validated_data)
+        paginator = self.pagination_class()
         page = paginator.paginate_queryset(qs, request, view=self)
         serializer = ProductListSerializer(
             page, many=True, context={"request": request}

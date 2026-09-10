@@ -12,6 +12,39 @@ from .models import (
 )
 
 
+class ProductListQuerySerializer(serializers.Serializer):
+    """Valida a query antes de construir filtros ou executar a paginação."""
+
+    page = serializers.IntegerField(min_value=1, required=False)
+    page_size = serializers.IntegerField(min_value=1, required=False)
+    category = serializers.SlugField(max_length=150, required=False)
+    drop = serializers.UUIDField(required=False)
+    search = serializers.CharField(required=False, allow_blank=True)
+    size = serializers.CharField(max_length=50, required=False)
+    color = serializers.ListField(
+        child=serializers.CharField(max_length=100), required=False, allow_empty=False
+    )
+    min_price = serializers.DecimalField(
+        max_digits=10, decimal_places=2, min_value=0, required=False
+    )
+    max_price = serializers.DecimalField(
+        max_digits=10, decimal_places=2, min_value=0, required=False
+    )
+    ordering = serializers.ChoiceField(
+        choices=("-created_at", "base_price", "-base_price", "-sales_count"),
+        default="-created_at",
+    )
+
+    def validate(self, attrs):
+        minimum = attrs.get("min_price")
+        maximum = attrs.get("max_price")
+        if minimum is not None and maximum is not None and minimum > maximum:
+            raise serializers.ValidationError(
+                {"max_price": "Deve ser maior ou igual a min_price."}
+            )
+        return attrs
+
+
 class CategorySerializer(serializers.ModelSerializer):
     """Serializer de Category — usado em list, detail, create e update (PUT)."""
 
@@ -135,7 +168,15 @@ class ProductVariationSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ProductVariation
-        fields = ["id", "size", "color", "sku", "stock_quantity", "created_at", "updated_at"]
+        fields = [
+            "id",
+            "size",
+            "color",
+            "sku",
+            "stock_quantity",
+            "created_at",
+            "updated_at",
+        ]
         read_only_fields = ["id", "created_at", "updated_at"]
 
 

@@ -12,14 +12,19 @@ from io import BytesIO
 
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.urls import path
 from django.utils import timezone
+from drf_spectacular.generators import SchemaGenerator
+from drf_spectacular.validation import validate_schema
 from PIL import Image
 from rest_framework import status
 from rest_framework.test import APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from authentication.models import UserProfile, UserRole
+from orders.models import CustomerOrder, OrderItem, OrderStatus
 
+from .catalog import filter_catalog
 from .models import (
     Category,
     DropCampaign,
@@ -28,6 +33,7 @@ from .models import (
     ProductVariation,
     StockMovement,
 )
+from .views import ProductListCreateView
 
 User = get_user_model()
 
@@ -632,6 +638,222 @@ class ProductListTests(APITestCase):
 # ─── Product — Detail ─────────────────────────────────────────────────────────
 
 
+class ProductListContractTests(APITestCase):
+    url = "/api/catalog/products/"
+
+    def setUp(self):
+        self.category = Category.objects.create(name="Camisetas", slug="camisetas")
+        self.products = [
+            make_product(
+                name=f"Produto {index}",
+                category=self.category,
+                base_price=index,
+                description="Algodão exclusivo" if index == 0 else "Descrição",
+            )
+            for index in range(25)
+        ]
+
+    def test_pagination_defaults_links_and_custom_size(self):
+        first = self.client.get(self.url).json()
+        self.assertEqual(set(first), {"count", "next", "previous", "results"})
+        self.assertEqual(first["count"], 25)
+        self.assertEqual(len(first["results"]), 20)
+        self.assertIsNone(first["previous"])
+        second = self.client.get(first["next"]).json()
+        self.assertEqual(len(second["results"]), 5)
+        self.assertIsNone(second["next"])
+        self.assertIsNotNone(second["previous"])
+        self.assertFalse(
+            {item["id"] for item in first["results"]}
+            & {item["id"] for item in second["results"]}
+        )
+        page = self.client.get(self.url, {"page": 2, "page_size": 7}).json()
+        self.assertEqual(page["count"], 25)
+        self.assertEqual(len(page["results"]), 7)
+        self.assertIn("page_size=7", page["next"])
+        self.assertEqual(page["results"][0]["id"], str(self.products[17].id))
+
+    def test_page_size_is_capped(self):
+        Product.objects.bulk_create(
+            [Product(name=f"Extra {i}", base_price=1) for i in range(80)]
+        )
+        body = self.client.get(self.url, {"page_size": 999}).json()
+        self.assertEqual(body["count"], 105)
+        self.assertEqual(len(body["results"]), 100)
+        self.assertIsNotNone(body["next"])
+
+    def test_category_slug_uuid_and_unknown(self):
+        other = Category.objects.create(name="Bonés", slug="bones")
+        make_product(category=other)
+        for category, count in (
+            ("camisetas", 25),
+            (str(self.category.id), 25),
+            ("bones", 1),
+            ("inexistente", 0),
+        ):
+            with self.subTest(category=category):
+                body = self.client.get(self.url, {"category": category}).json()
+                self.assertEqual(body["count"], count)
+
+    def test_uuid_shaped_category_is_always_an_id(self):
+        category = Category.objects.create(name="Slug UUID", slug=str(self.category.id))
+        make_product(category=category)
+        body = self.client.get(self.url, {"category": category.slug}).json()
+        self.assertEqual(body["count"], 25)
+
+    def test_search_finds_description_outside_first_page(self):
+        body = self.client.get(self.url, {"search": "EXCLUSIVO"}).json()
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["results"][0]["id"], str(self.products[0].id))
+
+    def test_combined_filters_require_same_variation_without_duplicates(self):
+        matching = self.products[10]
+        for product, size, color in (
+            (matching, "M", "Azul"),
+            (matching, "M", "Preto"),
+            (self.products[11], "M", "Branco"),
+            (self.products[11], "G", "Azul"),
+            (self.products[9], "M", "Azul"),
+        ):
+            ProductVariation.objects.create(
+                product=product, size=size, color=color, sku=str(uuid.uuid4())
+            )
+        body = self.client.get(
+            self.url + "?size=M&color=Azul&color=Preto&min_price=10&max_price=11"
+        ).json()
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["results"][0]["id"], str(matching.id))
+
+    def test_invalid_parameters_return_400(self):
+        for params in (
+            {"page": 0},
+            {"page": "abc"},
+            {"page": -1},
+            {"page": 1.5},
+            {"page_size": 0},
+            {"page_size": "abc"},
+            {"page_size": -2},
+            {"min_price": "abc"},
+            {"min_price": "NaN"},
+            {"max_price": "Infinity"},
+            {"min_price": -1},
+            {"max_price": "1.234"},
+            {"min_price": 10, "max_price": 9},
+            {"ordering": "name"},
+            {"ordering": "?"},
+            {"drop": "invalid"},
+            {"color": ""},
+        ):
+            with self.subTest(params=params):
+                response = self.client.get(self.url, params)
+                self.assertEqual(response.status_code, 400, response.content)
+        self.assertEqual(self.client.get(self.url, {"page": 999}).status_code, 404)
+
+    def test_price_ordering_and_stable_ties(self):
+        for ordering, expected in (
+            ("base_price", self.products[0]),
+            ("-base_price", self.products[-1]),
+        ):
+            body = self.client.get(self.url, {"ordering": ordering}).json()
+            self.assertEqual(body["results"][0]["id"], str(expected.id))
+        Product.objects.update(created_at=timezone.now(), base_price=1)
+        expected = sorted(str(product.id) for product in self.products)
+        for ordering in ("-created_at", "base_price", "-base_price", "-sales_count"):
+            body = self.client.get(
+                self.url, {"ordering": ordering, "page_size": 100}
+            ).json()
+            self.assertEqual([item["id"] for item in body["results"]], expected)
+
+    def test_related_data_is_loaded_in_constant_queries(self):
+        with self.assertNumQueries(4):
+            response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 200)
+
+    def test_openapi_documents_query_and_paginated_response(self):
+        schema = SchemaGenerator(
+            patterns=[path("api/catalog/products/", ProductListCreateView.as_view())]
+        ).get_schema(public=True)
+        validate_schema(schema)
+        operation = schema["paths"][self.url]["get"]
+        names = {parameter["name"] for parameter in operation["parameters"]}
+        self.assertTrue(
+            {
+                "page",
+                "page_size",
+                "category",
+                "drop",
+                "search",
+                "size",
+                "color",
+                "min_price",
+                "max_price",
+                "ordering",
+            }.issubset(names)
+        )
+        response_schema = operation["responses"]["200"]["content"]["application/json"][
+            "schema"
+        ]
+        component = response_schema["$ref"].rsplit("/", 1)[1]
+        self.assertEqual(
+            set(schema["components"]["schemas"][component]["properties"]),
+            {"count", "next", "previous", "results"},
+        )
+
+    def test_sales_sum_quantities_and_ignore_invalid_orders_with_filters(self):
+        user = make_user("sales@example.com")
+        winner, runner_up, invalid = self.products[:3]
+        variations = {}
+        for product in (winner, runner_up, invalid):
+            variations[product.id] = [
+                ProductVariation.objects.create(
+                    product=product, size="M", color=color, sku=str(uuid.uuid4())
+                )
+                for color in ("Azul", "Preto")
+            ]
+        for order_status in OrderStatus.values:
+            valid = order_status not in (
+                OrderStatus.AWAITING_PAYMENT,
+                OrderStatus.CANCELED,
+            )
+            order = CustomerOrder.objects.create(
+                user=user,
+                status=order_status,
+                subtotal=100,
+                total_amount=100,
+                shipping_zip_code="01001000",
+                shipping_street="Rua Teste",
+                shipping_number="1",
+                shipping_neighborhood="Centro",
+                shipping_city="São Paulo",
+                shipping_state="SP",
+            )
+            for product, quantity in (
+                ((winner, 2), (runner_up, 1)) if valid else ((invalid, 100),)
+            ):
+                for variation in variations[product.id]:
+                    OrderItem.objects.create(
+                        order=order,
+                        variation=variation,
+                        quantity=quantity,
+                        unit_price=1,
+                        product_name=product.name,
+                    )
+        body = self.client.get(
+            self.url + "?ordering=-sales_count&size=M&color=Azul&color=Preto"
+        ).json()
+        self.assertEqual(body["count"], 3)
+        self.assertEqual(
+            [item["id"] for item in body["results"]],
+            [str(product.id) for product in (winner, runner_up, invalid)],
+        )
+        ranked = filter_catalog(Product.objects.all(), {"ordering": "-sales_count"})
+        totals = dict(ranked.values_list("id", "sales_count"))
+        self.assertEqual(totals[winner.id], 16)
+        self.assertEqual(totals[runner_up.id], 8)
+        self.assertEqual(totals[invalid.id], 0)
+        self.assertEqual(totals[self.products[-1].id], 0)
+
+
 class ProductDetailTests(APITestCase):
     """Testes para GET /api/catalog/products/{id}/."""
 
@@ -704,8 +926,18 @@ class ProductCreateTests(APITestCase):
                 "description": "Algodão",
                 "base_price": "120.00",
                 "variations": [
-                    {"size": "P", "color": "Azul", "sku": "CAM-P", "stock_quantity": 10},
-                    {"size": "M", "color": "Vermelho", "sku": "CAM-M", "stock_quantity": 5},
+                    {
+                        "size": "P",
+                        "color": "Azul",
+                        "sku": "CAM-P",
+                        "stock_quantity": 10,
+                    },
+                    {
+                        "size": "M",
+                        "color": "Vermelho",
+                        "sku": "CAM-M",
+                        "stock_quantity": 5,
+                    },
                 ],
             },
             format="json",
