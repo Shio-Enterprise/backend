@@ -125,7 +125,16 @@ def get_cart_data(request):
     if request.user.is_authenticated:
         cart = Cart.objects.filter(user=request.user, status="ACTIVE").first()
         if not cart:
-            return {"id": None, "items": [], "subtotal": Decimal("0.00")}
+            welcome_coupon, welcome_discount_amount = get_welcome_discount_preview(
+                request.user, Decimal("0.00")
+            )
+            return {
+                "id": None,
+                "items": [],
+                "subtotal": Decimal("0.00"),
+                "eligible_for_welcome_discount": welcome_coupon is not None,
+                "welcome_discount_amount": welcome_discount_amount,
+            }
 
         items = []
         subtotal = Decimal("0.00")
@@ -145,10 +154,15 @@ def get_cart_data(request):
                     "stock_quantity": item.variation.stock_quantity,
                 }
             )
+        welcome_coupon, welcome_discount_amount = get_welcome_discount_preview(
+            request.user, subtotal
+        )
         return {
             "id": cart.id,
             "items": items,
             "subtotal": subtotal,
+            "eligible_for_welcome_discount": welcome_coupon is not None,
+            "welcome_discount_amount": welcome_discount_amount,
         }
     else:
         session_cart = request.session.get("cart", {})
@@ -203,6 +217,8 @@ def get_cart_data(request):
             "id": None,
             "items": items,
             "subtotal": subtotal,
+            "eligible_for_welcome_discount": False,
+            "welcome_discount_amount": Decimal("0.00"),
         }
 
 
@@ -419,6 +435,36 @@ def get_welcome_discount(user, subtotal):
 
     User = get_user_model()
     User.objects.select_for_update().get(pk=user.pk)
+
+    has_previous_order = CustomerOrder.objects.filter(user=user).exists()
+    if has_previous_order:
+        return None, Decimal("0.00")
+
+    coupon = Coupon.objects.filter(code="BEMVINDO10", is_active=True).first()
+    if not coupon:
+        return None, Decimal("0.00")
+
+    discount = (subtotal * (coupon.discount_value / Decimal("100"))).quantize(
+        Decimal("0.01")
+    )
+    return coupon, discount
+
+
+def get_welcome_discount_preview(user, subtotal):
+    """Versão somente-leitura de get_welcome_discount, para uso em contextos
+    que não estão dentro de uma transaction.atomic() (ex.: GET /cart/, uma
+    rota de leitura que apenas exibe uma prévia do desconto).
+
+    Mesma assinatura e retorno de get_welcome_discount — (coupon, discount) ou
+    (None, Decimal('0.00')) — e mesma lógica de elegibilidade, mas SEM
+    select_for_update(): não adquire lock na linha do usuário, então não
+    serializa contra checkouts concorrentes. Isso é aceitável aqui porque
+    esta função só alimenta uma prévia informativa no carrinho; a aplicação
+    real e segura contra corrida do desconto acontece em get_welcome_discount,
+    chamada por CheckoutAPIView.post dentro de @transaction.atomic.
+    """
+    if not user.is_authenticated:
+        return None, Decimal("0.00")
 
     has_previous_order = CustomerOrder.objects.filter(user=user).exists()
     if has_previous_order:

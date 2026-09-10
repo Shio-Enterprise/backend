@@ -1136,6 +1136,22 @@ class MergeSessionCartTests(APITestCase):
         data = response.json()
         self.assertEqual(len(data["items"]), 0)
 
+    def test_cart_expõe_elegibilidade_de_desconto_para_usuario_sem_pedidos(self):
+        self.client.force_authenticate(user=self.user)
+        response = self.client.get(self.cart_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.json()["eligible_for_welcome_discount"])
+
+    def test_cart_nao_expõe_desconto_para_usuario_com_pedido_anterior(self):
+        self.client.force_authenticate(user=self.user)
+        CustomerOrder.objects.create(
+            user=self.user, subtotal=10.00, total_amount=10.00,
+            status=OrderStatus.PAID,
+        )
+        response = self.client.get(self.cart_url)
+        self.assertFalse(response.json()["eligible_for_welcome_discount"])
+        self.assertEqual(response.json()["welcome_discount_amount"], "0.00")
+
     def test_authenticated_add_item(self):
         self.client.force_authenticate(user=self.user)
         response = self.client.post(
