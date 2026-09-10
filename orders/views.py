@@ -38,6 +38,7 @@ from .serializers import (
     CartItemAddSerializer,
     CartItemUpdateSerializer,
     CartRepresentationSerializer,
+    CheckoutCalculationInputSerializer,
     CheckoutCalculationSerializer,
     CheckoutInputSerializer,
     DashboardLowStockSerializer,
@@ -47,10 +48,11 @@ from .serializers import (
 )
 from .services import (
     add_item_to_cart,
-    calculate_checkout,
     check_payment_status,
+    checkout_from_shipping_quote,
     clear_cart,
     create_infinitepay_checkout,
+    create_shipping_quote,
     get_cart_data,
     remove_item_from_cart,
     update_item_quantity,
@@ -327,8 +329,8 @@ class CheckoutCalculationView(APIView):
 
     @extend_schema(
         summary="Calcular valores atuais da compra",
-        description="Calcula preços e frete no servidor, sem criar cotação persistida ou pedido.",
-        request=CheckoutInputSerializer,
+        description="Cria uma cotação com preços, frete e validade, sem criar pedido ou reservar estoque.",
+        request=CheckoutCalculationInputSerializer,
         responses={
             200: CheckoutCalculationSerializer,
             400: OpenApiTypes.OBJECT,
@@ -336,9 +338,9 @@ class CheckoutCalculationView(APIView):
         },
     )
     def post(self, request):
-        serializer = CheckoutInputSerializer(data=request.data)
+        serializer = CheckoutCalculationInputSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        calculation = calculate_checkout(
+        calculation = create_shipping_quote(
             request.user, serializer.validated_data["address_id"]
         )
         return Response(CheckoutCalculationSerializer(calculation).data)
@@ -354,8 +356,8 @@ class CheckoutAPIView(APIView):
             "Gera o pedido (CustomerOrder), faz o snapshot do endereço de entrega e debita o estoque. "
             "Por fim, comunica-se com a API da InfinitePay para gerar o link de checkout.\n\n"
             "**Fluxo:**\n"
-            "1. Envie somente `address_id` (UUID do endereço do perfil).\n"
-            "2. O backend recalcula preços e frete e gera a cobrança.\n"
+            "1. Envie `address_id` e `shipping_quote_id` retornado pelo cálculo.\n"
+            "2. O backend valida a cotação e gera a cobrança com os valores confirmados.\n"
             "3. O utilizador é redirecionado para a `checkout_url` retornada."
         ),
         request=CheckoutInputSerializer,
@@ -371,7 +373,15 @@ class CheckoutAPIView(APIView):
         user = request.user
         serializer = CheckoutInputSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        calculation = calculate_checkout(user, serializer.validated_data["address_id"])
+        try:
+            calculation = checkout_from_shipping_quote(
+                user,
+                serializer.validated_data["shipping_quote_id"],
+                serializer.validated_data["address_id"],
+            )
+        except serializers.ValidationError as exc:
+            # Preserva a invalidação da cotação: nenhum pedido foi criado até aqui.
+            return Response(exc.detail, status=status.HTTP_400_BAD_REQUEST)
         cart = calculation["cart"]
         address = calculation["address"]
 

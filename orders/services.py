@@ -51,17 +51,27 @@ class CheckoutShippingUnavailable(APIException):
     default_code = "shipping_unavailable"
 
 
-def _get_checkout_contents(user, address_id, cart_id=None):
+def _get_checkout_contents(user, address_id, cart_id=None, *, lock=False):
     carts = Cart.objects.filter(user=user, status="ACTIVE")
+    if lock:
+        carts = carts.select_for_update()
     if cart_id is not None:
         carts = carts.filter(id=cart_id)
     cart = carts.first()
     if not cart:
         raise ValidationError({"message": "Carrinho vazio."})
-    cart_items = list(cart.items.select_related("variation__product"))
+    items_query = cart.items.select_related("variation__product").order_by(
+        "variation_id"
+    )
+    if lock:
+        items_query = items_query.select_for_update()
+    cart_items = list(items_query)
     if not cart_items:
         raise ValidationError({"message": "Carrinho vazio."})
-    address = user.addresses.filter(id=address_id).first()
+    addresses = user.addresses.filter(id=address_id)
+    if lock:
+        addresses = addresses.select_for_update()
+    address = addresses.first()
     if not address:
         raise ValidationError({"message": "Endereço inválido."})
 
@@ -174,12 +184,14 @@ def _shipping_quote_snapshot(contents):
                     "updated_at": item["cart_item_updated_at"],
                     "variation_id": str(item["variation_id"]),
                     "product_id": str(item["product_id"]),
+                    "product_name": item["product_name"],
                     "product_updated_at": item[
                         "variation"
                     ].product.updated_at.isoformat(),
                     "product_is_active": item["variation"].product.is_active,
                     "quantity": item["quantity"],
                     "unit_price": str(item["unit_price"]),
+                    "total_price": str(item["total_price"]),
                     "size": item["size"],
                     "color": item["variation"].color,
                     "sku": item["sku"],
@@ -238,10 +250,13 @@ def create_shipping_quote(user, address_id):
     )
 
 
-def validate_shipping_quote(user, quote_id, cart_id, address_id):
+def validate_shipping_quote(user, quote_id, cart_id, address_id, *, lock=False):
     """Valida o estado atual; não consome a cotação nem confirma o checkout."""
     try:
-        quote = ShippingQuote.objects.filter(id=quote_id, user=user).first()
+        quotes = ShippingQuote.objects.filter(id=quote_id, user=user)
+        if lock:
+            quotes = quotes.select_for_update()
+        quote = quotes.first()
     except (DjangoValidationError, ValueError, TypeError):
         quote = None
     if quote is None:
@@ -266,7 +281,9 @@ def validate_shipping_quote(user, quote_id, cart_id, address_id):
             code="quote_expired",
         )
     try:
-        contents = _get_checkout_contents(user, quote.address_id, quote.cart_id)
+        contents = _get_checkout_contents(
+            user, quote.address_id, quote.cart_id, lock=lock
+        )
         matches = quote.snapshot == _shipping_quote_snapshot(contents)
     except ValidationError:
         matches = False
@@ -278,7 +295,31 @@ def validate_shipping_quote(user, quote_id, cart_id, address_id):
             {"shipping_quote_id": "A compra mudou. Calcule novamente."},
             code="quote_changed",
         )
+    # A aquisição dos bloqueios pode ter aguardado outra transação.
+    if quote.expires_at <= timezone.now():
+        raise ValidationError(
+            {"shipping_quote_id": "Cotação expirada. Calcule novamente."},
+            code="quote_expired",
+        )
     return quote
+
+
+def checkout_from_shipping_quote(user, quote_id, address_id):
+    """Deve ser chamado na transação do checkout para manter as linhas bloqueadas."""
+    cart = Cart.objects.filter(user=user, status="ACTIVE").first()
+    quote = validate_shipping_quote(
+        user, quote_id, cart.pk if cart else None, address_id, lock=True
+    )
+    contents = _get_checkout_contents(user, address_id, quote.cart_id)
+    # A validação mantém os itens, produtos e endereço bloqueados até o commit.
+    return {
+        **contents,
+        "subtotal": quote.subtotal,
+        "shipping_cost": quote.shipping_cost,
+        "discount_amount": quote.discount_amount,
+        "total_amount": quote.total_amount,
+        "prazo_dias": quote.prazo_dias,
+    }
 
 
 def create_infinitepay_checkout(order, request):
@@ -377,7 +418,7 @@ def check_payment_status(order_nsu, transaction_nsu, slug):
 
 
 def get_or_create_user_cart(user):
-    cart, _ = Cart.objects.get_or_create(user=user, status="ACTIVE")
+    cart, _ = Cart.objects.select_for_update().get_or_create(user=user, status="ACTIVE")
     return cart
 
 
@@ -469,12 +510,12 @@ def get_cart_data(request):
 def add_item_to_cart(request, variation_id, quantity):
     if request.user.is_authenticated:
         with transaction.atomic():
+            cart = get_or_create_user_cart(request.user)
             variation = get_object_or_404(
                 ProductVariation.objects.select_for_update().select_related("product"),
                 id=variation_id,
             )
 
-            cart = get_or_create_user_cart(request.user)
             cart_item, _ = CartItem.objects.get_or_create(
                 cart=cart,
                 variation=variation,
@@ -514,7 +555,11 @@ def add_item_to_cart(request, variation_id, quantity):
         request.session.modified = True
 
 
+@transaction.atomic
 def update_item_quantity(request, variation_id, quantity):
+    cart = (
+        get_or_create_user_cart(request.user) if request.user.is_authenticated else None
+    )
     variation = get_object_or_404(
         ProductVariation.objects.select_related("product"), id=variation_id
     )
@@ -525,7 +570,6 @@ def update_item_quantity(request, variation_id, quantity):
         )
 
     if request.user.is_authenticated:
-        cart = get_or_create_user_cart(request.user)
         cart_item = get_object_or_404(CartItem, cart=cart, variation=variation)
         cart_item.quantity = quantity
         cart_item.unit_price = variation.product.base_price
@@ -542,9 +586,14 @@ def update_item_quantity(request, variation_id, quantity):
         request.session.modified = True
 
 
+@transaction.atomic
 def remove_item_from_cart(request, variation_id):
     if request.user.is_authenticated:
-        cart = Cart.objects.filter(user=request.user, status="ACTIVE").first()
+        cart = (
+            Cart.objects.select_for_update()
+            .filter(user=request.user, status="ACTIVE")
+            .first()
+        )
         if not cart:
             raise KeyError("Carrinho não encontrado.")
         cart_item = get_object_or_404(CartItem, cart=cart, variation_id=variation_id)
@@ -559,9 +608,14 @@ def remove_item_from_cart(request, variation_id):
         request.session.modified = True
 
 
+@transaction.atomic
 def clear_cart(request):
     if request.user.is_authenticated:
-        cart = Cart.objects.filter(user=request.user, status="ACTIVE").first()
+        cart = (
+            Cart.objects.select_for_update()
+            .filter(user=request.user, status="ACTIVE")
+            .first()
+        )
         if cart:
             cart.items.all().delete()
     else:

@@ -85,12 +85,24 @@ class CheckoutAPITests(APITestCase):
         shipping_settings.enable()
         self.addCleanup(shipping_settings.disable)
 
+    def checkout_payload(self):
+        response = self.client.post(
+            "/api/orders/checkout/calculate/",
+            {"address_id": str(self.address.pk)},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        return {
+            "address_id": str(self.address.pk),
+            "shipping_quote_id": response.data["shipping_quote_id"],
+        }
+
     @patch("orders.views.create_infinitepay_checkout")
     def test_checkout_sucesso_gera_pedido_e_reduz_estoque(self, mock_create_checkout):
         """Deve retornar 201, criar o pedido, finalizar o carrinho e deduzir estoque."""
         mock_create_checkout.return_value = "https://pay.infinitepay.io/mock-url"
 
-        payload = {"address_id": str(self.address.id)}
+        payload = self.checkout_payload()
 
         response = self.client.post(self.url, payload, format="json")
 
@@ -111,9 +123,8 @@ class CheckoutAPITests(APITestCase):
 
     def test_checkout_com_carrinho_vazio_retorna_400(self):
         """Deve retornar 400 se o usuário não tiver itens no carrinho ativo."""
+        payload = self.checkout_payload()
         self.cart.items.all().delete()
-
-        payload = {"address_id": str(self.address.id)}
 
         response = self.client.post(self.url, payload, format="json")
 
@@ -122,10 +133,9 @@ class CheckoutAPITests(APITestCase):
 
     def test_checkout_sem_estoque_faz_rollback_e_retorna_400(self):
         """Deve barrar a compra e garantir que o carrinho continua ativo e o estoque intacto."""
+        payload = self.checkout_payload()
         self.cart_item.quantity = 20
         self.cart_item.save()
-
-        payload = {"address_id": str(self.address.id)}
 
         response = self.client.post(self.url, payload, format="json")
 
@@ -142,7 +152,7 @@ class CheckoutAPITests(APITestCase):
         """Deve proteger o banco de dados se a API da InfinitePay cair."""
         mock_create_checkout.side_effect = Exception("InfinitePay Timeout")
 
-        payload = {"address_id": str(self.address.id)}
+        payload = self.checkout_payload()
 
         response = self.client.post(self.url, payload, format="json")
 
@@ -215,7 +225,12 @@ class CheckoutAPITests(APITestCase):
             format="json",
         )
         response = self.client.post(
-            self.url, {"address_id": str(self.address.id)}, format="json"
+            self.url,
+            {
+                "address_id": str(self.address.id),
+                "shipping_quote_id": preview.data["shipping_quote_id"],
+            },
+            format="json",
         )
         self.assertEqual(response.status_code, 201)
         order = CustomerOrder.objects.get()
@@ -240,12 +255,16 @@ class CheckoutAPITests(APITestCase):
             with self.subTest(price=price):
                 self.mock_shipping.return_value = price
                 response = self.client.post(
-                    self.url, {"address_id": str(self.address.id)}, format="json"
+                    "/api/orders/checkout/calculate/",
+                    {"address_id": str(self.address.id)},
+                    format="json",
                 )
                 self.assertEqual(response.status_code, 503)
         self.mock_shipping.side_effect = TimeoutError()
         response = self.client.post(
-            self.url, {"address_id": str(self.address.id)}, format="json"
+            "/api/orders/checkout/calculate/",
+            {"address_id": str(self.address.id)},
+            format="json",
         )
         self.assertEqual(response.status_code, 503)
         mock_gateway.assert_not_called()
@@ -256,6 +275,8 @@ class CheckoutAPITests(APITestCase):
         self.assertEqual(self.variation.stock_quantity, 10)
 
     def test_rejeita_endereco_invalido_ou_de_outro_usuario(self):
+        payload = self.checkout_payload()
+        self.mock_shipping.reset_mock()
         other = User.objects.create_user(email="outro@checkout.test", name="Outro")
         self.address.user = other
         self.address.save()
@@ -263,7 +284,12 @@ class CheckoutAPITests(APITestCase):
             for url in (self.url, "/api/orders/checkout/calculate/"):
                 with self.subTest(address=address_id, url=url):
                     response = self.client.post(
-                        url, {"address_id": address_id}, format="json"
+                        url,
+                        {
+                            **(payload if url == self.url else {}),
+                            "address_id": address_id,
+                        },
+                        format="json",
                     )
                     self.assertEqual(response.status_code, 400)
         self.mock_shipping.assert_not_called()
@@ -275,6 +301,135 @@ class CheckoutAPITests(APITestCase):
                 url, {"address_id": str(self.address.id)}, format="json"
             )
             self.assertEqual(response.status_code, 401)
+
+    @patch("orders.views.create_infinitepay_checkout")
+    def test_checkout_exige_cotacao_sem_criar_pedido(self, mock_gateway):
+        response = self.client.post(
+            self.url, {"address_id": str(self.address.pk)}, format="json"
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("shipping_quote_id", response.data)
+        self.assertFalse(CustomerOrder.objects.exists())
+        self.assertFalse(Payment.objects.exists())
+        mock_gateway.assert_not_called()
+
+    @patch("orders.views.create_infinitepay_checkout")
+    def test_checkout_rejeita_cotacao_expirada_ou_invalidada(self, mock_gateway):
+        for field in ("expires_at", "invalidated_at"):
+            with self.subTest(field=field):
+                payload = self.checkout_payload()
+                ShippingQuote.objects.filter(pk=payload["shipping_quote_id"]).update(
+                    **{field: timezone.now() - timedelta(seconds=1)}
+                )
+                response = self.client.post(self.url, payload, format="json")
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("shipping_quote_id", response.data)
+        self.assertFalse(CustomerOrder.objects.exists())
+        self.assertFalse(Payment.objects.exists())
+        self.variation.refresh_from_db()
+        self.assertEqual(self.variation.stock_quantity, 10)
+        mock_gateway.assert_not_called()
+
+    @patch("orders.views.create_infinitepay_checkout")
+    def test_checkout_rejeita_cotacao_de_outro_usuario(self, mock_gateway):
+        payload = self.checkout_payload()
+        other = User.objects.create_user(email="intruso@checkout.test", name="Outro")
+        self.client.force_authenticate(user=other)
+        response = self.client.post(self.url, payload, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("shipping_quote_id", response.data)
+        self.assertFalse(CustomerOrder.objects.exists())
+        mock_gateway.assert_not_called()
+
+    @patch("orders.views.create_infinitepay_checkout")
+    def test_checkout_rejeita_cotacao_de_outro_endereco_ou_carrinho(self, mock_gateway):
+        payload = self.checkout_payload()
+        address = Address.objects.create(
+            user=self.user,
+            zip_code=self.address.zip_code,
+            street="Outra rua",
+            address_number="456",
+            neighborhood="Centro",
+            city="Brasília",
+            state="DF",
+        )
+        response = self.client.post(
+            self.url, {**payload, "address_id": str(address.pk)}, format="json"
+        )
+        self.assertEqual(response.status_code, 400)
+        self.cart.status = "ABANDONED"
+        self.cart.save()
+        cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(
+            cart=cart, variation=self.variation, quantity=2, unit_price=100
+        )
+        response = self.client.post(self.url, payload, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("shipping_quote_id", response.data)
+        self.assertFalse(CustomerOrder.objects.exists())
+        mock_gateway.assert_not_called()
+
+    @patch("orders.views.create_infinitepay_checkout")
+    def test_checkout_invalida_compra_alterada_antes_de_chamar_gateway(
+        self, mock_gateway
+    ):
+        for model, object_id, changes in (
+            (Product, self.product.pk, {"base_price": Decimal("110.00")}),
+            (CartItem, self.cart_item.pk, {"quantity": 3}),
+            (Address, self.address.pk, {"street": "Rua alterada"}),
+        ):
+            with self.subTest(model=model.__name__):
+                payload = self.checkout_payload()
+                quote = ShippingQuote.objects.get(pk=payload["shipping_quote_id"])
+                model.objects.filter(pk=object_id).update(**changes)
+                response = self.client.post(self.url, payload, format="json")
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("shipping_quote_id", response.data)
+                quote.refresh_from_db()
+                self.assertIsNotNone(quote.invalidated_at)
+        self.assertFalse(CustomerOrder.objects.exists())
+        self.assertFalse(Payment.objects.exists())
+        self.cart.refresh_from_db()
+        self.assertEqual(self.cart.status, "ACTIVE")
+        mock_gateway.assert_not_called()
+
+    @patch("orders.services.requests.post")
+    def test_finalizacao_usa_frete_confirmado_sem_nova_consulta(self, mock_post):
+        payload = self.checkout_payload()
+        self.mock_shipping.reset_mock()
+        self.mock_deadline.reset_mock()
+        self.mock_shipping.side_effect = TimeoutError()
+        mock_post.return_value.json.return_value = {
+            "url": "https://pay.infinitepay.io/mock"
+        }
+        response = self.client.post(self.url, payload, format="json")
+        self.assertEqual(response.status_code, 201)
+        order = CustomerOrder.objects.get()
+        self.assertEqual(order.subtotal, Decimal("200.00"))
+        self.assertEqual(order.shipping_cost, Decimal("15.00"))
+        self.assertEqual(order.total_amount, Decimal("215.00"))
+        self.assertEqual(order.payment.total_amount, order.total_amount)
+        items = mock_post.call_args.kwargs["json"]["items"]
+        self.assertEqual(sum(item["quantity"] * item["price"] for item in items), 21500)
+        self.mock_shipping.assert_not_called()
+        self.mock_deadline.assert_not_called()
+
+    @patch("orders.views.create_infinitepay_checkout")
+    def test_nova_cotacao_permite_finalizar_apos_mudanca_de_preco(self, mock_gateway):
+        old_payload = self.checkout_payload()
+        Product.objects.filter(pk=self.product.pk).update(base_price=Decimal("110.00"))
+        self.assertEqual(
+            self.client.post(self.url, old_payload, format="json").status_code, 400
+        )
+        payload = self.checkout_payload()
+        self.assertNotEqual(
+            payload["shipping_quote_id"], old_payload["shipping_quote_id"]
+        )
+        mock_gateway.return_value = "https://pay.infinitepay.io/mock"
+        response = self.client.post(self.url, payload, format="json")
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(CustomerOrder.objects.get().total_amount, Decimal("235.00"))
+        mock_gateway.assert_called_once()
 
     def test_frete_zero_explicito_e_arredondamento(self):
         for raw, expected in (
@@ -424,6 +579,14 @@ class ShippingQuoteTests(APITestCase):
                     create_shipping_quote(self.user, self.address.pk)
         self.mock_price.assert_not_called()
         self.assertFalse(ShippingQuote.objects.exists())
+
+    def test_rejeita_expiracao_durante_validacao(self):
+        quote = create_shipping_quote(self.user, self.address.pk)
+        with patch(
+            "orders.services.timezone.now",
+            side_effect=[quote.expires_at - timedelta(seconds=1), quote.expires_at],
+        ):
+            self.assert_quote_rejected(quote, "quote_expired")
 
     def test_rejeita_outro_usuario_e_id_invalido_sem_expor_cotacao(self):
         quote = create_shipping_quote(self.user, self.address.pk)
@@ -622,7 +785,7 @@ class ShippingQuoteTests(APITestCase):
                     **{field: Decimal("-0.01")}
                 )
 
-    def test_rota_atual_de_calculo_permanece_sem_persistencia(self):
+    def test_rota_de_calculo_retorna_cotacao_persistida(self):
         self.client.force_authenticate(user=self.user)
         response = self.client.post(
             "/api/orders/checkout/calculate/",
@@ -631,8 +794,10 @@ class ShippingQuoteTests(APITestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["total_amount"], "54.99")
-        self.assertNotIn("shipping_quote_id", response.data)
-        self.assertFalse(ShippingQuote.objects.exists())
+        quote = ShippingQuote.objects.get(pk=response.data["shipping_quote_id"])
+        self.assertEqual(quote.total_amount, Decimal(response.data["total_amount"]))
+        self.assertIn("expires_at", response.data)
+        self.assertEqual(response.data["address"]["street"], self.address.street)
 
 
 class PaymentSuccessRedirectTests(APITestCase):
