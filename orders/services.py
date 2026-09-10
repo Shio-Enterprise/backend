@@ -3,6 +3,7 @@ from uuid import UUID
 
 import requests
 from django.conf import settings
+from django.contrib.auth import get_user_model
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 from django.shortcuts import get_object_or_404
@@ -403,9 +404,21 @@ def update_status(order, new_status, changed_by=None, tracking_code=None, commen
 
 def get_welcome_discount(user, subtotal):
     """Retorna (coupon, discount_amount) para o desconto de boas-vindas,
-    ou (None, Decimal('0.00')) se o usuário não for elegível."""
+    ou (None, Decimal('0.00')) se o usuário não for elegível.
+
+    Deve ser chamada dentro de uma transaction.atomic() (o caller,
+    CheckoutAPIView.post, já está decorado com @transaction.atomic).
+    Faz o lock da linha do usuário via select_for_update() antes de checar
+    se ele já tem pedido: isso serializa dois checkouts concorrentes do
+    mesmo usuário — a segunda transação só prossegue além do lock depois
+    que a primeira commitar, e nesse ponto já enxerga o pedido criado pela
+    primeira, evitando aplicar o desconto duas vezes.
+    """
     if not user.is_authenticated:
         return None, Decimal("0.00")
+
+    User = get_user_model()
+    User.objects.select_for_update().get(pk=user.pk)
 
     has_previous_order = CustomerOrder.objects.filter(user=user).exists()
     if has_previous_order:

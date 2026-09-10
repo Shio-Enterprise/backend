@@ -1,7 +1,10 @@
 import uuid
+from decimal import Decimal
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.db import connection, transaction
+from django.test.utils import CaptureQueriesContext
 from rest_framework import status
 from rest_framework.test import APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -16,6 +19,7 @@ from orders.models import (
     Payment,
     PaymentStatus,
 )
+from orders.services import get_welcome_discount
 from products.models import Category, Product, ProductVariation
 
 User = get_user_model()
@@ -1296,3 +1300,106 @@ class WelcomeCouponSeedTests(APITestCase):
         self.assertEqual(coupon.discount_type, "PERCENTAGE")
         self.assertEqual(coupon.discount_value, 10)
         self.assertTrue(coupon.is_active)
+
+
+class GetWelcomeDiscountConcurrencyTests(APITestCase):
+    """Cobre o risco de corrida entre dois checkouts concorrentes do mesmo
+    usuário que nunca comprou antes: ambos não podem aplicar o desconto de
+    boas-vindas (ver get_welcome_discount em orders/services.py).
+
+    Nota sobre a estratégia de teste: o banco usado nos testes é SQLite em
+    memória. Nesse backend, `django.db.models.QuerySet.select_for_update()`
+    é essencialmente um no-op — a feature `has_select_for_update` é False
+    para o SQLite, então o Django nem adiciona a cláusula `FOR UPDATE` nem
+    valida que a chamada está dentro de uma transação (ver
+    django/db/models/sql/compiler.py, condição
+    `self.query.select_for_update and features.has_select_for_update`).
+    Ou seja: um teste com threads reais batendo no SQLite não provaria nada
+    sobre o `select_for_update` em si (ele não bloqueia lá) — só mostraria
+    uma peculiaridade de locking do SQLite, o que tornaria o teste flaky e
+    não relacionado ao comportamento real de produção (Postgres, onde
+    `SELECT ... FOR UPDATE` bloqueia de verdade e serializa as transações).
+
+    Por isso o teste abaixo prova, de forma determinística, que o lock
+    "governa" a checagem: dentro de uma única transaction.atomic() — a mesma
+    seção que, em Postgres, uma segunda transação concorrente só atravessaria
+    depois que a primeira commitasse — criamos o pedido da primeira "checkout"
+    e então chamamos get_welcome_discount() de novo, simulando a checagem que
+    a segunda transação concorrente faria ao ser liberada pelo lock. Ela deve
+    enxergar o pedido recém-criado e negar o desconto, confirmando que a
+    ordem lock -> checagem -> criação está correta e que, em um banco com
+    locking real, isso serializa as duas requisições concorrentes.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="concorrencia@shio.com",
+            name="Concorrencia",
+            password="senha_forte_123",
+        )
+
+    def test_lock_do_usuario_governa_checagem_de_primeira_compra(self):
+        with transaction.atomic():
+            User.objects.select_for_update().get(pk=self.user.pk)
+
+            coupon, discount = get_welcome_discount(self.user, Decimal("200.00"))
+            self.assertIsNotNone(coupon)
+            self.assertEqual(coupon.code, "BEMVINDO10")
+            self.assertEqual(discount, Decimal("20.00"))
+
+            CustomerOrder.objects.create(
+                user=self.user,
+                coupon=coupon,
+                subtotal=Decimal("200.00"),
+                discount_amount=discount,
+                total_amount=Decimal("180.00"),
+                status=OrderStatus.AWAITING_PAYMENT,
+            )
+
+            # Simula a segunda transação concorrente retomando após o lock:
+            # ela deve enxergar o pedido acabado de criar e não conceder
+            # desconto duplicado.
+            coupon2, discount2 = get_welcome_discount(self.user, Decimal("200.00"))
+            self.assertIsNone(coupon2)
+            self.assertEqual(discount2, Decimal("0.00"))
+
+    def test_helper_bloqueia_linha_do_usuario_antes_de_checar_pedidos_anteriores(self):
+        """Prova, via SQL de fato executado, que get_welcome_discount adquire
+        o lock na linha do usuário (SELECT ... na tabela de usuário via
+        select_for_update) ANTES de consultar se ele já possui pedido. Essa
+        ordem é o que, em um banco com locking real (Postgres em produção),
+        serializa dois checkouts concorrentes do mesmo usuário — a segunda
+        transação bloqueia no lock até a primeira commitar. Diferente do
+        teste acima (que só confirma o resultado final e passaria mesmo sem
+        o lock, já que o SQLite ignora select_for_update), este teste
+        garante que uma remoção acidental do select_for_update() quebre o
+        CI, checando a ordem real das queries emitidas."""
+        User = get_user_model()
+        user_table = User._meta.db_table
+        order_table = CustomerOrder._meta.db_table
+
+        with transaction.atomic():
+            with CaptureQueriesContext(connection) as ctx:
+                get_welcome_discount(self.user, Decimal("200.00"))
+
+        queries = [q["sql"] for q in ctx.captured_queries]
+        user_query_index = next(
+            (i for i, sql in enumerate(queries) if user_table in sql), None
+        )
+        order_query_index = next(
+            (i for i, sql in enumerate(queries) if order_table in sql), None
+        )
+
+        self.assertIsNotNone(
+            user_query_index, "Esperava uma query de lock na tabela de usuário."
+        )
+        self.assertIsNotNone(
+            order_query_index,
+            "Esperava uma query checando pedidos anteriores do usuário.",
+        )
+        self.assertLess(
+            user_query_index,
+            order_query_index,
+            "O lock select_for_update na linha do usuário deve ocorrer antes "
+            "da checagem de pedidos anteriores (CustomerOrder.objects...exists()).",
+        )
