@@ -16,7 +16,7 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import UserProfile, UserRole
+from .models import NewsletterSubscriber, UserProfile, UserRole
 from .services import GoogleAuthService, InvalidGoogleTokenException
 
 User = get_user_model()
@@ -376,3 +376,17 @@ class LogoutViewTests(APITestCase):
         self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.access}")
         response = self.client.post(self.url, {}, format="json")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class NewsletterSubscriberModelTests(TestCase):
+    def test_cria_assinante_com_consentimento(self):
+        subscriber = NewsletterSubscriber.objects.create(
+            email="fan@shio.com", consent_lgpd=True
+        )
+        self.assertTrue(subscriber.consent_lgpd)
+        self.assertIsNotNone(subscriber.subscribed_at)
+
+    def test_email_e_unico(self):
+        NewsletterSubscriber.objects.create(email="dup@shio.com", consent_lgpd=True)
+        with self.assertRaises(Exception):
+            NewsletterSubscriber.objects.create(email="dup@shio.com", consent_lgpd=True)
