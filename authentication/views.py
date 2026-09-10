@@ -562,17 +562,27 @@ class NewsletterSubscribeView(APIView):
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         email = serializer.validated_data["email"]
-        existing = NewsletterSubscriber.objects.filter(email=email).first()
-        if existing:
-            if not existing.consent_lgpd:
-                existing.consent_lgpd = True
-                existing.unsubscribed_at = None
-                existing.save()
+        # get_or_create em vez de filter().first() + create(): duas requisições
+        # concorrentes com o mesmo e-mail novo passariam ambas pela checagem e a
+        # segunda estouraria IntegrityError (500) na coluna única `email`.
+        subscriber, created = NewsletterSubscriber.objects.get_or_create(
+            email=email, defaults={"consent_lgpd": True}
+        )
+
+        if not created:
+            # Ao reenviar o formulário o usuário reconsente explicitamente:
+            # reativa a inscrição independentemente do consent_lgpd atual.
+            changed = (
+                not subscriber.consent_lgpd or subscriber.unsubscribed_at is not None
+            )
+            if changed:
+                subscriber.consent_lgpd = True
+                subscriber.unsubscribed_at = None
+                subscriber.save(update_fields=["consent_lgpd", "unsubscribed_at"])
             return Response(
                 {"message": "E-mail já inscrito."}, status=status.HTTP_200_OK
             )
 
-        NewsletterSubscriber.objects.create(email=email, consent_lgpd=True)
         return Response(
             {"message": "Inscrito com sucesso!"}, status=status.HTTP_201_CREATED
         )

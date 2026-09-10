@@ -5,8 +5,9 @@ import requests
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ObjectDoesNotExist
-from django.db import transaction
+from django.db import models, transaction
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 
 from orders.models import (
     Cart,
@@ -43,6 +44,18 @@ def create_infinitepay_checkout(order, request):
                 "quantity": 1,
                 "price": int(order.shipping_cost * 100),
                 "description": "Frete",
+            }
+        )
+
+    if order.discount_amount > 0:
+        # Linha negativa para que o total cobrado pelo gateway bata com
+        # order.total_amount (subtotal - desconto + frete). Sem ela, o cliente
+        # veria o desconto na UI mas seria cobrado o valor cheio.
+        items_data.append(
+            {
+                "quantity": 1,
+                "price": -int(order.discount_amount * 100),
+                "description": "Desconto de boas-vindas",
             }
         )
 
@@ -418,17 +431,59 @@ def update_status(order, new_status, changed_by=None, tracking_code=None, commen
     )
 
 
+def _compute_welcome_discount(user, subtotal):
+    """Lógica compartilhada de elegibilidade e cálculo do desconto de
+    boas-vindas, usada por get_welcome_discount e get_welcome_discount_preview.
+
+    Retorna (coupon, discount_amount) ou (None, Decimal('0.00')) se o usuário
+    não for elegível. NÃO adquire lock algum: quem precisa serializar contra
+    checkouts concorrentes (get_welcome_discount) deve travar a linha do
+    usuário ANTES de chamar esta função.
+
+    Só considera o cupom BEMVINDO10 se ele estiver ativo e não expirado, e
+    respeita o discount_type configurado (PERCENTAGE ou FIXED_VALUE), de modo
+    que uma edição da linha do cupom no admin não seja silenciosamente
+    ignorada.
+    """
+    if not user.is_authenticated:
+        return None, Decimal("0.00")
+
+    has_previous_order = CustomerOrder.objects.filter(user=user).exists()
+    if has_previous_order:
+        return None, Decimal("0.00")
+
+    coupon = (
+        Coupon.objects.filter(code="BEMVINDO10", is_active=True)
+        .filter(
+            models.Q(expiration_date__isnull=True)
+            | models.Q(expiration_date__gt=timezone.now())
+        )
+        .first()
+    )
+    if not coupon:
+        return None, Decimal("0.00")
+
+    if coupon.discount_type == "FIXED_VALUE":
+        # Nunca deixa o desconto ultrapassar o subtotal (total negativo).
+        discount = min(coupon.discount_value, subtotal)
+    else:
+        discount = subtotal * (coupon.discount_value / Decimal("100"))
+
+    return coupon, discount.quantize(Decimal("0.01"))
+
+
 def get_welcome_discount(user, subtotal):
     """Retorna (coupon, discount_amount) para o desconto de boas-vindas,
     ou (None, Decimal('0.00')) se o usuário não for elegível.
 
     Deve ser chamada dentro de uma transaction.atomic() (o caller,
     CheckoutAPIView.post, já está decorado com @transaction.atomic).
-    Faz o lock da linha do usuário via select_for_update() antes de checar
-    se ele já tem pedido: isso serializa dois checkouts concorrentes do
-    mesmo usuário — a segunda transação só prossegue além do lock depois
-    que a primeira commitar, e nesse ponto já enxerga o pedido criado pela
-    primeira, evitando aplicar o desconto duas vezes.
+    Faz o lock da linha do usuário via select_for_update() antes de delegar a
+    checagem de elegibilidade a _compute_welcome_discount(): isso serializa
+    dois checkouts concorrentes do mesmo usuário — a segunda transação só
+    prossegue além do lock depois que a primeira commitar, e nesse ponto já
+    enxerga o pedido criado pela primeira, evitando aplicar o desconto duas
+    vezes.
     """
     if not user.is_authenticated:
         return None, Decimal("0.00")
@@ -436,18 +491,7 @@ def get_welcome_discount(user, subtotal):
     User = get_user_model()
     User.objects.select_for_update().get(pk=user.pk)
 
-    has_previous_order = CustomerOrder.objects.filter(user=user).exists()
-    if has_previous_order:
-        return None, Decimal("0.00")
-
-    coupon = Coupon.objects.filter(code="BEMVINDO10", is_active=True).first()
-    if not coupon:
-        return None, Decimal("0.00")
-
-    discount = (subtotal * (coupon.discount_value / Decimal("100"))).quantize(
-        Decimal("0.01")
-    )
-    return coupon, discount
+    return _compute_welcome_discount(user, subtotal)
 
 
 def get_welcome_discount_preview(user, subtotal):
@@ -456,25 +500,12 @@ def get_welcome_discount_preview(user, subtotal):
     rota de leitura que apenas exibe uma prévia do desconto).
 
     Mesma assinatura e retorno de get_welcome_discount — (coupon, discount) ou
-    (None, Decimal('0.00')) — e mesma lógica de elegibilidade, mas SEM
-    select_for_update(): não adquire lock na linha do usuário, então não
-    serializa contra checkouts concorrentes. Isso é aceitável aqui porque
-    esta função só alimenta uma prévia informativa no carrinho; a aplicação
-    real e segura contra corrida do desconto acontece em get_welcome_discount,
-    chamada por CheckoutAPIView.post dentro de @transaction.atomic.
+    (None, Decimal('0.00')) — e mesma lógica de elegibilidade (as duas delegam
+    a _compute_welcome_discount), mas SEM select_for_update(): não adquire lock
+    na linha do usuário, então não serializa contra checkouts concorrentes.
+    Isso é aceitável aqui porque esta função só alimenta uma prévia informativa
+    no carrinho; a aplicação real e segura contra corrida do desconto acontece
+    em get_welcome_discount, chamada por CheckoutAPIView.post dentro de
+    @transaction.atomic.
     """
-    if not user.is_authenticated:
-        return None, Decimal("0.00")
-
-    has_previous_order = CustomerOrder.objects.filter(user=user).exists()
-    if has_previous_order:
-        return None, Decimal("0.00")
-
-    coupon = Coupon.objects.filter(code="BEMVINDO10", is_active=True).first()
-    if not coupon:
-        return None, Decimal("0.00")
-
-    discount = (subtotal * (coupon.discount_value / Decimal("100"))).quantize(
-        Decimal("0.01")
-    )
-    return coupon, discount
+    return _compute_welcome_discount(user, subtotal)

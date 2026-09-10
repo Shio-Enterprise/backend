@@ -1,10 +1,13 @@
 import uuid
+from datetime import timedelta
 from decimal import Decimal
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.db import connection, transaction
+from django.test import RequestFactory
 from django.test.utils import CaptureQueriesContext
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -13,13 +16,18 @@ from authentication.models import Address, UserProfile, UserRole
 from orders.models import (
     Cart,
     CartItem,
+    Coupon,
     CustomerOrder,
     OrderItem,
     OrderStatus,
     Payment,
     PaymentStatus,
 )
-from orders.services import get_welcome_discount
+from orders.services import (
+    create_infinitepay_checkout,
+    get_welcome_discount,
+    get_welcome_discount_preview,
+)
 from products.models import Category, Product, ProductVariation
 
 User = get_user_model()
@@ -158,6 +166,108 @@ class CheckoutAPITests(APITestCase):
         ).first()
         self.assertEqual(new_order.discount_amount, 0)
         self.assertIsNone(new_order.coupon)
+
+
+class CreateInfinitePayCheckoutPayloadTests(APITestCase):
+    """Garante que o payload enviado à InfinitePay cobra exatamente
+    order.total_amount — em especial que o desconto de boas-vindas vira uma
+    linha negativa no payload, em vez de o cliente ser cobrado o valor cheio.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="payload@shio.com", name="Payload", password="senha_forte_123"
+        )
+        self.category = Category.objects.create(name="Calçados", slug="calcados")
+        self.product = Product.objects.create(
+            category=self.category, name="Tênis Teste", base_price=Decimal("100.00")
+        )
+        self.variation = ProductVariation.objects.create(
+            product=self.product, size="40", sku="TENIS-40", stock_quantity=10
+        )
+        self.factory = RequestFactory()
+
+    def make_order(self, discount_amount):
+        subtotal = Decimal("200.00")
+        shipping_cost = Decimal("15.00")
+        order = CustomerOrder.objects.create(
+            user=self.user,
+            subtotal=subtotal,
+            shipping_cost=shipping_cost,
+            discount_amount=discount_amount,
+            total_amount=subtotal - discount_amount + shipping_cost,
+            shipping_zip_code="71000000",
+            shipping_street="Rua Teste",
+            shipping_number="123",
+            shipping_neighborhood="Centro",
+            shipping_city="Brasília",
+            shipping_state="DF",
+        )
+        OrderItem.objects.create(
+            order=order,
+            variation=self.variation,
+            quantity=2,
+            unit_price=Decimal("100.00"),
+            product_name=self.product.name,
+            sku_snapshot=self.variation.sku,
+        )
+        return order
+
+    def call_service(self, order):
+        """Chama create_infinitepay_checkout mockando apenas a chamada HTTP de
+        saída, e devolve o payload realmente enviado ao gateway."""
+        with patch("orders.services.requests.post") as mock_post:
+            mock_post.return_value.raise_for_status.return_value = None
+            mock_post.return_value.json.return_value = {
+                "url": "https://pay.infinitepay.io/mock-url"
+            }
+            request = self.factory.get("/")
+            url = create_infinitepay_checkout(order, request)
+
+        self.assertEqual(url, "https://pay.infinitepay.io/mock-url")
+        return mock_post.call_args.kwargs["json"]
+
+    def test_payload_com_desconto_cobra_o_total_do_pedido(self):
+        order = self.make_order(Decimal("20.00"))
+
+        payload = self.call_service(order)
+
+        total_cobrado = sum(
+            item["price"] * item["quantity"] for item in payload["items"]
+        )
+        self.assertEqual(total_cobrado, int(order.total_amount * 100))
+
+    def test_payload_com_desconto_adiciona_linha_negativa_apos_o_frete(self):
+        order = self.make_order(Decimal("20.00"))
+
+        payload = self.call_service(order)
+
+        descriptions = [item["description"] for item in payload["items"]]
+        self.assertEqual(
+            descriptions, ["Tênis Teste", "Frete", "Desconto de boas-vindas"]
+        )
+
+        discount_line = payload["items"][-1]
+        self.assertEqual(discount_line["quantity"], 1)
+        self.assertEqual(discount_line["price"], -2000)
+
+        # Os preços por produto continuam íntegros (itemização correta no recibo).
+        self.assertEqual(payload["items"][0]["price"], 10000)
+        self.assertEqual(payload["items"][0]["quantity"], 2)
+
+    def test_payload_sem_desconto_nao_ganha_linha_de_desconto(self):
+        order = self.make_order(Decimal("0.00"))
+
+        payload = self.call_service(order)
+
+        descriptions = [item["description"] for item in payload["items"]]
+        self.assertEqual(descriptions, ["Tênis Teste", "Frete"])
+        self.assertTrue(all(item["price"] > 0 for item in payload["items"]))
+
+        total_cobrado = sum(
+            item["price"] * item["quantity"] for item in payload["items"]
+        )
+        self.assertEqual(total_cobrado, int(order.total_amount * 100))
 
 
 class PaymentSuccessRedirectTests(APITestCase):
@@ -1419,3 +1529,87 @@ class GetWelcomeDiscountConcurrencyTests(APITestCase):
             "O lock select_for_update na linha do usuário deve ocorrer antes "
             "da checagem de pedidos anteriores (CustomerOrder.objects...exists()).",
         )
+
+
+class WelcomeDiscountCouponRulesTests(APITestCase):
+    """Cobre as regras do cupom que antes eram ignoradas pelos helpers de
+    desconto: expiration_date e discount_type (PERCENTAGE vs FIXED_VALUE).
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="cupom@shio.com", name="Cupom", password="senha_forte_123"
+        )
+        self.coupon = Coupon.objects.get(code="BEMVINDO10")
+
+    def test_cupom_sem_expiracao_continua_valido(self):
+        coupon, discount = get_welcome_discount_preview(self.user, Decimal("200.00"))
+
+        self.assertIsNotNone(coupon)
+        self.assertEqual(discount, Decimal("20.00"))
+
+    def test_cupom_com_expiracao_futura_continua_valido(self):
+        self.coupon.expiration_date = timezone.now() + timedelta(days=1)
+        self.coupon.save()
+
+        coupon, discount = get_welcome_discount_preview(self.user, Decimal("200.00"))
+
+        self.assertIsNotNone(coupon)
+        self.assertEqual(discount, Decimal("20.00"))
+
+    def test_cupom_expirado_nao_concede_desconto(self):
+        self.coupon.expiration_date = timezone.now() - timedelta(days=1)
+        self.coupon.save()
+
+        coupon, discount = get_welcome_discount_preview(self.user, Decimal("200.00"))
+
+        self.assertIsNone(coupon)
+        self.assertEqual(discount, Decimal("0.00"))
+
+    def test_cupom_expirado_tambem_bloqueia_no_checkout(self):
+        """A versão com lock (usada no checkout) compartilha o mesmo helper,
+        então também precisa respeitar a expiração."""
+        self.coupon.expiration_date = timezone.now() - timedelta(days=1)
+        self.coupon.save()
+
+        with transaction.atomic():
+            coupon, discount = get_welcome_discount(self.user, Decimal("200.00"))
+
+        self.assertIsNone(coupon)
+        self.assertEqual(discount, Decimal("0.00"))
+
+    def test_cupom_fixed_value_aplica_valor_fixo(self):
+        # Alteração restrita a esta transação de teste (rollback no tearDown),
+        # simulando alguém editando o cupom pelo admin.
+        self.coupon.discount_type = "FIXED_VALUE"
+        self.coupon.discount_value = Decimal("30.00")
+        self.coupon.save()
+
+        coupon, discount = get_welcome_discount_preview(self.user, Decimal("200.00"))
+
+        self.assertIsNotNone(coupon)
+        self.assertEqual(discount, Decimal("30.00"))
+
+    def test_cupom_fixed_value_maior_que_subtotal_e_limitado_ao_subtotal(self):
+        self.coupon.discount_type = "FIXED_VALUE"
+        self.coupon.discount_value = Decimal("500.00")
+        self.coupon.save()
+
+        coupon, discount = get_welcome_discount_preview(self.user, Decimal("200.00"))
+
+        self.assertIsNotNone(coupon)
+        self.assertEqual(discount, Decimal("200.00"))
+
+    def test_preview_e_versao_com_lock_retornam_o_mesmo_resultado(self):
+        """Guarda contra drift entre os dois helpers públicos (ambos delegam a
+        _compute_welcome_discount)."""
+        preview_coupon, preview_discount = get_welcome_discount_preview(
+            self.user, Decimal("200.00")
+        )
+        with transaction.atomic():
+            locked_coupon, locked_discount = get_welcome_discount(
+                self.user, Decimal("200.00")
+            )
+
+        self.assertEqual(preview_coupon, locked_coupon)
+        self.assertEqual(preview_discount, locked_discount)

@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -432,3 +433,54 @@ class NewsletterSubscribeAPITests(APITestCase):
         self.assertEqual(
             NewsletterSubscriber.objects.filter(email="ja@shio.com").count(), 1
         )
+
+    def test_reinscricao_reativa_quem_havia_cancelado_mantendo_consentimento(self):
+        """Quem cancelou a inscrição (unsubscribed_at preenchido) mas manteve
+        consent_lgpd=True deve ser reativado ao se inscrever de novo."""
+        subscriber = NewsletterSubscriber.objects.create(
+            email="voltou@shio.com", consent_lgpd=True
+        )
+        subscriber.unsubscribed_at = timezone.now()
+        subscriber.save()
+
+        response = self.client.post(
+            self.url, {"email": "voltou@shio.com", "consent_lgpd": True}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        subscriber.refresh_from_db()
+        self.assertIsNone(subscriber.unsubscribed_at)
+        self.assertTrue(subscriber.consent_lgpd)
+
+    def test_reinscricao_de_quem_havia_revogado_consentimento_reativa(self):
+        subscriber = NewsletterSubscriber.objects.create(
+            email="revogou@shio.com", consent_lgpd=False
+        )
+        subscriber.unsubscribed_at = timezone.now()
+        subscriber.save()
+
+        response = self.client.post(
+            self.url, {"email": "revogou@shio.com", "consent_lgpd": True}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        subscriber.refresh_from_db()
+        self.assertTrue(subscriber.consent_lgpd)
+        self.assertIsNone(subscriber.unsubscribed_at)
+
+    def test_reinscricao_de_assinante_ativo_nao_faz_escrita_desnecessaria(self):
+        subscriber = NewsletterSubscriber.objects.create(
+            email="ativo@shio.com", consent_lgpd=True
+        )
+
+        with patch.object(NewsletterSubscriber, "save") as mock_save:
+            response = self.client.post(
+                self.url,
+                {"email": "ativo@shio.com", "consent_lgpd": True},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        mock_save.assert_not_called()
+        subscriber.refresh_from_db()
+        self.assertTrue(subscriber.consent_lgpd)
