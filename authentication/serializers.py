@@ -193,3 +193,15 @@ class CustomerCRMDetailSerializer(CustomerCRMSerializer):
     def get_order_history(self, obj) -> list:
         orders = obj.orders.all().order_by("-created_at")
         return CustomerOrderHistorySerializer(orders, many=True).data
+
+
+class NewsletterSubscribeSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+    consent_lgpd = serializers.BooleanField()
+
+    def validate_consent_lgpd(self, value):
+        if not value:
+            raise serializers.ValidationError(
+                "É necessário aceitar o consentimento para se inscrever."
+            )
+        return value

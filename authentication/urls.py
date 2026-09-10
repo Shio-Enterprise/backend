@@ -11,6 +11,7 @@ from .views import (
     TokenRefreshView,
     RegisterView,
     PasswordLoginView,
+    NewsletterSubscribeView,
 )
 
 app_name = "authentication"
@@ -35,6 +36,12 @@ urlpatterns = [
     path("addresses/", AddressListCreateView.as_view(), name="addresses"),
     # PATCH/DELETE - Atualiza ou remove um endereço específico
     path("addresses/<uuid:pk>/", AddressDetailView.as_view(), name="address-detail"),
+    # POST - Inscrição pública na newsletter (consentimento LGPD obrigatório)
+    path(
+        "newsletter/subscribe/",
+        NewsletterSubscribeView.as_view(),
+        name="newsletter-subscribe",
+    ),
 ]
 
 urlpatterns += router.urls

@@ -29,7 +29,9 @@ from .serializers import (
     UserSerializer,
     RegisterSerializer,
     PasswordLoginSerializer,
+    NewsletterSubscribeSerializer,
 )
+from .models import NewsletterSubscriber
 from .services import GoogleAuthService, InvalidGoogleTokenException
 
 logger = logging.getLogger(__name__)
@@ -546,3 +548,31 @@ class CustomerCRMViewSet(viewsets.ReadOnlyModelViewSet):
         if self.action == "retrieve":
             return CustomerCRMDetailSerializer
         return CustomerCRMSerializer
+
+
+class NewsletterSubscribeView(APIView):
+    """Inscrição pública na newsletter, com consentimento LGPD obrigatório."""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        serializer = NewsletterSubscribeSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        email = serializer.validated_data["email"]
+        existing = NewsletterSubscriber.objects.filter(email=email).first()
+        if existing:
+            if not existing.consent_lgpd:
+                existing.consent_lgpd = True
+                existing.unsubscribed_at = None
+                existing.save()
+            return Response(
+                {"message": "E-mail já inscrito."}, status=status.HTTP_200_OK
+            )
+
+        NewsletterSubscriber.objects.create(email=email, consent_lgpd=True)
+        return Response(
+            {"message": "Inscrito com sucesso!"}, status=status.HTTP_201_CREATED
+        )
