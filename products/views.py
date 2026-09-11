@@ -15,7 +15,7 @@ from rest_framework.views import APIView
 
 from authentication.permissions import IsStaffOrSuperUser
 
-from .catalog import CatalogPagination, filter_catalog
+from .catalog import CatalogPagination, catalog_filter_options, filter_catalog
 from .models import (
     Category,
     DropCampaign,
@@ -25,6 +25,7 @@ from .models import (
     StockMovementKind,
 )
 from .serializers import (
+    CatalogFilterOptionsSerializer,
     CategorySerializer,
     DropCampaignDetailSerializer,
     DropCampaignSerializer,
@@ -398,6 +399,19 @@ class DropProductManageView(APIView):
 # ─── Products ─────────────────────────────────────────────────────────────────
 
 
+class CatalogFilterOptionsView(APIView):
+    permission_classes = [AllowAny]
+
+    @extend_schema(
+        tags=["Products"],
+        summary="Opções de filtros do catálogo público",
+        description="Preços, tamanhos e cores de todos os produtos ativos, independentemente da página ou dos filtros selecionados.",
+        responses={200: CatalogFilterOptionsSerializer},
+    )
+    def get(self, request):
+        return Response(CatalogFilterOptionsSerializer(catalog_filter_options()).data)
+
+
 class ProductListCreateView(APIView):
     """Listar produtos (público, com filtros) e criar (admin)."""
 
@@ -425,7 +439,7 @@ class ProductListCreateView(APIView):
             "Drop por UUID. Busca sem distinção de maiúsculas em name/description. "
             "Cores exatas repetidas: `color=Preto&color=Azul`; tamanho e cor na mesma "
             "variação. Preços inclusivos, não negativos, com até duas casas decimais. "
-            "Página inicial 1, tamanho padrão 20 e máximo 100 (valores maiores são limitados). "
+            "Página inicial 1, tamanho padrão 20 e máximo 50 (valores maiores são limitados). "
             "Parâmetros inválidos retornam 400; página inexistente retorna 404. "
             "Ordenação padrão -created_at, com id como desempate; preços e vendas "
             "desempatam por -created_at e id. Vendas somam quantidades de pedidos PAID, "

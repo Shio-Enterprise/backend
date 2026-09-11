@@ -1,10 +1,33 @@
 from uuid import UUID
 
-from django.db.models import OuterRef, Q, Subquery, Sum
+from django.db.models import Max, Min, OuterRef, Q, Subquery, Sum
 from django.db.models.functions import Coalesce
 from rest_framework.pagination import PageNumberPagination
 
 from orders.models import OrderItem, OrderStatus
+
+from .models import Product, ProductVariation
+
+
+def catalog_filter_options():
+    """Opções do catálogo completo, sem carregar produtos na interface."""
+    products = Product.objects.filter(is_active=True)
+    variations = ProductVariation.objects.filter(product__is_active=True)
+    return {
+        **products.aggregate(min_price=Min("base_price"), max_price=Max("base_price")),
+        "sizes": list(
+            variations.exclude(size="")
+            .order_by("size")
+            .values_list("size", flat=True)
+            .distinct()
+        ),
+        "colors": list(
+            variations.exclude(color="")
+            .order_by("color")
+            .values_list("color", flat=True)
+            .distinct()
+        ),
+    }
 
 
 class CatalogPagination(PageNumberPagination):
@@ -12,7 +35,9 @@ class CatalogPagination(PageNumberPagination):
     page_size_query_param = "page_size"
     max_page_size = 50
 
+
 def filter_catalog(queryset, params):
+    """Aplica parâmetros já validados; tamanho e cor devem existir na mesma variação."""
     # Mantém compatibilidade com UUIDs existentes, mas aceita slug como contrato público da categoria.
     category = params.get("category")
     if category:

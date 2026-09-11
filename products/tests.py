@@ -33,7 +33,7 @@ from .models import (
     ProductVariation,
     StockMovement,
 )
-from .views import ProductListCreateView
+from .views import CatalogFilterOptionsView, ProductListCreateView
 
 User = get_user_model()
 
@@ -679,7 +679,7 @@ class ProductListContractTests(APITestCase):
         )
         body = self.client.get(self.url, {"page_size": 999}).json()
         self.assertEqual(body["count"], 105)
-        self.assertEqual(len(body["results"]), 100)
+        self.assertEqual(len(body["results"]), 50)
         self.assertIsNotNone(body["next"])
 
     def test_category_slug_uuid_and_unknown(self):
@@ -705,6 +705,80 @@ class ProductListContractTests(APITestCase):
         body = self.client.get(self.url, {"search": "EXCLUSIVO"}).json()
         self.assertEqual(body["count"], 1)
         self.assertEqual(body["results"][0]["id"], str(self.products[0].id))
+
+    def test_search_name_and_inclusive_price_boundaries(self):
+        body = self.client.get(
+            self.url, {"search": "pRoDuTo 0", "min_price": "0", "max_price": "0"}
+        ).json()
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["results"][0]["id"], str(self.products[0].id))
+
+    def test_each_variation_filter_and_unknown_values(self):
+        ProductVariation.objects.create(
+            product=self.products[0], size="M", color="Azul", sku="FILTER-M"
+        )
+        for params, expected in (
+            ({"size": "M"}, 1),
+            ({"color": "Azul"}, 1),
+            ({"size": "Inexistente"}, 0),
+            ({"color": "Inexistente"}, 0),
+        ):
+            with self.subTest(params=params):
+                body = self.client.get(self.url, params).json()
+                self.assertEqual(body["count"], expected)
+
+    def test_list_metadata_preserves_relation_ids(self):
+        drop = DropCampaign.objects.create(name="Coleção", slug="colecao")
+        product = self.products[0]
+        product.drop = drop
+        product.save()
+        with self.assertNumQueries(4):
+            body = self.client.get(self.url, {"search": "EXCLUSIVO"}).json()
+        item = body["results"][0]
+        self.assertEqual(item["category"], str(self.category.id))
+        self.assertEqual(item["drop"], str(drop.id))
+        self.assertEqual(item["category_details"]["slug"], "camisetas")
+        self.assertEqual(item["drop_details"]["slug"], "colecao")
+
+    def test_filter_options_cover_all_active_products_without_duplicates(self):
+        inactive = make_product(is_active=False, base_price=9999)
+        for product, size, color in (
+            (self.products[0], "M", "Azul"),
+            (self.products[-1], "M", "Azul"),
+            (self.products[1], "G", ""),
+            (inactive, "EXCLUSIVO", "Oculta"),
+        ):
+            ProductVariation.objects.create(
+                product=product, size=size, color=color, sku=str(uuid.uuid4())
+            )
+        with self.assertNumQueries(3):
+            response = self.client.get(self.url + "filter-options/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {
+                "min_price": "0.00",
+                "max_price": "24.00",
+                "sizes": ["G", "M"],
+                "colors": ["Azul"],
+            },
+        )
+
+    def test_empty_filter_options_and_nullable_list_metadata(self):
+        Product.objects.all().delete()
+        self.assertEqual(
+            self.client.get(self.url + "filter-options/").json(),
+            {
+                "min_price": None,
+                "max_price": None,
+                "sizes": [],
+                "colors": [],
+            },
+        )
+        make_product()
+        item = self.client.get(self.url).json()["results"][0]
+        self.assertIsNone(item["category_details"])
+        self.assertIsNone(item["drop_details"])
 
     def test_combined_filters_require_same_variation_without_duplicates(self):
         matching = self.products[10]
@@ -771,9 +845,14 @@ class ProductListContractTests(APITestCase):
 
     def test_openapi_documents_query_and_paginated_response(self):
         schema = SchemaGenerator(
-            patterns=[path("api/catalog/products/", ProductListCreateView.as_view())]
+            patterns=[
+                path("api/catalog/products/", ProductListCreateView.as_view()),
+                path("api/catalog/products/filter-options/", CatalogFilterOptionsView.as_view()),
+            ]
         ).get_schema(public=True)
         validate_schema(schema)
+        filter_options_operation = schema["paths"][self.url + "filter-options/"]["get"]
+        self.assertIn("200", filter_options_operation["responses"])
         operation = schema["paths"][self.url]["get"]
         names = {parameter["name"] for parameter in operation["parameters"]}
         self.assertTrue(

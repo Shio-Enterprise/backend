@@ -45,6 +45,17 @@ class ProductListQuerySerializer(serializers.Serializer):
         return attrs
 
 
+class CatalogFilterOptionsSerializer(serializers.Serializer):
+    min_price = serializers.DecimalField(
+        max_digits=10, decimal_places=2, allow_null=True
+    )
+    max_price = serializers.DecimalField(
+        max_digits=10, decimal_places=2, allow_null=True
+    )
+    sizes = serializers.ListField(child=serializers.CharField())
+    colors = serializers.ListField(child=serializers.CharField())
+
+
 class CategorySerializer(serializers.ModelSerializer):
     """Serializer de Category — usado em list, detail, create e update (PUT)."""
 
@@ -226,6 +237,8 @@ class ProductListSerializer(serializers.ModelSerializer):
 
     variations = ProductVariationSerializer(many=True, read_only=True)
     images = ProductImageSerializer(many=True, read_only=True)
+    category_details = CategoryNestedSerializer(source="category", read_only=True)
+    drop_details = DropNestedSerializer(source="drop", read_only=True)
 
     class Meta:
         model = Product
@@ -236,6 +249,8 @@ class ProductListSerializer(serializers.ModelSerializer):
             "is_active",
             "category",
             "drop",
+            "category_details",
+            "drop_details",
             "variations",
             "images",
             "created_at",

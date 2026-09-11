@@ -1,6 +1,7 @@
 from django.urls import path
 
 from .views import (
+    CatalogFilterOptionsView,
     CategoryDetailView,
     CategoryListCreateView,
     DropCampaignDetailView,
@@ -20,6 +21,7 @@ from .views import (
 app_name = "products"
 
 urlpatterns = [
+    path("products/filter-options/", CatalogFilterOptionsView.as_view(), name="catalog-filter-options"),
     # GET (público) - Lista categorias / POST (admin) - Cria categoria
     path(
         "categories/",
