@@ -138,6 +138,42 @@ class CustomerOrder(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
 
+class CheckoutAttemptStatus(models.TextChoices):
+    PROCESSING = "PROCESSING", "Processing"
+    SUCCEEDED = "SUCCEEDED", "Succeeded"
+    UNCERTAIN = "UNCERTAIN", "Uncertain"
+
+
+class CheckoutAttempt(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT)
+    idempotency_key = models.UUIDField()
+    cart = models.OneToOneField(
+        Cart, on_delete=models.PROTECT, related_name="checkout_attempt"
+    )
+    shipping_quote = models.ForeignKey(ShippingQuote, on_delete=models.PROTECT)
+    address_id = models.UUIDField()
+    order = models.OneToOneField(
+        CustomerOrder, on_delete=models.PROTECT, related_name="checkout_attempt"
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=CheckoutAttemptStatus.choices,
+        default=CheckoutAttemptStatus.PROCESSING,
+    )
+    checkout_url = models.URLField(max_length=2048, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "idempotency_key"],
+                name="checkout_attempt_user_key_unique",
+            ),
+        ]
+
+
 class OrderItem(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     order = models.ForeignKey(

@@ -1,22 +1,26 @@
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from decimal import Decimal
+from threading import Event
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ImproperlyConfigured
-from django.db import IntegrityError, transaction
-from django.test import override_settings
+from django.db import IntegrityError, close_old_connections, connections, transaction
+from django.test import override_settings, skipUnlessDBFeature
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.exceptions import ValidationError
-from rest_framework.test import APITestCase
+from rest_framework.test import APIClient, APITestCase, APITransactionTestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from authentication.models import Address, UserProfile, UserRole
 from orders.models import (
     Cart,
     CartItem,
+    CheckoutAttempt,
+    CheckoutAttemptStatus,
     CustomerOrder,
     OrderItem,
     OrderStatus,
@@ -27,6 +31,7 @@ from orders.models import (
 from orders.services import (
     CheckoutShippingUnavailable,
     create_shipping_quote,
+    prepare_checkout_attempt,
     validate_shipping_quote,
 )
 from products.models import Category, Product, ProductVariation
@@ -95,9 +100,10 @@ class CheckoutAPITests(APITestCase):
         return {
             "address_id": str(self.address.pk),
             "shipping_quote_id": response.data["shipping_quote_id"],
+            "idempotency_key": str(uuid.uuid4()),
         }
 
-    @patch("orders.views.create_infinitepay_checkout")
+    @patch("orders.services.create_infinitepay_checkout")
     def test_checkout_sucesso_gera_pedido_e_reduz_estoque(self, mock_create_checkout):
         """Deve retornar 201, criar o pedido, finalizar o carrinho e deduzir estoque."""
         mock_create_checkout.return_value = "https://pay.infinitepay.io/mock-url"
@@ -147,20 +153,28 @@ class CheckoutAPITests(APITestCase):
         self.variation.refresh_from_db()
         self.assertEqual(self.variation.stock_quantity, 10)
 
-    @patch("orders.views.create_infinitepay_checkout")
-    def test_checkout_falha_gateway_faz_rollback(self, mock_create_checkout):
-        """Deve proteger o banco de dados se a API da InfinitePay cair."""
+    @patch("orders.services.create_infinitepay_checkout")
+    def test_checkout_falha_gateway_preserva_tentativa_para_conferencia(
+        self, mock_create_checkout
+    ):
+        """Timeout pode ocorrer após criar o link; não apagar nem reenviar a tentativa."""
         mock_create_checkout.side_effect = Exception("InfinitePay Timeout")
 
         payload = self.checkout_payload()
 
         response = self.client.post(self.url, payload, format="json")
 
-        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
-        self.assertEqual(CustomerOrder.objects.count(), 0)
+        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.assertEqual(CustomerOrder.objects.count(), 1)
+        self.assertEqual(
+            CheckoutAttempt.objects.get().status, CheckoutAttemptStatus.UNCERTAIN
+        )
+        replay = self.client.post(self.url, payload, format="json")
+        self.assertEqual(replay.data, response.data)
+        mock_create_checkout.assert_called_once()
 
         self.variation.refresh_from_db()
-        self.assertEqual(self.variation.stock_quantity, 10)
+        self.assertEqual(self.variation.stock_quantity, 8)
 
     def test_rejeita_valores_e_parametros_logisticos_do_cliente(self):
         for field in (
@@ -229,6 +243,7 @@ class CheckoutAPITests(APITestCase):
             {
                 "address_id": str(self.address.id),
                 "shipping_quote_id": preview.data["shipping_quote_id"],
+                "idempotency_key": str(uuid.uuid4()),
             },
             format="json",
         )
@@ -242,7 +257,7 @@ class CheckoutAPITests(APITestCase):
         self.assertEqual(sent[1]["price"], 1992)
         self.assertEqual(sum(i["quantity"] * i["price"] for i in sent), 5990)
 
-    @patch("orders.views.create_infinitepay_checkout")
+    @patch("orders.services.create_infinitepay_checkout")
     def test_frete_invalido_ou_indisponivel_nao_cria_pedido(self, mock_gateway):
         for price in (
             {},
@@ -302,7 +317,7 @@ class CheckoutAPITests(APITestCase):
             )
             self.assertEqual(response.status_code, 401)
 
-    @patch("orders.views.create_infinitepay_checkout")
+    @patch("orders.services.create_infinitepay_checkout")
     def test_checkout_exige_cotacao_sem_criar_pedido(self, mock_gateway):
         response = self.client.post(
             self.url, {"address_id": str(self.address.pk)}, format="json"
@@ -313,7 +328,7 @@ class CheckoutAPITests(APITestCase):
         self.assertFalse(Payment.objects.exists())
         mock_gateway.assert_not_called()
 
-    @patch("orders.views.create_infinitepay_checkout")
+    @patch("orders.services.create_infinitepay_checkout")
     def test_checkout_rejeita_cotacao_expirada_ou_invalidada(self, mock_gateway):
         for field in ("expires_at", "invalidated_at"):
             with self.subTest(field=field):
@@ -330,7 +345,7 @@ class CheckoutAPITests(APITestCase):
         self.assertEqual(self.variation.stock_quantity, 10)
         mock_gateway.assert_not_called()
 
-    @patch("orders.views.create_infinitepay_checkout")
+    @patch("orders.services.create_infinitepay_checkout")
     def test_checkout_rejeita_cotacao_de_outro_usuario(self, mock_gateway):
         payload = self.checkout_payload()
         other = User.objects.create_user(email="intruso@checkout.test", name="Outro")
@@ -341,7 +356,7 @@ class CheckoutAPITests(APITestCase):
         self.assertFalse(CustomerOrder.objects.exists())
         mock_gateway.assert_not_called()
 
-    @patch("orders.views.create_infinitepay_checkout")
+    @patch("orders.services.create_infinitepay_checkout")
     def test_checkout_rejeita_cotacao_de_outro_endereco_ou_carrinho(self, mock_gateway):
         payload = self.checkout_payload()
         address = Address.objects.create(
@@ -369,7 +384,7 @@ class CheckoutAPITests(APITestCase):
         self.assertFalse(CustomerOrder.objects.exists())
         mock_gateway.assert_not_called()
 
-    @patch("orders.views.create_infinitepay_checkout")
+    @patch("orders.services.create_infinitepay_checkout")
     def test_checkout_invalida_compra_alterada_antes_de_chamar_gateway(
         self, mock_gateway
     ):
@@ -414,7 +429,7 @@ class CheckoutAPITests(APITestCase):
         self.mock_shipping.assert_not_called()
         self.mock_deadline.assert_not_called()
 
-    @patch("orders.views.create_infinitepay_checkout")
+    @patch("orders.services.create_infinitepay_checkout")
     def test_nova_cotacao_permite_finalizar_apos_mudanca_de_preco(self, mock_gateway):
         old_payload = self.checkout_payload()
         Product.objects.filter(pk=self.product.pk).update(base_price=Decimal("110.00"))
@@ -431,6 +446,226 @@ class CheckoutAPITests(APITestCase):
         self.assertEqual(CustomerOrder.objects.get().total_amount, Decimal("235.00"))
         mock_gateway.assert_called_once()
 
+    @patch("orders.services.requests.post")
+    def test_reenvio_retorna_resultado_original_mesmo_apos_expirar_cotacao(
+        self, mock_post
+    ):
+        mock_post.return_value.json.return_value = {
+            "url": "https://pay.infinitepay.io/mock"
+        }
+        payload = self.checkout_payload()
+        response = self.client.post(self.url, payload, format="json")
+        self.assertEqual(response.status_code, 201)
+        ShippingQuote.objects.filter(pk=payload["shipping_quote_id"]).update(
+            expires_at=timezone.now() - timedelta(days=1)
+        )
+        for _ in range(3):
+            replay = self.client.post(self.url, payload, format="json")
+            self.assertEqual(replay.status_code, 201)
+            self.assertEqual(replay.data, response.data)
+        self.assertEqual(CustomerOrder.objects.count(), 1)
+        self.assertEqual(Payment.objects.count(), 1)
+        self.assertEqual(CheckoutAttempt.objects.count(), 1)
+        self.variation.refresh_from_db()
+        self.assertEqual(self.variation.stock_quantity, 8)
+        mock_post.assert_called_once()
+
+    @patch(
+        "orders.services.create_infinitepay_checkout",
+        return_value="https://pay.infinitepay.io/mock",
+    )
+    def test_rejeita_mesma_chave_para_payload_diferente(self, mock_gateway):
+        payload = self.checkout_payload()
+        other_payload = self.checkout_payload()
+        self.assertEqual(
+            self.client.post(self.url, payload, format="json").status_code, 201
+        )
+        for field, value in (
+            ("address_id", str(uuid.uuid4())),
+            ("shipping_quote_id", other_payload["shipping_quote_id"]),
+        ):
+            with self.subTest(field=field):
+                response = self.client.post(
+                    self.url, {**payload, field: value}, format="json"
+                )
+                self.assertEqual(response.status_code, 409)
+                self.assertEqual(response.data["code"], "idempotency_conflict")
+        mock_gateway.assert_called_once()
+
+    @patch(
+        "orders.services.create_infinitepay_checkout",
+        return_value="https://pay.infinitepay.io/mock",
+    )
+    def test_chave_diferente_nao_duplica_mesmo_carrinho(self, mock_gateway):
+        payload = self.checkout_payload()
+        second = self.checkout_payload()
+        self.assertEqual(
+            self.client.post(self.url, payload, format="json").status_code, 201
+        )
+        response = self.client.post(self.url, second, format="json")
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data["code"], "checkout_already_started")
+        self.assertEqual(response.data["attempt"], payload)
+        self.assertEqual(CustomerOrder.objects.count(), 1)
+        mock_gateway.assert_called_once()
+
+    @patch("orders.services.create_infinitepay_checkout")
+    def test_preparacao_falha_faz_rollback_e_permite_mesma_tentativa(
+        self, mock_gateway
+    ):
+        payload = self.checkout_payload()
+        with patch(
+            "orders.services.OrderItem.objects.create",
+            side_effect=RuntimeError("Falha local"),
+        ):
+            response = self.client.post(self.url, payload, format="json")
+        self.assertEqual(response.status_code, 500)
+        self.assertFalse(CustomerOrder.objects.exists())
+        self.assertFalse(Payment.objects.exists())
+        self.assertFalse(CheckoutAttempt.objects.exists())
+        self.cart.refresh_from_db()
+        self.variation.refresh_from_db()
+        self.assertEqual(self.cart.status, "ACTIVE")
+        self.assertEqual(self.variation.stock_quantity, 10)
+        mock_gateway.assert_not_called()
+        mock_gateway.return_value = "https://pay.infinitepay.io/mock"
+        self.assertEqual(
+            self.client.post(self.url, payload, format="json").status_code, 201
+        )
+        self.assertEqual(
+            CheckoutAttempt.objects.get().idempotency_key,
+            uuid.UUID(payload["idempotency_key"]),
+        )
+
+    @patch("orders.services.requests.post")
+    def test_tentativa_interrompida_nao_dispara_nova_chamada_externa(self, mock_post):
+        payload = self.checkout_payload()
+        attempt, result = prepare_checkout_attempt(
+            self.user, **{field: uuid.UUID(value) for field, value in payload.items()}
+        )
+        self.assertIsNone(result)
+        response = self.client.post(self.url, payload, format="json")
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response["Retry-After"], "3")
+        self.assertEqual(response.data["status"], "PROCESSING")
+        CheckoutAttempt.objects.filter(pk=attempt.pk).update(
+            created_at=timezone.now() - timedelta(minutes=5)
+        )
+        response = self.client.post(self.url, payload, format="json")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.data["status"], "UNCERTAIN")
+        self.assertEqual(CustomerOrder.objects.count(), 1)
+        mock_post.assert_not_called()
+
+    @patch("orders.services.requests.post")
+    def test_resposta_sem_url_fica_incerta_sem_reenvio(self, mock_post):
+        payload = self.checkout_payload()
+        mock_post.return_value.json.return_value = {}
+        response = self.client.post(self.url, payload, format="json")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.data["status"], "UNCERTAIN")
+        self.assertEqual(
+            self.client.post(self.url, payload, format="json").data, response.data
+        )
+        self.assertEqual(Payment.objects.get().status, PaymentStatus.PENDING)
+        mock_post.assert_called_once()
+
+    def test_exige_chave_uuid(self):
+        payload = self.checkout_payload()
+        for key in (None, "", "invalid"):
+            with self.subTest(key=key):
+                response = self.client.post(
+                    self.url, {**payload, "idempotency_key": key}, format="json"
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("idempotency_key", response.data)
+        self.assertFalse(CustomerOrder.objects.exists())
+
+    @patch(
+        "orders.services.create_infinitepay_checkout",
+        return_value="https://pay.infinitepay.io/mock",
+    )
+    def test_chave_e_isolada_por_usuario(self, mock_gateway):
+        payload = self.checkout_payload()
+        original = self.client.post(self.url, payload, format="json")
+        other = User.objects.create_user(email="other-attempt@shio.test", name="Outro")
+        self.client.force_authenticate(user=other)
+        forbidden = self.client.post(self.url, payload, format="json")
+        self.assertEqual(forbidden.status_code, 400)
+        self.assertNotIn("checkout_url", forbidden.data)
+        address = Address.objects.create(
+            user=other,
+            zip_code="71000000",
+            street="Rua",
+            address_number="2",
+            neighborhood="Centro",
+            city="Brasília",
+            state="DF",
+        )
+        cart = Cart.objects.create(user=other)
+        CartItem.objects.create(
+            cart=cart, variation=self.variation, quantity=1, unit_price=100
+        )
+        quote = create_shipping_quote(other, address.pk)
+        response = self.client.post(
+            self.url,
+            {
+                "address_id": str(address.pk),
+                "shipping_quote_id": str(quote.pk),
+                "idempotency_key": payload["idempotency_key"],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertNotEqual(response.data["order_id"], original.data["order_id"])
+        self.assertEqual(CheckoutAttempt.objects.count(), 2)
+        self.assertEqual(mock_gateway.call_count, 2)
+
+    @patch("orders.services.requests.post")
+    def test_falha_ao_persistir_resposta_nao_reenvia_ao_gateway(self, mock_post):
+        from django.db.models.query import QuerySet
+
+        payload = self.checkout_payload()
+        mock_post.return_value.json.return_value = {
+            "url": "https://pay.infinitepay.io/mock"
+        }
+        original_update = QuerySet.update
+
+        def fail_success(queryset, **kwargs):
+            if (
+                queryset.model is CheckoutAttempt
+                and kwargs.get("status") == CheckoutAttemptStatus.SUCCEEDED
+            ):
+                raise RuntimeError("Falha ao persistir resposta")
+            return original_update(queryset, **kwargs)
+
+        with patch.object(QuerySet, "update", autospec=True, side_effect=fail_success):
+            with self.assertRaises(RuntimeError):
+                self.client.post(self.url, payload, format="json")
+        response = self.client.post(self.url, payload, format="json")
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(CustomerOrder.objects.count(), 1)
+        self.assertEqual(Payment.objects.count(), 1)
+        mock_post.assert_called_once()
+
+    @patch("orders.services.requests.post")
+    def test_resposta_do_link_nao_regride_pagamento_confirmado(self, mock_post):
+        payload = self.checkout_payload()
+
+        def confirm_payment(*args, **kwargs):
+            Payment.objects.update(status=PaymentStatus.PAID)
+            CustomerOrder.objects.update(status=OrderStatus.PAID)
+            response = mock_post.return_value
+            response.json.return_value = {"url": "https://pay.infinitepay.io/mock"}
+            return response
+
+        mock_post.side_effect = confirm_payment
+        response = self.client.post(self.url, payload, format="json")
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(Payment.objects.get().status, PaymentStatus.PAID)
+        self.assertEqual(CustomerOrder.objects.get().status, OrderStatus.PAID)
+        self.assertFalse(mock_post.call_args.kwargs["allow_redirects"])
+
     def test_frete_zero_explicito_e_arredondamento(self):
         for raw, expected in (
             ("0.00", "200.00"),
@@ -446,6 +681,106 @@ class CheckoutAPITests(APITestCase):
                 )
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(response.data["total_amount"], expected)
+
+
+@skipUnlessDBFeature("has_select_for_update")
+@override_settings(CORREIOS_REMETENTE_CEP="70000000")
+class CheckoutConcurrencyTests(APITransactionTestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="concurrent@shio.test", name="Cliente"
+        )
+        self.address = Address.objects.create(
+            user=self.user,
+            zip_code="71000000",
+            street="Rua",
+            address_number="1",
+            neighborhood="Centro",
+            city="Brasília",
+            state="DF",
+        )
+        product = Product.objects.create(name="Camiseta", base_price=Decimal("100.00"))
+        self.variation = ProductVariation.objects.create(
+            product=product, size="M", sku="CONCURRENT", stock_quantity=10
+        )
+        cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(
+            cart=cart,
+            variation=self.variation,
+            quantity=2,
+            unit_price=Decimal("100.00"),
+        )
+        with (
+            patch(
+                "orders.services.fetch_shipping_price_by_service_and_ceps",
+                return_value={"pcFinal": "15.00"},
+            ),
+            patch(
+                "orders.services.fetch_shipping_deadline_by_service_and_ceps",
+                return_value={"prazoEntrega": 3},
+            ),
+        ):
+            quote = create_shipping_quote(self.user, self.address.pk)
+        self.payload = {
+            "address_id": str(self.address.pk),
+            "shipping_quote_id": str(quote.pk),
+            "idempotency_key": str(uuid.uuid4()),
+        }
+
+    def assert_parallel_checkout(self, different_key):
+        entered = Event()
+        release = Event()
+
+        def gateway(*args):
+            entered.set()
+            if not release.wait(10):
+                raise RuntimeError("Teste não liberou o gateway")
+            return "https://pay.infinitepay.io/mock"
+
+        def checkout(payload):
+            close_old_connections()
+            try:
+                client = APIClient()
+                client.force_authenticate(user=self.user)
+                return client.post("/api/orders/checkout/", payload, format="json")
+            finally:
+                connections.close_all()
+
+        with (
+            patch(
+                "orders.services.create_infinitepay_checkout", side_effect=gateway
+            ) as mock_gateway,
+            ThreadPoolExecutor(max_workers=2) as pool,
+        ):
+            first = pool.submit(checkout, self.payload)
+            try:
+                self.assertTrue(entered.wait(5))
+                # Outra conexão enxerga o registro enquanto o gateway ainda não respondeu.
+                self.assertEqual(CheckoutAttempt.objects.count(), 1)
+                payload = (
+                    {**self.payload, "idempotency_key": str(uuid.uuid4())}
+                    if different_key
+                    else self.payload
+                )
+                second = pool.submit(checkout, payload).result(timeout=5)
+                self.assertEqual(second.status_code, 409 if different_key else 202)
+            finally:
+                release.set()
+            response = first.result(timeout=5)
+            self.assertEqual(response.status_code, 201)
+            mock_gateway.assert_called_once()
+        self.assertEqual(CustomerOrder.objects.count(), 1)
+        self.assertEqual(Payment.objects.count(), 1)
+        self.variation.refresh_from_db()
+        self.assertEqual(self.variation.stock_quantity, 8)
+        replay = checkout(self.payload)
+        self.assertEqual(replay.data, response.data)
+
+    def test_requisicoes_simultaneas_com_mesma_chave(self):
+        self.assert_parallel_checkout(different_key=False)
+
+    def test_requisicoes_simultaneas_com_chaves_diferentes(self):
+        self.assert_parallel_checkout(different_key=True)
 
 
 @override_settings(

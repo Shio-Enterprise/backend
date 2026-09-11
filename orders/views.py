@@ -6,6 +6,7 @@ from django.db import transaction
 from django.db.models import Sum
 from django.http import Http404
 from django.utils import timezone
+from django.utils.decorators import method_decorator
 from drf_spectacular.utils import (
     OpenApiParameter,
     OpenApiTypes,
@@ -29,7 +30,6 @@ from .correios import (
 )
 from .models import (
     CustomerOrder,
-    OrderItem,
     OrderStatus,
     OrderStatusLog,
     PaymentStatus,
@@ -49,11 +49,11 @@ from .serializers import (
 from .services import (
     add_item_to_cart,
     check_payment_status,
-    checkout_from_shipping_quote,
     clear_cart,
-    create_infinitepay_checkout,
+    complete_checkout_attempt,
     create_shipping_quote,
     get_cart_data,
+    prepare_checkout_attempt,
     remove_item_from_cart,
     update_item_quantity,
     update_status,
@@ -346,6 +346,7 @@ class CheckoutCalculationView(APIView):
         return Response(CheckoutCalculationSerializer(calculation).data)
 
 
+@method_decorator(transaction.non_atomic_requests, name="dispatch")
 class CheckoutAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -356,83 +357,40 @@ class CheckoutAPIView(APIView):
             "Gera o pedido (CustomerOrder), faz o snapshot do endereço de entrega e debita o estoque. "
             "Por fim, comunica-se com a API da InfinitePay para gerar o link de checkout.\n\n"
             "**Fluxo:**\n"
-            "1. Envie `address_id` e `shipping_quote_id` retornado pelo cálculo.\n"
+            "1. Envie `address_id`, `shipping_quote_id` e `idempotency_key` (UUID da tentativa).\n"
             "2. O backend valida a cotação e gera a cobrança com os valores confirmados.\n"
             "3. O utilizador é redirecionado para a `checkout_url` retornada."
         ),
         request=CheckoutInputSerializer,
         responses={
             201: OpenApiTypes.OBJECT,
+            202: OpenApiTypes.OBJECT,
             400: OpenApiTypes.OBJECT,
+            409: OpenApiTypes.OBJECT,
             500: OpenApiTypes.OBJECT,
             503: OpenApiTypes.OBJECT,
         },
     )
-    @transaction.atomic
     def post(self, request):
-        user = request.user
         serializer = CheckoutInputSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         try:
-            calculation = checkout_from_shipping_quote(
-                user,
-                serializer.validated_data["shipping_quote_id"],
-                serializer.validated_data["address_id"],
-            )
-        except serializers.ValidationError as exc:
-            # Preserva a invalidação da cotação: nenhum pedido foi criado até aqui.
-            return Response(exc.detail, status=status.HTTP_400_BAD_REQUEST)
-        cart = calculation["cart"]
-        address = calculation["address"]
-
-        order = CustomerOrder.objects.create(
-            user=user,
-            address=address,
-            subtotal=calculation["subtotal"],
-            shipping_cost=calculation["shipping_cost"],
-            discount_amount=calculation["discount_amount"],
-            total_amount=calculation["total_amount"],
-            shipping_zip_code=address.zip_code,
-            shipping_street=address.street,
-            shipping_number=address.address_number,
-            shipping_complement=address.complement,
-            shipping_neighborhood=address.neighborhood,
-            shipping_city=address.city,
-            shipping_state=address.state,
-        )
-
-        for item in calculation["items"]:
-            variation = item["variation"]
-            variation.stock_quantity -= item["quantity"]
-            variation.save()
-
-            OrderItem.objects.create(
-                order=order,
-                variation=variation,
-                quantity=item["quantity"],
-                unit_price=item["unit_price"],
-                product_name=f"{variation.product.name} - {variation.size}",
-                sku_snapshot=variation.sku,
-            )
-
-        cart.status = "FINISHED"
-        cart.save()
-
-        try:
-            checkout_url = create_infinitepay_checkout(order, request)
-            return Response(
-                {"success": True, "checkout_url": checkout_url},
-                status=status.HTTP_201_CREATED,
+            attempt, result = prepare_checkout_attempt(
+                request.user, **serializer.validated_data
             )
         except Exception:
-            transaction.set_rollback(True)
             return Response(
                 {
                     "success": False,
-                    "message": "Não foi possível iniciar o checkout da InfinitePay.",
+                    "message": "Não foi possível preparar o pedido. Reenvie a mesma tentativa.",
                 },
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
+        if attempt is not None:
+            result = complete_checkout_attempt(attempt, request)
+        body, response_status = result
+        headers = {"Retry-After": "3"} if response_status == 202 else {}
+        return Response(body, status=response_status, headers=headers)
 
 
 class PaymentSuccessRedirectView(APIView):

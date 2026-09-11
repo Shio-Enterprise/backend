@@ -4,6 +4,7 @@ from uuid import UUID
 
 import requests
 from django.conf import settings
+from django.contrib.auth import get_user_model
 from django.core.exceptions import ImproperlyConfigured, ObjectDoesNotExist
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
@@ -18,6 +19,10 @@ from orders.correios import (
 from orders.models import (
     Cart,
     CartItem,
+    CheckoutAttempt,
+    CheckoutAttemptStatus,
+    CustomerOrder,
+    OrderItem,
     OrderStatus,
     OrderStatusLog,
     Payment,
@@ -382,17 +387,165 @@ def create_infinitepay_checkout(order, request):
         json=payload,
         headers=headers,
         timeout=10,
+        allow_redirects=False,
     )
 
     response.raise_for_status()
     data = response.json()
+    checkout_url = data.get("url") if isinstance(data, dict) else None
+    if (
+        not isinstance(checkout_url, str)
+        or not checkout_url.startswith("https://")
+        or len(checkout_url) > 2048
+    ):
+        raise ValueError("Resposta de checkout sem URL válida.")
 
-    payment.status = PaymentStatus.PROCESSING
-    payment.save()
-    order.status = OrderStatus.AWAITING_PAYMENT
-    order.save()
+    Payment.objects.filter(pk=payment.pk, status=PaymentStatus.PENDING).update(
+        status=PaymentStatus.PROCESSING, updated_at=timezone.now()
+    )
+    return checkout_url
 
-    return data.get("url")
+
+def checkout_attempt_result(attempt):
+    if (
+        attempt.status == CheckoutAttemptStatus.PROCESSING
+        and attempt.created_at
+        + timedelta(seconds=settings.CHECKOUT_PROCESSING_TIMEOUT_SECONDS)
+        <= timezone.now()
+    ):
+        CheckoutAttempt.objects.filter(
+            pk=attempt.pk, status=CheckoutAttemptStatus.PROCESSING
+        ).update(status=CheckoutAttemptStatus.UNCERTAIN, updated_at=timezone.now())
+        attempt.refresh_from_db()
+    body = {
+        "success": attempt.status == CheckoutAttemptStatus.SUCCEEDED,
+        "idempotency_key": str(attempt.idempotency_key),
+        "order_id": str(attempt.order_id),
+        "status": attempt.status,
+    }
+    if attempt.status == CheckoutAttemptStatus.SUCCEEDED:
+        return {**body, "checkout_url": attempt.checkout_url}, 201
+    if attempt.status == CheckoutAttemptStatus.UNCERTAIN:
+        return {
+            **body,
+            "message": "Não foi possível confirmar a criação do pagamento. O pedido foi preservado para conferência; não inicie outra compra para substituí-lo.",
+        }, 503
+    return {
+        **body,
+        "message": "Seu checkout está sendo processado. Consulte esta mesma tentativa novamente.",
+    }, 202
+
+
+def prepare_checkout_attempt(user, address_id, shipping_quote_id, idempotency_key):
+    """Confirma o registro local antes do envio externo; reenvios nunca reenviam ao gateway."""
+    with transaction.atomic():
+        # Serializa também a primeira requisição, quando ainda não há tentativa para bloquear.
+        get_user_model().objects.select_for_update().get(pk=user.pk)
+        attempt = CheckoutAttempt.objects.filter(
+            user=user, idempotency_key=idempotency_key
+        ).first()
+        if attempt:
+            if (
+                attempt.shipping_quote_id != shipping_quote_id
+                or attempt.address_id != address_id
+            ):
+                return None, (
+                    {
+                        "message": "Chave de idempotência já utilizada para outra compra.",
+                        "code": "idempotency_conflict",
+                    },
+                    409,
+                )
+            return None, checkout_attempt_result(attempt)
+        quote = ShippingQuote.objects.filter(pk=shipping_quote_id, user=user).first()
+        existing = (
+            CheckoutAttempt.objects.filter(cart_id=quote.cart_id, user=user).first()
+            if quote
+            else None
+        )
+        if existing:
+            return None, (
+                {
+                    "message": "Este carrinho já possui uma tentativa de checkout. Consulte a tentativa original.",
+                    "code": "checkout_already_started",
+                    "attempt": {
+                        "idempotency_key": str(existing.idempotency_key),
+                        "shipping_quote_id": str(existing.shipping_quote_id),
+                        "address_id": str(existing.address_id),
+                    },
+                },
+                409,
+            )
+        try:
+            calculation = checkout_from_shipping_quote(
+                user, shipping_quote_id, address_id
+            )
+        except ValidationError as exc:
+            return None, (exc.detail, 400)
+        cart = calculation["cart"]
+        address = calculation["address"]
+        order = CustomerOrder.objects.create(
+            user=user,
+            address=address,
+            subtotal=calculation["subtotal"],
+            shipping_cost=calculation["shipping_cost"],
+            discount_amount=calculation["discount_amount"],
+            total_amount=calculation["total_amount"],
+            shipping_zip_code=address.zip_code,
+            shipping_street=address.street,
+            shipping_number=address.address_number,
+            shipping_complement=address.complement,
+            shipping_neighborhood=address.neighborhood,
+            shipping_city=address.city,
+            shipping_state=address.state,
+        )
+        for item in calculation["items"]:
+            variation = item["variation"]
+            variation.stock_quantity -= item["quantity"]
+            variation.save()
+            OrderItem.objects.create(
+                order=order,
+                variation=variation,
+                quantity=item["quantity"],
+                unit_price=item["unit_price"],
+                product_name=f"{variation.product.name} - {variation.size}",
+                sku_snapshot=variation.sku,
+            )
+        cart.status = "FINISHED"
+        cart.save()
+        Payment.objects.create(
+            order=order, method="CREDIT_CARD", total_amount=order.total_amount
+        )
+        attempt = CheckoutAttempt.objects.create(
+            user=user,
+            idempotency_key=idempotency_key,
+            cart=cart,
+            order=order,
+            shipping_quote_id=shipping_quote_id,
+            address_id=address_id,
+        )
+    return attempt, None
+
+
+def complete_checkout_attempt(attempt, request):
+    # Somente o processo que persistiu a tentativa pode executar esta chamada.
+    # Timeout, queda do processo ou falha ao salvar a resposta não autorizam novo POST externo.
+    try:
+        checkout_url = create_infinitepay_checkout(attempt.order, request)
+        if not isinstance(checkout_url, str) or not checkout_url.startswith("https://"):
+            raise ValueError("URL de checkout inválida.")
+    except Exception:
+        CheckoutAttempt.objects.filter(pk=attempt.pk).update(
+            status=CheckoutAttemptStatus.UNCERTAIN, updated_at=timezone.now()
+        )
+    else:
+        CheckoutAttempt.objects.filter(pk=attempt.pk).update(
+            status=CheckoutAttemptStatus.SUCCEEDED,
+            checkout_url=checkout_url,
+            updated_at=timezone.now(),
+        )
+    attempt.refresh_from_db()
+    return checkout_attempt_result(attempt)
 
 
 def check_payment_status(order_nsu, transaction_nsu, slug):

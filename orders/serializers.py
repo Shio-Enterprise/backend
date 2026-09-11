@@ -174,6 +174,7 @@ class CheckoutCalculationInputSerializer(serializers.Serializer):
 
 class CheckoutInputSerializer(CheckoutCalculationInputSerializer):
     shipping_quote_id = serializers.UUIDField()
+    idempotency_key = serializers.UUIDField()
 
 
 class CheckoutQuoteItemSerializer(CartItemRepresentationSerializer):
