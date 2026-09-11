@@ -428,7 +428,9 @@ class ProductListCreateView(APIView):
             "variations", "images"
         )
 
-        is_admin = request.user.is_authenticated and getattr(request.user, "is_admin", False)
+        is_admin = request.user.is_authenticated and getattr(
+            request.user, "is_admin", False
+        )
         is_active_param = request.query_params.get("is_active")
         if is_admin and is_active_param is not None:
             qs = qs.filter(is_active=is_active_param.lower() == "true")
@@ -510,7 +512,9 @@ class ProductDetailView(APIView):
             ),
             pk=pk,
         )
-        is_admin = request.user.is_authenticated and getattr(request.user, "is_admin", False)
+        is_admin = request.user.is_authenticated and getattr(
+            request.user, "is_admin", False
+        )
         if not product.is_active and not (is_admin and allow_inactive_for_admin):
             raise Product.DoesNotExist
         return product

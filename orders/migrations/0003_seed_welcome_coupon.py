@@ -20,7 +20,6 @@ def remove_welcome_coupon(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("orders", "0002_orderstatuslog"),
     ]

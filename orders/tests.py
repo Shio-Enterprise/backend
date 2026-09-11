@@ -161,11 +161,141 @@ class CheckoutAPITests(APITestCase):
         response = self.client.post(self.url, payload, format="json")
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        new_order = CustomerOrder.objects.filter(user=self.user).exclude(
-            subtotal=50.00
-        ).first()
+        new_order = (
+            CustomerOrder.objects.filter(user=self.user).exclude(subtotal=50.00).first()
+        )
         self.assertEqual(new_order.discount_amount, 0)
         self.assertIsNone(new_order.coupon)
+
+
+class InfinitePayCardSimulationTests(APITestCase):
+    """Simula o gateway InfinitePay (POST /links e /payment_check) via mock de
+    requests.post, sem bater na rede nem exigir cartão real. Cobre o fluxo
+    completo: checkout -> pagamento aprovado / recusado."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="cartao_teste@shio.com",
+            name="Testador Cartão",
+            password="senha_forte_123",
+        )
+        self.client.force_authenticate(user=self.user)
+
+        self.address = Address.objects.create(
+            user=self.user,
+            zip_code="71000000",
+            street="Rua Teste",
+            address_number="123",
+            neighborhood="Centro",
+            city="Brasília",
+            state="DF",
+        )
+
+        self.category = Category.objects.create(name="Roupas", slug="roupas")
+        self.product = Product.objects.create(
+            category=self.category, name="Camiseta Teste", base_price=100.00
+        )
+        self.variation = ProductVariation.objects.create(
+            product=self.product, size="M", sku="TESTE-M", stock_quantity=10
+        )
+
+        self.cart = Cart.objects.create(user=self.user, status="ACTIVE")
+        CartItem.objects.create(
+            cart=self.cart, variation=self.variation, quantity=1, unit_price=100.00
+        )
+
+        self.checkout_url = "/api/orders/checkout/"
+        self.success_url = "/api/orders/pagamento-sucesso/"
+
+    @staticmethod
+    def _fake_gateway_post(links_response, payment_check_response):
+        """Roteia o mock de requests.post pra /links ou /payment_check
+        conforme a URL chamada, como o gateway real faria."""
+
+        def _post(url, json=None, headers=None, timeout=None):
+            fake = type(
+                "FakeResponse",
+                (),
+                {"raise_for_status": lambda self: None, "status_code": 200},
+            )()
+            if "payment_check" in url:
+                fake.json = lambda: payment_check_response
+            else:
+                fake.json = lambda: links_response
+            return fake
+
+        return _post
+
+    def _fazer_checkout(
+        self, mock_post, checkout_link_url="https://checkout.infinitepay.io/mock"
+    ):
+        mock_post.side_effect = self._fake_gateway_post(
+            links_response={"url": checkout_link_url}, payment_check_response={}
+        )
+
+        response = self.client.post(
+            self.checkout_url,
+            {"address_id": str(self.address.id), "shipping_cost": 15.00},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.json()["checkout_url"], checkout_link_url)
+
+        order = CustomerOrder.objects.get(user=self.user)
+        self.assertEqual(order.status, OrderStatus.AWAITING_PAYMENT)
+        self.assertEqual(order.payment.status, PaymentStatus.PROCESSING)
+        return order
+
+    @patch("orders.services.requests.post")
+    def test_cartao_de_teste_aprovado_confirma_pagamento(self, mock_post):
+        """Simula cartão aprovado: /payment_check retorna paid=True e o
+        pedido deve virar PAID."""
+        order = self._fazer_checkout(mock_post)
+
+        mock_post.side_effect = self._fake_gateway_post(
+            links_response={}, payment_check_response={"paid": True}
+        )
+
+        response = self.client.get(
+            self.success_url,
+            {
+                "order_nsu": str(order.id),
+                "transaction_nsu": "CARTAO_TESTE_APROVADO",
+                "slug": "FATURA_TESTE",
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        order.refresh_from_db()
+        self.assertEqual(order.status, OrderStatus.PAID)
+        self.assertEqual(order.payment.status, PaymentStatus.PAID)
+        self.assertEqual(order.payment.gateway_transaction_id, "CARTAO_TESTE_APROVADO")
+
+    @patch("orders.services.requests.post")
+    def test_cartao_de_teste_recusado_mantem_pedido_pendente(self, mock_post):
+        """Simula cartão recusado: /payment_check retorna paid=False e o
+        pedido deve continuar AWAITING_PAYMENT."""
+        order = self._fazer_checkout(mock_post)
+
+        mock_post.side_effect = self._fake_gateway_post(
+            links_response={}, payment_check_response={"paid": False}
+        )
+
+        response = self.client.get(
+            self.success_url,
+            {
+                "order_nsu": str(order.id),
+                "transaction_nsu": "CARTAO_TESTE_RECUSADO",
+                "slug": "FATURA_TESTE",
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        order.refresh_from_db()
+        self.assertEqual(order.status, OrderStatus.AWAITING_PAYMENT)
+        self.assertEqual(order.payment.status, PaymentStatus.PROCESSING)
 
 
 class CreateInfinitePayCheckoutPayloadTests(APITestCase):
@@ -862,6 +992,7 @@ class OrderDispatchViewTests(APITestCase):
         self.assertEqual(self.order.status, OrderStatus.SHIPPED)
 
         from orders.models import OrderStatusLog
+
         log = OrderStatusLog.objects.filter(order=self.order).first()
         self.assertIsNotNone(log)
         self.assertEqual(log.new_status, OrderStatus.SHIPPED)
@@ -962,6 +1093,7 @@ class CepLookupViewTests(APITestCase):
     @patch("orders.correios_views.fetch_address_data_by_cep")
     def test_cep_inexistente_retorna_404(self, mock_fetch):
         from orders.correios import CorreiosCepNotFoundError
+
         mock_fetch.side_effect = CorreiosCepNotFoundError("CEP não encontrado")
 
         response = self.client.get(self.cep_url("00000000"))
@@ -978,7 +1110,9 @@ class CepLookupViewTests(APITestCase):
 class ShippingOptionsViewTests(APITestCase):
     def setUp(self):
         self.user = User.objects.create_user(
-            email="frete_user@shio.com", name="Usuario Frete", password="senha_forte_123"
+            email="frete_user@shio.com",
+            name="Usuario Frete",
+            password="senha_forte_123",
         )
         self.url = "/api/orders/correios/frete/"
 
@@ -1255,7 +1389,9 @@ class MergeSessionCartTests(APITestCase):
     def test_cart_nao_expõe_desconto_para_usuario_com_pedido_anterior(self):
         self.client.force_authenticate(user=self.user)
         CustomerOrder.objects.create(
-            user=self.user, subtotal=10.00, total_amount=10.00,
+            user=self.user,
+            subtotal=10.00,
+            total_amount=10.00,
             status=OrderStatus.PAID,
         )
         response = self.client.get(self.cart_url)

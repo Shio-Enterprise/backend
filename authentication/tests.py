@@ -408,7 +408,8 @@ class NewsletterSubscribeAPITests(APITestCase):
 
     def test_inscricao_sem_consentimento_retorna_400(self):
         response = self.client.post(
-            self.url, {"email": "semconsentimento@shio.com", "consent_lgpd": False},
+            self.url,
+            {"email": "semconsentimento@shio.com", "consent_lgpd": False},
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
