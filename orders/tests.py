@@ -1,9 +1,15 @@
+import threading
+import unittest
 import uuid
+from datetime import timedelta
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.db import connection, connections
+from django.test import TransactionTestCase
+from django.utils import timezone
 from rest_framework import status
-from rest_framework.test import APITestCase
+from rest_framework.test import APIClient, APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from authentication.models import Address, UserProfile, UserRole
@@ -15,8 +21,16 @@ from orders.models import (
     OrderStatus,
     Payment,
     PaymentStatus,
+    StockReservation,
+    StockReservationStatus,
 )
-from products.models import Category, Product, ProductVariation
+from products.models import (
+    Category,
+    Product,
+    ProductVariation,
+    StockMovement,
+    StockMovementReason,
+)
 
 User = get_user_model()
 
@@ -54,8 +68,8 @@ class CheckoutAPITests(APITestCase):
         self.url = "/api/orders/checkout/"
 
     @patch("orders.views.create_infinitepay_checkout")
-    def test_checkout_sucesso_gera_pedido_e_reduz_estoque(self, mock_create_checkout):
-        """Deve retornar 201, criar o pedido, finalizar o carrinho e deduzir estoque."""
+    def test_checkout_sucesso_gera_pedido_e_reserva_estoque(self, mock_create_checkout):
+        """Deve retornar 201, criar o pedido, finalizar o carrinho e reservar estoque sem debitar."""
         mock_create_checkout.return_value = "https://pay.infinitepay.io/mock-url"
 
         payload = {"address_id": str(self.address.id), "shipping_cost": 15.00}
@@ -71,11 +85,14 @@ class CheckoutAPITests(APITestCase):
         self.assertEqual(self.cart.status, "FINISHED")
 
         self.variation.refresh_from_db()
-        self.assertEqual(self.variation.stock_quantity, 8)
+        self.assertEqual(self.variation.stock_quantity, 10)
 
         order = CustomerOrder.objects.get(user=self.user)
         self.assertEqual(order.status, OrderStatus.AWAITING_PAYMENT)
         self.assertEqual(order.total_amount, 215.00)
+
+        order_item = order.items.get(variation=self.variation)
+        self.assertEqual(order_item.reservation.status, StockReservationStatus.ACTIVE)
 
     def test_checkout_com_carrinho_vazio_retorna_400(self):
         """Deve retornar 400 se o usuário não tiver itens no carrinho ativo."""
@@ -145,6 +162,26 @@ class PaymentSuccessRedirectTests(APITestCase):
             total_amount=100.00,
         )
 
+        self.category = Category.objects.create(name="Roupas2", slug="roupas2")
+        self.product = Product.objects.create(
+            category=self.category, name="Calça Teste", base_price=100.00
+        )
+        self.variation = ProductVariation.objects.create(
+            product=self.product, size="M", sku="TESTE-CALCA-M", stock_quantity=10
+        )
+        self.order_item = OrderItem.objects.create(
+            order=self.order,
+            variation=self.variation,
+            quantity=1,
+            unit_price=100.00,
+            product_name="Calça Teste - M",
+            sku_snapshot=self.variation.sku,
+        )
+        self.reservation = StockReservation.objects.create(
+            order_item=self.order_item,
+            expires_at=timezone.now() + timedelta(minutes=30),
+        )
+
         self.url = "/api/orders/pagamento-sucesso/"
 
     @patch("orders.views.check_payment_status")
@@ -170,6 +207,45 @@ class PaymentSuccessRedirectTests(APITestCase):
         self.assertEqual(self.payment.status, PaymentStatus.PAID)
         self.assertEqual(self.payment.gateway_transaction_id, "TRANS123")
 
+        self.variation.refresh_from_db()
+        self.assertEqual(self.variation.stock_quantity, 9)
+
+        self.reservation.refresh_from_db()
+        self.assertEqual(self.reservation.status, StockReservationStatus.CONVERTED)
+
+        self.assertEqual(
+            StockMovement.objects.filter(
+                variation=self.variation, reason=StockMovementReason.VENDA
+            ).count(),
+            1,
+        )
+
+    @patch("orders.views.check_payment_status")
+    def test_pagamento_confirmado_duas_vezes_nao_duplica_movimentacao(
+        self, mock_check_payment
+    ):
+        """Deve ser idempotente diante de notificações repetidas do gateway."""
+        mock_check_payment.return_value = {"paid": True}
+
+        query = {
+            "order_nsu": str(self.order.id),
+            "transaction_nsu": "TRANS123",
+            "slug": "FATURA123",
+        }
+
+        self.client.get(self.url, query)
+        self.client.get(self.url, query)
+
+        self.variation.refresh_from_db()
+        self.assertEqual(self.variation.stock_quantity, 9)
+
+        self.assertEqual(
+            StockMovement.objects.filter(
+                variation=self.variation, reason=StockMovementReason.VENDA
+            ).count(),
+            1,
+        )
+
     @patch("orders.views.check_payment_status")
     def test_pagamento_nao_confirmado_mantem_pendente(self, mock_check_payment):
         """Deve ignorar fraude se o gateway informar que não foi pago."""
@@ -189,6 +265,12 @@ class PaymentSuccessRedirectTests(APITestCase):
         self.order.refresh_from_db()
         self.assertEqual(self.order.status, OrderStatus.AWAITING_PAYMENT)
 
+        self.variation.refresh_from_db()
+        self.assertEqual(self.variation.stock_quantity, 10)
+
+        self.reservation.refresh_from_db()
+        self.assertEqual(self.reservation.status, StockReservationStatus.ACTIVE)
+
     def test_parametros_faltando_retorna_400(self):
         """Deve retornar erro se a query string estiver incompleta."""
         response = self.client.get(self.url, {"order_nsu": str(self.order.id)})
@@ -206,6 +288,157 @@ class PaymentSuccessRedirectTests(APITestCase):
             },
         )
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class StockReservationExpirationTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(email="testador3@shio.com", password="123")
+        self.category = Category.objects.create(name="Roupas3", slug="roupas3")
+        self.product = Product.objects.create(
+            category=self.category, name="Boné Teste", base_price=50.00
+        )
+        self.variation = ProductVariation.objects.create(
+            product=self.product, size="U", sku="TESTE-BONE-U", stock_quantity=5
+        )
+        self.order = CustomerOrder.objects.create(
+            user=self.user,
+            subtotal=50.00,
+            total_amount=50.00,
+            status=OrderStatus.AWAITING_PAYMENT,
+            shipping_zip_code="000",
+            shipping_street="X",
+            shipping_number="1",
+            shipping_neighborhood="Y",
+            shipping_city="Z",
+            shipping_state="DF",
+        )
+        self.order_item = OrderItem.objects.create(
+            order=self.order,
+            variation=self.variation,
+            quantity=1,
+            unit_price=50.00,
+            product_name="Boné Teste - U",
+            sku_snapshot=self.variation.sku,
+        )
+        self.client.force_authenticate(user=self.user)
+
+    def test_reserva_expirada_libera_estoque_e_cancela_pedido(self):
+        StockReservation.objects.create(
+            order_item=self.order_item,
+            expires_at=timezone.now() - timedelta(minutes=1),
+        )
+
+        response = self.client.get(f"/api/orders/my-orders/{self.order.id}/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        self.order_item.reservation.refresh_from_db()
+        self.assertEqual(
+            self.order_item.reservation.status, StockReservationStatus.RELEASED
+        )
+
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, OrderStatus.CANCELED)
+
+        self.variation.refresh_from_db()
+        self.assertEqual(self.variation.stock_quantity, 5)
+
+    def test_reserva_ativa_nao_e_afetada(self):
+        StockReservation.objects.create(
+            order_item=self.order_item,
+            expires_at=timezone.now() + timedelta(minutes=30),
+        )
+
+        self.client.get(f"/api/orders/my-orders/{self.order.id}/")
+
+        self.order_item.reservation.refresh_from_db()
+        self.assertEqual(
+            self.order_item.reservation.status, StockReservationStatus.ACTIVE
+        )
+
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, OrderStatus.AWAITING_PAYMENT)
+
+
+@unittest.skipUnless(
+    connection.vendor == "postgresql",
+    "select_for_update requer locking real de linha, indisponível no SQLite.",
+)
+class StockReservationConcurrencyTests(TransactionTestCase):
+    reset_sequences = True
+
+    def setUp(self):
+        self.category = Category.objects.create(name="Roupas4", slug="roupas4")
+        self.product = Product.objects.create(
+            category=self.category, name="Jaqueta Teste", base_price=200.00
+        )
+        self.variation = ProductVariation.objects.create(
+            product=self.product, size="G", sku="TESTE-JAQUETA-G", stock_quantity=1
+        )
+
+        self.address_payloads = []
+        self.users = []
+        for i in range(2):
+            user = User.objects.create_user(
+                email=f"concorrente{i}@shio.com", password="123"
+            )
+            address = Address.objects.create(
+                user=user,
+                zip_code="71000000",
+                street="Rua Teste",
+                address_number="123",
+                neighborhood="Centro",
+                city="Brasília",
+                state="DF",
+            )
+            cart = Cart.objects.create(user=user, status="ACTIVE")
+            CartItem.objects.create(
+                cart=cart, variation=self.variation, quantity=1, unit_price=200.00
+            )
+            self.users.append(user)
+            self.address_payloads.append(str(address.id))
+
+    @patch("orders.views.create_infinitepay_checkout")
+    def test_dois_checkouts_concorrentes_na_ultima_unidade(self, mock_create_checkout):
+        mock_create_checkout.return_value = "https://pay.infinitepay.io/mock-url"
+
+        results = {}
+
+        def checkout(index):
+            client = APIClient()
+            client.force_authenticate(user=self.users[index])
+            response = client.post(
+                "/api/orders/checkout/",
+                {
+                    "address_id": self.address_payloads[index],
+                    "shipping_cost": 0,
+                },
+                format="json",
+            )
+            results[index] = response.status_code
+            connections.close_all()
+
+        threads = [
+            threading.Thread(target=checkout, args=(0,)),
+            threading.Thread(target=checkout, args=(1,)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        success_count = sum(1 for code in results.values() if code == 201)
+        failure_count = sum(1 for code in results.values() if code == 400)
+
+        self.assertEqual(success_count, 1)
+        self.assertEqual(failure_count, 1)
+
+        self.assertEqual(
+            StockReservation.objects.filter(
+                status=StockReservationStatus.ACTIVE
+            ).count(),
+            1,
+        )
 
 
 class OrderTrackingViewTests(APITestCase):

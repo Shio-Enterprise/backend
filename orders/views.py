@@ -30,7 +30,6 @@ from .correios import (
 from .models import (
     Cart,
     CustomerOrder,
-    OrderItem,
     OrderStatus,
     OrderStatusLog,
     PaymentStatus,
@@ -48,8 +47,11 @@ from .services import (
     add_item_to_cart,
     check_payment_status,
     clear_cart,
+    convert_reservations_to_sale,
     create_infinitepay_checkout,
+    create_reservations_for_order,
     get_cart_data,
+    release_expired_reservations,
     remove_item_from_cart,
     update_item_quantity,
     update_status,
@@ -192,11 +194,12 @@ class UserOrderDetailView(APIView):
         try:
             order = (
                 CustomerOrder.objects.select_related("user", "address", "payment")
-                .prefetch_related("items__variation__product")
+                .prefetch_related("items__variation__product", "items__reservation")
                 .get(id=order_id, user=request.user)
             )
         except CustomerOrder.DoesNotExist:
             return Response({"message": "Pedido não encontrado."}, status=404)
+        release_expired_reservations(order)
         return Response(OrderDetailSerializer(order).data, status=status.HTTP_200_OK)
 
 
@@ -244,12 +247,13 @@ class AdminOrderDetailView(APIView):
         try:
             order = (
                 CustomerOrder.objects.select_related("user", "address", "payment")
-                .prefetch_related("items__variation__product")
+                .prefetch_related("items__variation__product", "items__reservation")
                 .get(id=order_id)
             )
         except CustomerOrder.DoesNotExist:
             return Response({"message": "Pedido não encontrado."}, status=404)
 
+        release_expired_reservations(order)
         return Response(OrderDetailSerializer(order).data, status=status.HTTP_200_OK)
 
     @extend_schema(
@@ -406,27 +410,13 @@ class CheckoutAPIView(APIView):
             shipping_state=address.state,
         )
 
-        for item in cart.items.all():
-            if item.variation.stock_quantity < item.quantity:
-                transaction.set_rollback(True)
-                return Response(
-                    {
-                        "success": False,
-                        "message": f"Estoque insuficiente para {item.variation.product.name}.",
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            item.variation.stock_quantity -= item.quantity
-            item.variation.save()
-
-            OrderItem.objects.create(
-                order=order,
-                variation=item.variation,
-                quantity=item.quantity,
-                unit_price=item.unit_price,
-                product_name=f"{item.variation.product.name} - {item.variation.size}",
-                sku_snapshot=item.variation.sku,
+        try:
+            create_reservations_for_order(order, cart)
+        except ValueError as e:
+            transaction.set_rollback(True)
+            return Response(
+                {"success": False, "message": str(e)},
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         cart.status = "FINISHED"
@@ -511,8 +501,8 @@ class PaymentSuccessRedirectView(APIView):
                 order.payment.gateway_transaction_id = transaction_nsu
                 order.payment.status = PaymentStatus.PAID
                 order.payment.save()
-                order.status = OrderStatus.PAID
-                order.save()
+                convert_reservations_to_sale(order)
+                order.refresh_from_db()
 
         if order.status == OrderStatus.PAID:
             return Response(

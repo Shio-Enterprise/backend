@@ -136,6 +136,27 @@ class Payment(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
 
+class StockReservationStatus(models.TextChoices):
+    ACTIVE = "ACTIVE", "Active"
+    CONVERTED = "CONVERTED", "Converted"
+    RELEASED = "RELEASED", "Released"
+
+
+class StockReservation(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    order_item = models.OneToOneField(
+        OrderItem, on_delete=models.CASCADE, related_name="reservation"
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=StockReservationStatus.choices,
+        default=StockReservationStatus.ACTIVE,
+    )
+    expires_at = models.DateTimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+
 class OrderStatusLog(models.Model):
     order = models.ForeignKey(
         CustomerOrder,

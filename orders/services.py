@@ -1,3 +1,4 @@
+from datetime import timedelta
 from decimal import Decimal
 from uuid import UUID
 
@@ -5,17 +6,28 @@ import requests
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
+from django.db.models import Sum
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 
 from orders.models import (
     Cart,
     CartItem,
+    CustomerOrder,
+    OrderItem,
     OrderStatus,
     OrderStatusLog,
     Payment,
     PaymentStatus,
+    StockReservation,
+    StockReservationStatus,
 )
-from products.models import ProductVariation
+from products.models import (
+    ProductVariation,
+    StockMovement,
+    StockMovementKind,
+    StockMovementReason,
+)
 
 
 def create_infinitepay_checkout(order, request):
@@ -359,6 +371,113 @@ def merge_session_cart_to_db(request, user):
             # In some contexts session backend may not support save here;
             # ensure modified flag is set so caller can persist if needed.
             pass
+
+
+def active_reserved_quantity(variation):
+    total = StockReservation.objects.filter(
+        order_item__variation=variation,
+        status=StockReservationStatus.ACTIVE,
+        expires_at__gte=timezone.now(),
+    ).aggregate(total=Sum("order_item__quantity"))["total"]
+    return total or 0
+
+
+def create_reservations_for_order(order, cart):
+    cart_items = list(cart.items.select_related("variation", "variation__product"))
+    variation_ids = [item.variation_id for item in cart_items]
+
+    locked_variations = {
+        variation.id: variation
+        for variation in ProductVariation.objects.select_for_update()
+        .filter(id__in=variation_ids)
+        .order_by("id")
+    }
+
+    expires_at = timezone.now() + timedelta(
+        minutes=settings.STOCK_RESERVATION_TTL_MINUTES
+    )
+
+    for item in cart_items:
+        variation = locked_variations[item.variation_id]
+        available = variation.stock_quantity - active_reserved_quantity(variation)
+
+        if item.quantity > available:
+            raise ValueError(
+                f"Estoque insuficiente para {variation.product.name}."
+            )
+
+        order_item = OrderItem.objects.create(
+            order=order,
+            variation=variation,
+            quantity=item.quantity,
+            unit_price=item.unit_price,
+            product_name=f"{variation.product.name} - {variation.size}",
+            sku_snapshot=variation.sku,
+        )
+        StockReservation.objects.create(order_item=order_item, expires_at=expires_at)
+
+
+def convert_reservations_to_sale(order):
+    with transaction.atomic():
+        locked_order = CustomerOrder.objects.select_for_update().get(id=order.id)
+
+        if locked_order.status == OrderStatus.PAID:
+            return
+
+        for item in locked_order.items.select_related("variation"):
+            try:
+                reservation = item.reservation
+            except ObjectDoesNotExist:
+                continue
+
+            if reservation.status != StockReservationStatus.ACTIVE:
+                continue
+
+            variation = ProductVariation.objects.select_for_update().get(
+                id=item.variation_id
+            )
+            variation.stock_quantity -= item.quantity
+            variation.save(update_fields=["stock_quantity", "updated_at"])
+
+            StockMovement.objects.create(
+                variation=variation,
+                kind=StockMovementKind.SAIDA,
+                reason=StockMovementReason.VENDA,
+                quantity=item.quantity,
+                note=f"Venda - Pedido {locked_order.id}",
+            )
+
+            reservation.status = StockReservationStatus.CONVERTED
+            reservation.save(update_fields=["status", "updated_at"])
+
+        locked_order.status = OrderStatus.PAID
+        locked_order.save(update_fields=["status", "updated_at"])
+
+
+def release_expired_reservations(order):
+    if order.status != OrderStatus.AWAITING_PAYMENT:
+        return
+
+    now = timezone.now()
+    has_active_reservation = False
+
+    for item in order.items.all():
+        try:
+            reservation = item.reservation
+        except ObjectDoesNotExist:
+            continue
+
+        if reservation.status != StockReservationStatus.ACTIVE:
+            continue
+
+        if reservation.expires_at < now:
+            reservation.status = StockReservationStatus.RELEASED
+            reservation.save(update_fields=["status", "updated_at"])
+        else:
+            has_active_reservation = True
+
+    if not has_active_reservation:
+        update_status(order, OrderStatus.CANCELED, comment="Reserva de estoque expirada.")
 
 
 def update_status(order, new_status, changed_by=None, tracking_code=None, comment=None):
