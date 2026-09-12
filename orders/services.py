@@ -7,6 +7,8 @@ from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 from django.shortcuts import get_object_or_404
 
+from rest_framework.exceptions import ValidationError
+
 from orders.models import (
     Cart,
     CartItem,
@@ -16,6 +18,24 @@ from orders.models import (
     PaymentStatus,
 )
 from products.models import ProductVariation
+
+ALLOWED_TRANSITIONS = {
+    OrderStatus.AWAITING_PAYMENT: {
+        OrderStatus.PAID,
+        OrderStatus.CANCELED,
+    },
+    OrderStatus.PAID: {
+        OrderStatus.PREPARING,
+    },
+    OrderStatus.PREPARING: {
+        OrderStatus.SHIPPED,
+    },
+    OrderStatus.SHIPPED: {
+        OrderStatus.DELIVERED,
+    },
+    OrderStatus.DELIVERED: set(),
+    OrderStatus.CANCELED: set(),
+}
 
 
 def create_infinitepay_checkout(order, request):
@@ -85,8 +105,8 @@ def create_infinitepay_checkout(order, request):
 
     payment.status = PaymentStatus.PROCESSING
     payment.save()
-    order.status = OrderStatus.AWAITING_PAYMENT
-    order.save()
+
+    update_status(order, OrderStatus.AWAITING_PAYMENT)
 
     return data.get("url")
 
@@ -373,6 +393,16 @@ def update_status(order, new_status, changed_by=None, tracking_code=None, commen
     """
     previous_status = order.status
 
+    allowed = ALLOWED_TRANSITIONS.get(previous_status, set())
+
+    if new_status not in allowed:
+        raise ValidationError({
+            "status": (
+                f"Transição inválida: "
+                f"{previous_status} -> {new_status}."
+            )
+        })
+
     if tracking_code:
         order.tracking_code = tracking_code
 
@@ -387,7 +417,7 @@ def update_status(order, new_status, changed_by=None, tracking_code=None, commen
     if new_status == OrderStatus.CANCELED and payment:
         if payment.status != PaymentStatus.PAID:
             payment.status = PaymentStatus.FAILED
-            payment.save()
+            payment.save(update_fields=["status"])
 
     OrderStatusLog.objects.create(
         order=order,
@@ -397,3 +427,5 @@ def update_status(order, new_status, changed_by=None, tracking_code=None, commen
         tracking_code=tracking_code,
         comment=comment,
     )
+
+    return order

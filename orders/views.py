@@ -293,11 +293,13 @@ class AdminOrderDetailView(APIView):
             )
 
         previous_status = order.status
-        order.status = status_value
-        if tracking_code:
-            order.tracking_code = tracking_code
-
-        order.save()
+        
+        update_status(
+            order=order,
+            new_status=status_value,
+            tracking_code=tracking_code,
+            changed_by=request.user
+        )
 
         if (
             status_value == OrderStatus.CANCELED
@@ -511,8 +513,8 @@ class PaymentSuccessRedirectView(APIView):
                 order.payment.gateway_transaction_id = transaction_nsu
                 order.payment.status = PaymentStatus.PAID
                 order.payment.save()
-                order.status = OrderStatus.PAID
-                order.save()
+
+                update_status(order=order, new_status=OrderStatus.PAID)
 
         if order.status == OrderStatus.PAID:
             return Response(
