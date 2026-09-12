@@ -15,7 +15,13 @@ from rest_framework.views import APIView
 
 from authentication.permissions import IsStaffOrSuperUser
 
-from .catalog import CatalogPagination, catalog_filter_options, filter_catalog
+from .catalog import (
+    CatalogPagination,
+    RecommendationPagination,
+    catalog_filter_options,
+    filter_catalog,
+    recommend_products,
+)
 from .models import (
     Category,
     DropCampaign,
@@ -26,6 +32,7 @@ from .models import (
 )
 from .serializers import (
     CatalogFilterOptionsSerializer,
+    CatalogPageQuerySerializer,
     CategorySerializer,
     DropCampaignDetailSerializer,
     DropCampaignSerializer,
@@ -506,6 +513,40 @@ class ProductListCreateView(APIView):
             ProductDetailSerializer(product, context={"request": request}).data,
             status=status.HTTP_201_CREATED,
         )
+
+
+class ProductRecommendationsView(APIView):
+    permission_classes = [AllowAny]
+    pagination_class = RecommendationPagination
+    serializer_class = ProductListSerializer
+
+    @extend_schema(
+        tags=["Products"],
+        summary="Recomendações para um produto",
+        description=(
+            "Produtos ativos com pelo menos uma variação em estoque, excluindo o atual. "
+            "Prioriza mesma categoria, depois mesmo drop (quando presentes), vendas "
+            "válidas, recência decrescente e ID crescente. Completa os resultados com "
+            "outros produtos disponíveis do catálogo. Vendas consideram quantidades "
+            "de pedidos PAID, PREPARING, SHIPPED e DELIVERED. "
+            "Página inicial 1, tamanho padrão 4 e máximo 50; valores maiores são limitados. "
+            "Produto de origem inativo ou inexistente retorna 404, inclusive para admin."
+        ),
+        parameters=[CatalogPageQuerySerializer],
+        responses={
+            200: ProductListSerializer(many=True),
+            400: OpenApiResponse(description="Parâmetros de paginação inválidos."),
+            404: OpenApiResponse(description="Produto ou página não encontrado."),
+        },
+    )
+    def get(self, request, pk):
+        query = CatalogPageQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        product = get_object_or_404(Product, pk=pk, is_active=True)
+        paginator = self.pagination_class()
+        page = paginator.paginate_queryset(recommend_products(product), request, view=self)
+        serializer = self.serializer_class(page, many=True, context={"request": request})
+        return paginator.get_paginated_response(serializer.data)
 
 
 class ProductDetailView(APIView):

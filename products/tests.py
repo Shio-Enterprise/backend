@@ -33,7 +33,11 @@ from .models import (
     ProductVariation,
     StockMovement,
 )
-from .views import CatalogFilterOptionsView, ProductListCreateView
+from .views import (
+    CatalogFilterOptionsView,
+    ProductListCreateView,
+    ProductRecommendationsView,
+)
 
 User = get_user_model()
 
@@ -1034,6 +1038,216 @@ class ProductListContractTests(APITestCase):
                 self.assertEqual(ids[:3], [str(winner.id), *expected_ties])
                 self.assertNotIn(str(inactive.id), ids)
                 self.assertIsNotNone(body["next"])
+
+
+class ProductRecommendationTests(APITestCase):
+    def setUp(self):
+        self.category = Category.objects.create(name="Camisetas", slug="camisetas")
+        self.other_category = Category.objects.create(name="Calças", slug="calcas")
+        self.drop = DropCampaign.objects.create(name="Drop", slug="drop")
+        self.product = self.make_available(category=self.category, drop=self.drop)
+        self.url = f"/api/catalog/products/{self.product.id}/recommendations/"
+
+    def make_available(self, stock=2, **kwargs):
+        product = make_product(**kwargs)
+        ProductVariation.objects.create(
+            product=product, size="M", sku=str(uuid.uuid4()), stock_quantity=stock
+        )
+        return product
+
+    def assert_recommendations(self, expected, **params):
+        response = self.client.get(self.url, params)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(
+            [item["id"] for item in body["results"]],
+            [str(product.id) for product in expected],
+        )
+        return body
+
+    def test_public_recommendations_require_active_products_with_stock(self):
+        available = self.make_available(category=self.category)
+        ProductVariation.objects.create(
+            product=available, size="G", sku="second-stock", stock_quantity=3
+        )
+        self.make_available(category=self.category, is_active=False)
+        self.make_available(category=self.category, stock=0)
+        make_product(category=self.category)
+        with self.assertNumQueries(5):
+            body = self.assert_recommendations([available])
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["results"][0]["category_details"]["slug"], "camisetas")
+        self.assertEqual(len(body["results"][0]["variations"]), 2)
+        self.assertIn("images", body["results"][0])
+
+    def test_category_then_drop_priority_precedes_recency(self):
+        both = self.make_available(category=self.category, drop=self.drop)
+        category_only = self.make_available(category=self.category)
+        drop_only = self.make_available(category=self.other_category, drop=self.drop)
+        general = self.make_available(category=self.other_category)
+        self.assert_recommendations([both, category_only, drop_only, general])
+
+    def test_fallback_fills_page_from_same_category_then_general_catalog(self):
+        category_only = self.make_available(category=self.category)
+        general = self.make_available(category=self.other_category)
+        body = self.assert_recommendations([category_only, general])
+        self.assertEqual(body["count"], 2)
+        self.assertIsNone(body["next"])
+
+    def test_fallback_to_general_catalog_when_category_is_unavailable(self):
+        self.make_available(category=self.category, stock=0)
+        self.make_available(category=self.category, is_active=False)
+        older = self.make_available(category=self.other_category)
+        newer = self.make_available()
+        self.assert_recommendations([newer, older])
+
+    def test_no_drop_does_not_prioritize_other_products_without_drop(self):
+        self.product.drop = None
+        self.product.save(update_fields=["drop"])
+        without_drop = self.make_available(category=self.category)
+        with_drop = self.make_available(category=self.category, drop=self.drop)
+        self.assert_recommendations([with_drop, without_drop])
+
+    def test_no_category_uses_drop_then_general_catalog(self):
+        self.product.category = None
+        self.product.save(update_fields=["category"])
+        same_drop = self.make_available(category=self.category, drop=self.drop)
+        without_category = self.make_available()
+        general = self.make_available(category=self.other_category)
+        self.assert_recommendations([same_drop, general, without_category])
+
+    def test_sales_sum_all_variations_and_only_valid_order_statuses(self):
+        winner = self.make_available(category=self.category, drop=self.drop)
+        second_variation = ProductVariation.objects.create(
+            product=winner, size="G", sku="sold-out-sales", stock_quantity=0
+        )
+        runner_up = self.make_available(category=self.category, drop=self.drop)
+        unpaid = self.make_available(category=self.category, drop=self.drop)
+        general = self.make_available(category=self.other_category)
+        user = make_user("recommendations@example.com")
+        for order_status in OrderStatus.values:
+            order = CustomerOrder.objects.create(
+                user=user,
+                status=order_status,
+                subtotal=100,
+                total_amount=100,
+                shipping_zip_code="01001000",
+                shipping_street="Rua Teste",
+                shipping_number="1",
+                shipping_neighborhood="Centro",
+                shipping_city="São Paulo",
+                shipping_state="SP",
+            )
+            valid = order_status in (
+                OrderStatus.PAID,
+                OrderStatus.PREPARING,
+                OrderStatus.SHIPPED,
+                OrderStatus.DELIVERED,
+            )
+            for variation, quantity in (
+                (winner.variations.get(size="M"), 2 if valid else 0),
+                (second_variation, 2 if valid else 0),
+                (runner_up.variations.get(), 3 if valid else 0),
+                (unpaid.variations.get(), 0 if valid else 100),
+                (general.variations.get(), 100 if valid else 0),
+            ):
+                if quantity:
+                    OrderItem.objects.create(
+                        order=order,
+                        variation=variation,
+                        quantity=quantity,
+                        unit_price=1,
+                        product_name=variation.product.name,
+                    )
+        self.assert_recommendations([winner, runner_up, unpaid, general])
+
+    def test_ties_use_recency_then_id(self):
+        older = self.make_available()
+        newer = self.make_available()
+        Product.objects.filter(pk=older.pk).update(
+            created_at=timezone.now() - timedelta(days=1)
+        )
+        self.assert_recommendations([newer, older])
+        Product.objects.filter(pk__in=[older.pk, newer.pk]).update(
+            created_at=timezone.now()
+        )
+        self.assert_recommendations(
+            sorted([older, newer], key=lambda product: product.id)
+        )
+
+    def test_priorities_apply_before_pagination_with_a_safe_page_size_limit(self):
+        preferred = self.make_available(category=self.category, drop=self.drop)
+        others = [self.make_available() for _ in range(54)]
+        expected = [preferred, *reversed(others)]
+        body = self.assert_recommendations(expected[:4])
+        self.assertEqual(body["count"], 55)
+        self.assertIsNotNone(body["next"])
+        self.assertIsNone(body["previous"])
+        body = self.assert_recommendations(expected[4:8], page=2, page_size=4)
+        self.assertIsNotNone(body["previous"])
+        body = self.assert_recommendations(expected[:50], page_size=1000)
+        self.assertEqual(body["count"], 55)
+        body = self.assert_recommendations(expected[50:], page_size=1000, page=2)
+        self.assertIsNone(body["next"])
+
+    def test_invalid_pagination_and_missing_page(self):
+        for name in ("page", "page_size"):
+            for value in ("zero", "0", "-1", "1.5"):
+                with self.subTest(parameter=name, value=value):
+                    self.assertEqual(
+                        self.client.get(self.url, {name: value}).status_code, 400
+                    )
+        self.assertEqual(self.client.get(self.url, {"page": 2}).status_code, 404)
+
+    def test_missing_or_inactive_source_returns_404_even_for_admin(self):
+        admin = make_user(
+            "recommendations-admin@example.com", role=UserRole.ADMIN, is_staff=True
+        )
+        inactive = make_product(is_active=False)
+        for headers in ({}, auth_header(admin)):
+            for product_id in (uuid.uuid4(), inactive.id):
+                with self.subTest(authenticated=bool(headers), product_id=product_id):
+                    response = self.client.get(
+                        f"/api/catalog/products/{product_id}/recommendations/",
+                        **headers,
+                    )
+                    self.assertEqual(response.status_code, 404)
+
+    def test_sold_out_source_can_still_receive_recommendations(self):
+        self.product.variations.update(stock_quantity=0)
+        available = self.make_available()
+        self.assert_recommendations([available])
+
+    def test_empty_catalog_returns_empty_paginated_response(self):
+        self.assertEqual(
+            self.assert_recommendations([]),
+            {"count": 0, "next": None, "previous": None, "results": []},
+        )
+
+    def test_openapi_documents_paginated_recommendations(self):
+        schema = SchemaGenerator(
+            patterns=[
+                path(
+                    "api/catalog/products/<uuid:pk>/recommendations/",
+                    ProductRecommendationsView.as_view(),
+                ),
+            ]
+        ).get_schema(public=True)
+        validate_schema(schema)
+        operation = next(iter(schema["paths"].values()))["get"]
+        self.assertTrue(
+            {"page", "page_size"}.issubset(
+                parameter["name"] for parameter in operation["parameters"]
+            )
+        )
+        response_schema = operation["responses"]["200"]["content"]["application/json"][
+            "schema"
+        ]
+        component = response_schema["$ref"].rsplit("/", 1)[1]
+        self.assertEqual(
+            set(schema["components"]["schemas"][component]["properties"]),
+            {"count", "next", "previous", "results"},
+        )
 
 
 class ProductDetailTests(APITestCase):

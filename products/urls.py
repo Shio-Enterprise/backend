@@ -12,6 +12,7 @@ from .views import (
     ProductImageDeleteView,
     ProductImageUpdateView,
     ProductListCreateView,
+    ProductRecommendationsView,
     ProductVariationCreateView,
     ProductVariationDetailView,
     StockMovementListCreateView,
@@ -63,6 +64,11 @@ urlpatterns = [
         "products/<uuid:pk>/",
         ProductDetailView.as_view(),
         name="product-detail",
+    ),
+    path(
+        "products/<uuid:pk>/recommendations/",
+        ProductRecommendationsView.as_view(),
+        name="product-recommendations",
     ),
     # POST (admin) - Cria variação no produto
     path(

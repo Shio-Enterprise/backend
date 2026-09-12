@@ -12,11 +12,14 @@ from .models import (
 )
 
 
-class ProductListQuerySerializer(serializers.Serializer):
-    """Valida a query antes de construir filtros ou executar a paginação."""
-
+class CatalogPageQuerySerializer(serializers.Serializer):
     page = serializers.IntegerField(min_value=1, required=False)
     page_size = serializers.IntegerField(min_value=1, required=False)
+
+
+class ProductListQuerySerializer(CatalogPageQuerySerializer):
+    """Valida a query antes de construir filtros ou executar a paginação."""
+
     category = serializers.SlugField(max_length=150, required=False)
     drop = serializers.UUIDField(required=False)
     search = serializers.CharField(required=False, allow_blank=True)
