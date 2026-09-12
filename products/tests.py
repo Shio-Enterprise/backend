@@ -932,6 +932,109 @@ class ProductListContractTests(APITestCase):
         self.assertEqual(totals[invalid.id], 0)
         self.assertEqual(totals[self.products[-1].id], 0)
 
+    def test_sales_ranking_tracks_each_order_status_and_ignores_payment_status(self):
+        from orders.models import Payment, PaymentMethod, PaymentStatus
+
+        product = self.products[0]
+        variation = ProductVariation.objects.create(
+            product=product, sku="ranking-status"
+        )
+        order = CustomerOrder.objects.create(
+            user=make_user("ranking-status@example.com"),
+            subtotal=100,
+            total_amount=100,
+            shipping_zip_code="01001000",
+            shipping_street="Rua Teste",
+            shipping_number="1",
+            shipping_neighborhood="Centro",
+            shipping_city="São Paulo",
+            shipping_state="SP",
+        )
+        OrderItem.objects.create(
+            order=order,
+            variation=variation,
+            quantity=7,
+            unit_price=100,
+            product_name=product.name,
+        )
+        payment = Payment.objects.create(
+            order=order,
+            method=PaymentMethod.PIX,
+            status=PaymentStatus.PENDING,
+            total_amount=100,
+        )
+        for order_status, expected in (
+            (OrderStatus.AWAITING_PAYMENT, 0),
+            (OrderStatus.PAID, 7),
+            (OrderStatus.PREPARING, 7),
+            (OrderStatus.SHIPPED, 7),
+            (OrderStatus.DELIVERED, 7),
+            (OrderStatus.CANCELED, 0),
+        ):
+            for payment_status in (PaymentStatus.PENDING, PaymentStatus.PAID):
+                with self.subTest(order=order_status, payment=payment_status):
+                    order.status = order_status
+                    order.save(update_fields=["status"])
+                    payment.status = payment_status
+                    payment.save(update_fields=["status"])
+                    ranked = filter_catalog(
+                        Product.objects.all(), {"ordering": "-sales_count"}
+                    )
+                    self.assertEqual(ranked.get(pk=product.pk).sales_count, expected)
+
+    def test_sales_ranking_precedes_pagination_and_has_stable_ties(self):
+        # O produto mais antigo fica fora da primeira página por recência.
+        winner, tied_a, tied_b = self.products[:3]
+        order = CustomerOrder.objects.create(
+            user=make_user("ranking-page@example.com"),
+            status=OrderStatus.PAID,
+            subtotal=100,
+            total_amount=100,
+            shipping_zip_code="01001000",
+            shipping_street="Rua Teste",
+            shipping_number="1",
+            shipping_neighborhood="Centro",
+            shipping_city="São Paulo",
+            shipping_state="SP",
+        )
+        inactive = make_product(name="Inativo", is_active=False)
+        for product, quantity in (
+            (winner, 10),
+            (tied_a, 5),
+            (tied_b, 5),
+            (inactive, 100),
+        ):
+            variation = ProductVariation.objects.create(
+                product=product, sku=str(product.id)
+            )
+            OrderItem.objects.create(
+                order=order,
+                variation=variation,
+                quantity=quantity,
+                unit_price=100,
+                product_name=product.name,
+            )
+        expected_ties = [str(tied_b.id), str(tied_a.id)]
+        for same_date in (False, True):
+            if same_date:
+                Product.objects.filter(pk__in=[tied_a.pk, tied_b.pk]).update(
+                    created_at=timezone.now()
+                )
+                expected_ties = sorted(expected_ties)
+            with self.subTest(same_date=same_date):
+                with self.assertNumQueries(4):
+                    response = self.client.get(
+                        self.url, {"ordering": "-sales_count", "page_size": 4}
+                    )
+                self.assertEqual(response.status_code, 200)
+                body = response.json()
+                self.assertEqual(body["count"], 25)
+                self.assertEqual(len(body["results"]), 4)
+                ids = [item["id"] for item in body["results"]]
+                self.assertEqual(ids[:3], [str(winner.id), *expected_ties])
+                self.assertNotIn(str(inactive.id), ids)
+                self.assertIsNotNone(body["next"])
+
 
 class ProductDetailTests(APITestCase):
     """Testes para GET /api/catalog/products/{id}/."""
