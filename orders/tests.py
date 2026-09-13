@@ -5,6 +5,7 @@ from django.contrib.auth import get_user_model
 from rest_framework import status
 from rest_framework.test import APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework.exceptions import ValidationError
 
 from authentication.models import Address, UserProfile, UserRole
 from orders.models import (
@@ -17,6 +18,7 @@ from orders.models import (
     Payment,
     PaymentStatus,
 )
+from orders.services import update_status
 from products.models import Category, Product, ProductVariation
 
 User = get_user_model()
@@ -731,6 +733,12 @@ class OrderDispatchViewTests(APITestCase):
             shipping_city="Brasília",
             shipping_state="DF",
         )
+        self.payment = Payment.objects.create(
+            order=self.order,
+            method="PIX",
+            status=PaymentStatus.PAID,
+            total_amount=115.00,
+        )
 
     def dispatch_url(self, order_id):
         return f"/api/orders/correios/{order_id}/despachar/"
@@ -804,6 +812,379 @@ class OrderDispatchViewTests(APITestCase):
         self.client.force_authenticate(user=self.admin)
         response = self.client.post(self.dispatch_url(self.order.id))
         self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+
+
+class OrderStateMachineAcceptanceTests(APITestCase):
+    def setUp(self):
+        self.admin = User.objects.create_user(
+            email="o6_admin@shio.com",
+            name="Admin O6",
+            is_staff=True,
+        )
+
+        self.customer = User.objects.create_user(
+            email="o6_cliente@shio.com",
+            name="Cliente O6",
+            password="senha_forte_123",
+        )
+
+        self.admin_auth = {
+            "HTTP_AUTHORIZATION": (
+                f"Bearer "
+                f"{str(RefreshToken.for_user(self.admin).access_token)}"
+            )
+        }
+
+        self.customer_auth = {
+            "HTTP_AUTHORIZATION": (
+                f"Bearer "
+                f"{str(RefreshToken.for_user(self.customer).access_token)}"
+            )
+        }
+
+    def create_order(self, order_status):
+        return CustomerOrder.objects.create(
+            user=self.customer,
+            subtotal=100.00,
+            total_amount=115.00,
+            shipping_cost=15.00,
+            status=order_status,
+            tracking_code=None,
+            shipping_zip_code="71000000",
+            shipping_street="Rua Teste",
+            shipping_number="10",
+            shipping_neighborhood="Centro",
+            shipping_city="Brasília",
+            shipping_state="DF",
+        )
+
+    def admin_url(self, order):
+        return f"/api/orders/admin/{order.id}/"
+
+    def dispatch_url(self, order):
+        return f"/api/orders/correios/{order.id}/despachar/"
+
+    def customer_url(self, order):
+        return f"/api/orders/my-orders/{order.id}/"
+
+    def test_todas_as_transicoes_permitidas(self):
+        transitions = [
+            (OrderStatus.AWAITING_PAYMENT, OrderStatus.PAID),
+            (OrderStatus.AWAITING_PAYMENT, OrderStatus.CANCELED),
+            (OrderStatus.PAID, OrderStatus.PREPARING),
+            (OrderStatus.PREPARING, OrderStatus.SHIPPED),
+            (OrderStatus.SHIPPED, OrderStatus.DELIVERED),
+        ]
+
+        for previous_status, new_status in transitions:
+            with self.subTest(previous_status=previous_status, new_status=new_status):
+                order = self.create_order(previous_status)
+
+                tracking_code = (
+                    "BR123456789BR"
+                    if new_status == OrderStatus.SHIPPED
+                    else None
+                )
+
+                update_status(
+                    order=order,
+                    new_status=new_status,
+                    tracking_code=tracking_code,
+                    changed_by=self.admin,
+                )
+
+                order.refresh_from_db()
+                self.assertEqual(order.status, new_status)
+
+                logs = OrderStatusLog.objects.filter(order=order)
+                self.assertEqual(logs.count(), 1)
+
+                log = logs.first()
+                self.assertEqual(log.previous_status, previous_status)
+                self.assertEqual(log.new_status, new_status)
+
+    def test_cada_estado_rejeita_transicao_invalida(self):
+        invalid_transitions = [
+            (OrderStatus.AWAITING_PAYMENT, OrderStatus.SHIPPED),
+            (OrderStatus.PAID, OrderStatus.DELIVERED),
+            (OrderStatus.PREPARING, OrderStatus.DELIVERED),
+            (OrderStatus.SHIPPED, OrderStatus.PREPARING),
+            (OrderStatus.DELIVERED, OrderStatus.SHIPPED),
+            (OrderStatus.CANCELED, OrderStatus.PAID),
+        ]
+
+        for previous_status, new_status in invalid_transitions:
+            with self.subTest(previous_status=previous_status, new_status=new_status):
+                order = self.create_order(previous_status)
+
+                with self.assertRaises(ValidationError):
+                    update_status(
+                        order=order,
+                        new_status=new_status,
+                        changed_by=self.admin,
+                    )
+
+                order.refresh_from_db()
+
+                self.assertEqual(order.status, previous_status)
+                self.assertEqual(
+                    OrderStatusLog.objects.filter(
+                        order=order
+                    ).count(),
+                    0,
+                )
+
+    @patch("orders.views.dispatch_order_and_get_tracking_code")
+    def test_pedido_aguardando_pagamento_nao_pode_ser_despachado(
+        self,
+        mock_dispatch,
+    ):
+        order = self.create_order(OrderStatus.AWAITING_PAYMENT)
+
+        Payment.objects.create(
+            order=order,
+            method="PIX",
+            status=PaymentStatus.PROCESSING,
+            total_amount=115.00,
+        )
+
+        response = self.client.post(self.dispatch_url(order), **self.admin_auth)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        mock_dispatch.assert_not_called()
+
+        order.refresh_from_db()
+
+        self.assertEqual(order.status, OrderStatus.AWAITING_PAYMENT)
+        self.assertIsNone(order.tracking_code)
+        self.assertEqual(
+            OrderStatusLog.objects.filter(
+                order=order
+            ).count(),
+            0,
+        )
+
+    @patch("orders.views.dispatch_order_and_get_tracking_code")
+    def test_pedido_com_pagamento_recusado_nao_pode_ser_despachado(
+        self,
+        mock_dispatch,
+    ):
+        order = self.create_order(OrderStatus.PREPARING)
+
+        Payment.objects.create(
+            order=order,
+            method="PIX",
+            status=PaymentStatus.FAILED,
+            total_amount=115.00,
+        )
+
+        response = self.client.post(self.dispatch_url(order), **self.admin_auth)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        mock_dispatch.assert_not_called()
+
+        order.refresh_from_db()
+
+        self.assertEqual(order.status, OrderStatus.PREPARING)
+        self.assertIsNone(order.tracking_code)
+        self.assertEqual(
+            OrderStatusLog.objects.filter(
+                order=order
+            ).count(),
+            0,
+        )
+
+    def test_cada_mudanca_de_status_cria_somente_um_log(self):
+        order = self.create_order(OrderStatus.PAID)
+        update_status(
+            order=order,
+            new_status=OrderStatus.PREPARING,
+            changed_by=self.admin,
+        )
+
+        self.assertEqual(
+            OrderStatusLog.objects.filter(
+                order=order
+            ).count(),
+            1,
+        )
+
+        update_status(
+            order=order,
+            new_status=OrderStatus.SHIPPED,
+            tracking_code="BR123456789BR",
+            changed_by=self.admin,
+        )
+
+        self.assertEqual(
+            OrderStatusLog.objects.filter(
+                order=order
+            ).count(),
+            2,
+        )
+
+        update_status(
+            order=order,
+            new_status=OrderStatus.DELIVERED,
+            changed_by=self.admin,
+        )
+
+        self.assertEqual(
+            OrderStatusLog.objects.filter(
+                order=order
+            ).count(),
+            3,
+        )
+
+        logs = OrderStatusLog.objects.filter(order=order)
+
+        self.assertEqual(
+            logs.filter(
+                new_status=OrderStatus.PREPARING
+            ).count(),
+            1,
+        )
+        self.assertEqual(
+            logs.filter(
+                new_status=OrderStatus.SHIPPED
+            ).count(),
+            1,
+        )
+        self.assertEqual(
+            logs.filter(
+                new_status=OrderStatus.DELIVERED
+            ).count(),
+            1,
+        )
+
+    def test_admin_executa_ciclo_completo_ate_entrega(self):
+        order = self.create_order(OrderStatus.PAID)
+        Payment.objects.create(
+            order=order,
+            method="PIX",
+            status=PaymentStatus.PAID,
+            total_amount=115.00,
+        )
+        url = self.admin_url(order)
+
+        # PAID -> PREPARING
+        response = self.client.patch(
+            url,
+            {
+                "status": "PREPARING",
+                "comment": "Pedido em separação",
+            },
+            format="json",
+            **self.admin_auth,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # PREPARING -> SHIPPED
+        response = self.client.patch(
+            url,
+            {
+                "status": "SHIPPED",
+                "tracking_code": "BR123456789BR",
+                "comment": "Pedido enviado",
+            },
+            format="json",
+            **self.admin_auth,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # SHIPPED -> DELIVERED
+        response = self.client.patch(
+            url,
+            {
+                "status": "DELIVERED",
+                "comment": "Pedido entregue",
+            },
+            format="json",
+            **self.admin_auth,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        order.refresh_from_db()
+
+        self.assertEqual(order.status, OrderStatus.DELIVERED)
+        self.assertEqual(order.tracking_code, "BR123456789BR")
+        
+        logs = OrderStatusLog.objects.filter(order=order)
+        self.assertEqual(logs.count(), 3)
+
+    def test_cliente_recebe_linha_do_tempo_na_ordem_correta(self):
+        order = self.create_order(OrderStatus.PAID)
+        Payment.objects.create(
+            order=order,
+            method="PIX",
+            status=PaymentStatus.PAID,
+            total_amount=115.00,
+        )
+
+        update_status(
+            order=order,
+            new_status=OrderStatus.PREPARING,
+            changed_by=self.admin,
+        )
+
+        update_status(
+            order=order,
+            new_status=OrderStatus.SHIPPED,
+            tracking_code="BR123456789BR",
+            changed_by=self.admin,
+        )
+
+        update_status(
+            order=order,
+            new_status=OrderStatus.DELIVERED,
+            changed_by=self.admin,
+        )
+
+        response = self.client.get(
+            self.customer_url(order),
+            **self.customer_auth,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        data = response.json()
+
+        self.assertIn("status_logs", data)
+
+        timeline = [log["new_status"] for log in data["status_logs"]]
+
+        self.assertEqual(
+            timeline,
+            [
+                OrderStatus.PREPARING,
+                OrderStatus.SHIPPED,
+                OrderStatus.DELIVERED,
+            ],
+        )
+
+    def test_api_retorna_400_para_transicao_invalida(self):
+        order = self.create_order(OrderStatus.AWAITING_PAYMENT)
+        response = self.client.patch(
+            self.admin_url(order),
+            { "status": "DELIVERED" },
+            format="json",
+            **self.admin_auth,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        order.refresh_from_db()
+
+        self.assertEqual(order.status, OrderStatus.AWAITING_PAYMENT)
+        self.assertEqual(
+            OrderStatusLog.objects.filter(
+                order=order
+            ).count(),
+            0,
+        )
 
 
 class CepLookupViewTests(APITestCase):
