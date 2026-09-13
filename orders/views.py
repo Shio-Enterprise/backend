@@ -685,7 +685,7 @@ class OrderDispatchView(APIView):
     )
     def post(self, request, order_id):
         order = (
-            CustomerOrder.objects.select_related("user", "user__profile")
+            CustomerOrder.objects.select_related("user", "user__profile", "payment")
             .filter(id=order_id)
             .first()
         )
@@ -695,15 +695,24 @@ class OrderDispatchView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        undispatchable_statuses = [
-            OrderStatus.DELIVERED,
-            OrderStatus.CANCELED,
-            OrderStatus.SHIPPED,
-        ]
-        if order.status in undispatchable_statuses:
+        if order.status != OrderStatus.PREPARING:
             return Response(
                 {
                     "message": f"Pedido com status '{order.status}' não pode ser despachado."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if (
+            not hasattr(order, "payment")
+            or order.payment.status != PaymentStatus.PAID
+        ):
+            return Response(
+                {
+                    "message": (
+                        "Pedido sem pagamento confirmado "
+                        "não pode ser despachado."
+                    )
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
