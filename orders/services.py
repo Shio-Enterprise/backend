@@ -6,6 +6,7 @@ from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 
 from orders.models import (
     Cart,
@@ -15,7 +16,10 @@ from orders.models import (
     Payment,
     PaymentStatus,
 )
-from products.models import ProductVariation
+from products.models import ProductVariation, StockMovement
+from products.services import move_stock
+
+from .models import CustomerOrder
 
 
 def create_infinitepay_checkout(order, request):
@@ -119,6 +123,7 @@ def get_or_create_user_cart(user):
 
 
 def get_cart_data(request):
+    price_at = timezone.now()
     if request.user.is_authenticated:
         cart = Cart.objects.filter(user=request.user, status="ACTIVE").first()
         if not cart:
@@ -127,6 +132,7 @@ def get_cart_data(request):
         items = []
         subtotal = Decimal("0.00")
         for item in cart.items.select_related("variation", "variation__product").all():
+            item.unit_price = item.variation.product.price_at(price_at)
             total_price = item.quantity * item.unit_price
             subtotal += total_price
             items.append(
@@ -138,6 +144,10 @@ def get_cart_data(request):
                     "sku": item.variation.sku,
                     "quantity": item.quantity,
                     "unit_price": item.unit_price,
+                    "base_price": item.variation.product.base_price,
+                    "is_promotion_active": item.variation.product.promotion_active_at(
+                        price_at
+                    ),
                     "total_price": total_price,
                     "stock_quantity": item.variation.stock_quantity,
                 }
@@ -166,12 +176,7 @@ def get_cart_data(request):
                 continue
 
             quantity = item_data.get("quantity", 0)
-            unit_price_str = item_data.get("unit_price")
-            unit_price = (
-                Decimal(unit_price_str)
-                if unit_price_str
-                else variation.product.base_price
-            )
+            unit_price = variation.product.price_at(price_at)
 
             total_price = quantity * unit_price
             subtotal += total_price
@@ -185,6 +190,10 @@ def get_cart_data(request):
                     "sku": variation.sku,
                     "quantity": quantity,
                     "unit_price": unit_price,
+                    "base_price": variation.product.base_price,
+                    "is_promotion_active": variation.product.promotion_active_at(
+                        price_at
+                    ),
                     "total_price": total_price,
                     "stock_quantity": variation.stock_quantity,
                 }
@@ -215,7 +224,10 @@ def add_item_to_cart(request, variation_id, quantity):
             cart_item, _ = CartItem.objects.get_or_create(
                 cart=cart,
                 variation=variation,
-                defaults={"quantity": 0, "unit_price": variation.product.base_price},
+                defaults={
+                    "quantity": 0,
+                    "unit_price": variation.product.effective_price,
+                },
             )
 
             new_quantity = cart_item.quantity + quantity
@@ -225,7 +237,7 @@ def add_item_to_cart(request, variation_id, quantity):
                 )
 
             cart_item.quantity = new_quantity
-            cart_item.unit_price = variation.product.base_price
+            cart_item.unit_price = variation.product.effective_price
             cart_item.save()
     else:
         variation = get_object_or_404(
@@ -245,7 +257,7 @@ def add_item_to_cart(request, variation_id, quantity):
 
         session_cart[var_id_str] = {
             "quantity": new_quantity,
-            "unit_price": str(variation.product.base_price),
+            "unit_price": str(variation.product.effective_price),
         }
         request.session["cart"] = session_cart
         request.session.modified = True
@@ -265,7 +277,7 @@ def update_item_quantity(request, variation_id, quantity):
         cart = get_or_create_user_cart(request.user)
         cart_item = get_object_or_404(CartItem, cart=cart, variation=variation)
         cart_item.quantity = quantity
-        cart_item.unit_price = variation.product.base_price
+        cart_item.unit_price = variation.product.effective_price
         cart_item.save()
     else:
         session_cart = request.session.get("cart", {})
@@ -274,7 +286,7 @@ def update_item_quantity(request, variation_id, quantity):
             raise KeyError("Item não está no carrinho.")
 
         session_cart[var_id_str]["quantity"] = quantity
-        session_cart[var_id_str]["unit_price"] = str(variation.product.base_price)
+        session_cart[var_id_str]["unit_price"] = str(variation.product.effective_price)
         request.session["cart"] = session_cart
         request.session.modified = True
 
@@ -340,7 +352,10 @@ def merge_session_cart_to_db(request, user):
             cart_item, _ = CartItem.objects.get_or_create(
                 cart=db_cart,
                 variation=variation,
-                defaults={"quantity": 0, "unit_price": variation.product.base_price},
+                defaults={
+                    "quantity": 0,
+                    "unit_price": variation.product.effective_price,
+                },
             )
 
             new_quantity = cart_item.quantity + quantity
@@ -348,7 +363,7 @@ def merge_session_cart_to_db(request, user):
                 new_quantity = variation.stock_quantity
 
             cart_item.quantity = new_quantity
-            cart_item.unit_price = variation.product.base_price
+            cart_item.unit_price = variation.product.effective_price
             cart_item.save()
 
         request.session.pop("cart", None)
@@ -361,6 +376,7 @@ def merge_session_cart_to_db(request, user):
             pass
 
 
+@transaction.atomic
 def update_status(order, new_status, changed_by=None, tracking_code=None, comment=None):
     """Centraliza a atualização de status de pedidos e cria um log histórico.
 
@@ -371,7 +387,18 @@ def update_status(order, new_status, changed_by=None, tracking_code=None, commen
         tracking_code: optional tracking code to save
         comment: optional comment/observation
     """
+    locked = CustomerOrder.objects.select_for_update().get(pk=order.pk)
+    order.status = locked.status
     previous_status = order.status
+    if new_status == OrderStatus.CANCELED:
+        shipped = (
+            previous_status in (OrderStatus.SHIPPED, OrderStatus.DELIVERED)
+            or order.status_logs.filter(
+                new_status__in=[OrderStatus.SHIPPED, OrderStatus.DELIVERED]
+            ).exists()
+        )
+        if not shipped:
+            restore_order_stock(order, changed_by=changed_by)
 
     if tracking_code:
         order.tracking_code = tracking_code
@@ -397,3 +424,31 @@ def update_status(order, new_status, changed_by=None, tracking_code=None, commen
         tracking_code=tracking_code,
         comment=comment,
     )
+
+
+@transaction.atomic
+def restore_order_stock(order, changed_by=None, physical_return=False):
+    CustomerOrder.objects.select_for_update().get(pk=order.pk)
+    if physical_return and not changed_by:
+        raise ValueError("Retorno físico exige confirmação administrativa.")
+    for item in order.items.order_by("variation_id"):
+        sale = StockMovement.objects.filter(
+            order_item=item, reason="VENDA", origin_type="ORDER"
+        ).first()
+        if not sale or StockMovement.objects.filter(reverses_movement=sale).exists():
+            continue
+        move_stock(
+            variation=item.variation,
+            kind="ENTRADA",
+            reason="DEVOLUCAO",
+            quantity=item.quantity,
+            origin_type="ORDER",
+            origin_id=order.pk,
+            order_item=item,
+            idempotency_key=f"return:{item.pk}",
+            created_by=changed_by,
+            note="Retorno físico confirmado"
+            if physical_return
+            else "Cancelamento antes da expedição",
+            reverses_movement=sale,
+        )

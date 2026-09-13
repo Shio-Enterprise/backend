@@ -9,6 +9,13 @@ Este repositório contém o backend Django da aplicação, com autenticação JW
 - Python 3.9+
 - Docker e Docker Compose
 
+## Decisões funcionais
+
+- [DF-001: preços, variações, duplicação e estoque](docs/decisions/DF-001-produtos-precos-estoque.md)
+- [Issue técnica derivada da DF-001 (texto preparado)](docs/issues/IT-001-produtos-precos-estoque.md)
+
+- [Implementação da DF-001: uso, migração e validação](docs/IMPLEMENTACAO-DF-001.md)
+
 ## Dependências
 
 As dependências do projeto estão em `requirements.txt`.

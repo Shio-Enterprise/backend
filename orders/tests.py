@@ -58,7 +58,11 @@ class CheckoutAPITests(APITestCase):
         """Deve retornar 201, criar o pedido, finalizar o carrinho e deduzir estoque."""
         mock_create_checkout.return_value = "https://pay.infinitepay.io/mock-url"
 
-        payload = {"address_id": str(self.address.id), "shipping_cost": 15.00}
+        payload = {
+            "address_id": str(self.address.id),
+            "shipping_cost": 15.00,
+            "confirmed_subtotal": "200.00",
+        }
 
         response = self.client.post(self.url, payload, format="json")
 
@@ -81,7 +85,11 @@ class CheckoutAPITests(APITestCase):
         """Deve retornar 400 se o usuário não tiver itens no carrinho ativo."""
         self.cart.items.all().delete()
 
-        payload = {"address_id": str(self.address.id), "shipping_cost": 15.00}
+        payload = {
+            "address_id": str(self.address.id),
+            "shipping_cost": 15.00,
+            "confirmed_subtotal": "200.00",
+        }
 
         response = self.client.post(self.url, payload, format="json")
 
@@ -93,7 +101,11 @@ class CheckoutAPITests(APITestCase):
         self.cart_item.quantity = 20
         self.cart_item.save()
 
-        payload = {"address_id": str(self.address.id), "shipping_cost": 15.00}
+        payload = {
+            "address_id": str(self.address.id),
+            "shipping_cost": 15.00,
+            "confirmed_subtotal": "2000.00",
+        }
 
         response = self.client.post(self.url, payload, format="json")
 
@@ -110,7 +122,11 @@ class CheckoutAPITests(APITestCase):
         """Deve proteger o banco de dados se a API da InfinitePay cair."""
         mock_create_checkout.side_effect = Exception("InfinitePay Timeout")
 
-        payload = {"address_id": str(self.address.id), "shipping_cost": 15.00}
+        payload = {
+            "address_id": str(self.address.id),
+            "shipping_cost": 15.00,
+            "confirmed_subtotal": "200.00",
+        }
 
         response = self.client.post(self.url, payload, format="json")
 
@@ -713,6 +729,7 @@ class OrderDispatchViewTests(APITestCase):
         self.assertEqual(self.order.status, OrderStatus.SHIPPED)
 
         from orders.models import OrderStatusLog
+
         log = OrderStatusLog.objects.filter(order=self.order).first()
         self.assertIsNotNone(log)
         self.assertEqual(log.new_status, OrderStatus.SHIPPED)
@@ -813,6 +830,7 @@ class CepLookupViewTests(APITestCase):
     @patch("orders.correios_views.fetch_address_data_by_cep")
     def test_cep_inexistente_retorna_404(self, mock_fetch):
         from orders.correios import CorreiosCepNotFoundError
+
         mock_fetch.side_effect = CorreiosCepNotFoundError("CEP não encontrado")
 
         response = self.client.get(self.cep_url("00000000"))
@@ -829,7 +847,9 @@ class CepLookupViewTests(APITestCase):
 class ShippingOptionsViewTests(APITestCase):
     def setUp(self):
         self.user = User.objects.create_user(
-            email="frete_user@shio.com", name="Usuario Frete", password="senha_forte_123"
+            email="frete_user@shio.com",
+            name="Usuario Frete",
+            password="senha_forte_123",
         )
         self.url = "/api/orders/correios/frete/"
 

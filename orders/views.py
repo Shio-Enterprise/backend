@@ -1,5 +1,6 @@
 import datetime
 import logging
+from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.db import transaction
@@ -18,7 +19,8 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from authentication.permissions import IsStaffOrSuperUser
-from products.models import ProductVariation
+from products.models import Product, ProductVariation
+from products.services import move_stock
 
 from .correios import (
     CorreiosAuthenticationError,
@@ -51,6 +53,7 @@ from .services import (
     create_infinitepay_checkout,
     get_cart_data,
     remove_item_from_cart,
+    restore_order_stock,
     update_item_quantity,
     update_status,
 )
@@ -260,9 +263,10 @@ class AdminOrderDetailView(APIView):
             404: OpenApiTypes.OBJECT,
         },
     )
+    @transaction.atomic
     def patch(self, request, order_id):
         try:
-            order = CustomerOrder.objects.select_related("payment").get(id=order_id)
+            order = CustomerOrder.objects.select_for_update().get(id=order_id)
         except CustomerOrder.DoesNotExist:
             return Response({"message": "Pedido não encontrado."}, status=404)
 
@@ -287,35 +291,31 @@ class AdminOrderDetailView(APIView):
                 )
 
         # If shipping, require tracking code
-        if status_value == OrderStatus.SHIPPED and not tracking_code:
+        if status_value == OrderStatus.SHIPPED and not (
+            tracking_code or order.tracking_code
+        ):
             return Response(
                 {"message": "Tracking code obrigatório ao enviar pedido."}, status=400
             )
 
-        previous_status = order.status
-        order.status = status_value
-        if tracking_code:
-            order.tracking_code = tracking_code
-
-        order.save()
-
-        if (
-            status_value == OrderStatus.CANCELED
-            and hasattr(order, "payment")
-            and order.payment
+        if serializer.validated_data.get("physical_return_confirmed") and not (
+            order.status in (OrderStatus.SHIPPED, OrderStatus.DELIVERED)
+            or order.status_logs.filter(
+                new_status__in=[OrderStatus.SHIPPED, OrderStatus.DELIVERED]
+            ).exists()
         ):
-            if order.payment.status != PaymentStatus.PAID:
-                order.payment.status = PaymentStatus.FAILED
-                order.payment.save()
-
-        OrderStatusLog.objects.create(
-            order=order,
+            return Response(
+                {"message": "Retorno físico exige expedição anterior."}, status=400
+            )
+        update_status(
+            order,
+            status_value,
             changed_by=request.user,
-            previous_status=previous_status,
-            new_status=status_value,
             tracking_code=tracking_code,
             comment=comment,
         )
+        if serializer.validated_data.get("physical_return_confirmed"):
+            restore_order_stock(order, changed_by=request.user, physical_return=True)
 
         return Response(OrderDetailSerializer(order).data, status=status.HTTP_200_OK)
 
@@ -343,17 +343,22 @@ class CheckoutAPIView(APIView):
                         "format": "uuid",
                         "description": "UUID do endereço de entrega salvo no perfil",
                     },
+                    "confirmed_subtotal": {
+                        "type": "string",
+                        "description": "Subtotal de produtos confirmado pelo usuário; divergência retorna 409 price_changed.",
+                    },
                     "shipping_cost": {
                         "type": "number",
                         "format": "float",
                         "description": "Valor calculado do frete (em Reais)",
                     },
                 },
-                "required": ["address_id"],
+                "required": ["address_id", "confirmed_subtotal"],
             }
         },
         responses={
             201: OpenApiTypes.OBJECT,
+            409: OpenApiTypes.OBJECT,
             400: OpenApiTypes.OBJECT,
             500: OpenApiTypes.OBJECT,
         },
@@ -362,7 +367,8 @@ class CheckoutAPIView(APIView):
     def post(self, request):
         user = request.user
         cart = (
-            Cart.objects.filter(user=user, status="ACTIVE")
+            Cart.objects.select_for_update()
+            .filter(user=user, status="ACTIVE")
             .prefetch_related("items__variation__product")
             .first()
         )
@@ -387,9 +393,70 @@ class CheckoutAPIView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        subtotal = sum(item.quantity * item.unit_price for item in cart.items.all())
-        shipping_cost = request.data.get("shipping_cost", 0.00)
-        total_amount = float(subtotal) + float(shipping_cost)
+        items = list(
+            cart.items.select_related("variation__product").order_by("variation_id")
+        )
+        products = {
+            p.pk: p
+            for p in Product.objects.select_for_update()
+            .filter(pk__in=[i.variation.product_id for i in items])
+            .order_by("pk")
+        }
+        variations = {
+            v.pk: v
+            for v in ProductVariation.objects.select_for_update()
+            .filter(pk__in=[i.variation_id for i in items])
+            .order_by("pk")
+        }
+        at = timezone.now()
+        prices = {i.pk: products[i.variation.product_id].price_at(at) for i in items}
+        subtotal = sum((i.quantity * prices[i.pk] for i in items), Decimal("0.00"))
+        try:
+            confirmed = Decimal(str(request.data["confirmed_subtotal"]))
+            if not confirmed.is_finite():
+                raise ValueError
+        except (KeyError, ValueError, ArithmeticError):
+            return Response({"message": "Informe confirmed_subtotal."}, status=400)
+        if confirmed != subtotal:
+            return Response(
+                {
+                    "code": "price_changed",
+                    "message": "Os preços mudaram. Confira e confirme novamente.",
+                    "subtotal": str(subtotal),
+                    "items": [
+                        {
+                            "variation_id": str(i.variation_id),
+                            "quantity": i.quantity,
+                            "unit_price": str(prices[i.pk]),
+                            "base_price": str(
+                                products[i.variation.product_id].base_price
+                            ),
+                            "is_promotion_active": products[
+                                i.variation.product_id
+                            ].promotion_active_at(at),
+                            "total_price": str(prices[i.pk] * i.quantity),
+                        }
+                        for i in items
+                    ],
+                },
+                status=409,
+            )
+        for item in items:
+            if (
+                not products[item.variation.product_id].is_active
+                or variations[item.variation_id].stock_quantity < item.quantity
+            ):
+                return Response(
+                    {"message": "Produto indisponível ou estoque insuficiente."},
+                    status=400,
+                )
+        try:
+            shipping_cost = Decimal(str(request.data.get("shipping_cost", "0.00")))
+        except ArithmeticError:
+            return Response({"message": "Frete inválido."}, status=400)
+        if not shipping_cost.is_finite() or shipping_cost < 0:
+            return Response({"message": "Frete inválido."}, status=400)
+        total_amount = subtotal + shipping_cost
 
         order = CustomerOrder.objects.create(
             user=user,
@@ -406,27 +473,25 @@ class CheckoutAPIView(APIView):
             shipping_state=address.state,
         )
 
-        for item in cart.items.all():
-            if item.variation.stock_quantity < item.quantity:
-                transaction.set_rollback(True)
-                return Response(
-                    {
-                        "success": False,
-                        "message": f"Estoque insuficiente para {item.variation.product.name}.",
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            item.variation.stock_quantity -= item.quantity
-            item.variation.save()
-
-            OrderItem.objects.create(
+        for item in items:
+            order_item = OrderItem.objects.create(
                 order=order,
                 variation=item.variation,
                 quantity=item.quantity,
-                unit_price=item.unit_price,
-                product_name=f"{item.variation.product.name} - {item.variation.size}",
+                unit_price=prices[item.pk],
+                product_name=f"{item.variation.product.name} - {item.variation.size} / {item.variation.color}",
                 sku_snapshot=item.variation.sku,
+            )
+            move_stock(
+                variation=item.variation,
+                kind="SAIDA",
+                reason="VENDA",
+                quantity=item.quantity,
+                origin_type="ORDER",
+                origin_id=order.pk,
+                order_item=order_item,
+                idempotency_key=f"sale:{order_item.pk}",
+                created_by=user,
             )
 
         cart.status = "FINISHED"
@@ -606,6 +671,7 @@ class OrderTrackingView(APIView):
             404: OpenApiTypes.OBJECT,
         },
     )
+    @transaction.atomic
     def patch(self, request, order_id):
         order = CustomerOrder.objects.filter(id=order_id).first()
         if order is None:
@@ -666,7 +732,7 @@ class OrderDispatchView(APIView):
             "Restrito a administradores. Use este endpoint em vez do PATCH de rastreio manual "
             "quando quiser que o sistema gere o código automaticamente."
         ),
-        request=None, 
+        request=None,
         responses={
             200: OpenApiTypes.OBJECT,
             400: OpenApiTypes.OBJECT,
@@ -887,5 +953,3 @@ class CartItemDetailAPIView(APIView):
         return Response(
             CartRepresentationSerializer(cart_data).data, status=status.HTTP_200_OK
         )
-
-
