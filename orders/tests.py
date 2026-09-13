@@ -13,6 +13,7 @@ from orders.models import (
     CustomerOrder,
     OrderItem,
     OrderStatus,
+    OrderStatusLog,
     Payment,
     PaymentStatus,
 )
@@ -353,7 +354,7 @@ class OrderTrackingCodeAssignmentTests(APITestCase):
             subtotal=100.00,
             total_amount=115.00,
             shipping_cost=15.00,
-            status=OrderStatus.PAID,
+            status=OrderStatus.PREPARING,
             tracking_code=None,
             shipping_zip_code="71000000",
             shipping_street="Rua Teste",
@@ -603,15 +604,17 @@ class AdminOrderManagementTests(APITestCase):
         self.assertIn("status_logs", data)
 
     def test_admin_update_status_to_preparing(self):
-        url = f"/api/orders/admin/{self.order.id}/"
+        url = f"/api/orders/admin/{self.paid_order.id}/"
         payload = {"status": "PREPARING"}
+
         response = self.client.patch(url, payload, format="json", **self.admin_auth)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.order.refresh_from_db()
-        self.assertEqual(self.order.status, OrderStatus.PREPARING)
+
+        self.paid_order.refresh_from_db()
+        self.assertEqual(self.paid_order.status, OrderStatus.PREPARING)
 
     def test_admin_update_status_creates_audit_log(self):
-        url = f"/api/orders/admin/{self.order.id}/"
+        url = f"/api/orders/admin/{self.paid_order.id}/"
         payload = {"status": "PREPARING", "comment": "Iniciando separação"}
         response = self.client.patch(url, payload, format="json", **self.admin_auth)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
@@ -622,41 +625,76 @@ class AdminOrderManagementTests(APITestCase):
 
         self.assertEqual(len(data["status_logs"]), 1)
         log = data["status_logs"][0]
-        self.assertEqual(log["previous_status"], OrderStatus.AWAITING_PAYMENT)
+        self.assertEqual(log["previous_status"], OrderStatus.PAID)
         self.assertEqual(log["new_status"], OrderStatus.PREPARING)
         self.assertEqual(log["comment"], "Iniciando separação")
         self.assertEqual(log["changed_by"]["email"], self.admin.email)
 
     def test_admin_ship_stores_tracking_audit_log(self):
-        url = f"/api/orders/admin/{self.order.id}/"
+        self.paid_order.status = OrderStatus.PREPARING
+        self.paid_order.save(update_fields=["status"])
+
+        url = f"/api/orders/admin/{self.paid_order.id}/"
         payload = {
             "status": "SHIPPED",
             "tracking_code": "TRACK123",
             "comment": "Envio para correios",
         }
-        response = self.client.patch(url, payload, format="json", **self.admin_auth)
+
+        response = self.client.patch(
+            url,
+            payload,
+            format="json",
+            **self.admin_auth,
+        )
+
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.order.refresh_from_db()
-        self.assertEqual(self.order.status, OrderStatus.SHIPPED)
-        self.assertEqual(self.order.tracking_code, "TRACK123")
+        self.paid_order.refresh_from_db()
+        self.assertEqual(self.paid_order.status, OrderStatus.SHIPPED)
+        self.assertEqual(self.paid_order.tracking_code, "TRACK123")
 
         response = self.client.get(url, **self.admin_auth)
         log = response.json()["status_logs"][0]
+
+        self.assertEqual(log["previous_status"], OrderStatus.PREPARING)
+        self.assertEqual(log["new_status"], OrderStatus.SHIPPED)
         self.assertEqual(log["tracking_code"], "TRACK123")
         self.assertEqual(log["comment"], "Envio para correios")
 
     def test_admin_ship_requires_tracking_code(self):
-        url = f"/api/orders/admin/{self.order.id}/"
+        self.paid_order.status = OrderStatus.PREPARING
+        self.paid_order.save(update_fields=["status"])
+
+        url = f"/api/orders/admin/{self.paid_order.id}/"
+
         payload = {"status": "SHIPPED"}
-        response = self.client.patch(url, payload, format="json", **self.admin_auth)
+
+        response = self.client.patch(
+            url,
+            payload,
+            format="json",
+            **self.admin_auth,
+        )
+
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
-        payload = {"status": "SHIPPED", "tracking_code": "TRACK123"}
-        response = self.client.patch(url, payload, format="json", **self.admin_auth)
+        payload = {
+            "status": "SHIPPED",
+            "tracking_code": "TRACK123",
+        }
+
+        response = self.client.patch(
+            url,
+            payload,
+            format="json",
+            **self.admin_auth,
+        )
+
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.order.refresh_from_db()
-        self.assertEqual(self.order.status, OrderStatus.SHIPPED)
-        self.assertEqual(self.order.tracking_code, "TRACK123")
+        self.paid_order.refresh_from_db()
+
+        self.assertEqual(self.paid_order.status, OrderStatus.SHIPPED)
+        self.assertEqual(self.paid_order.tracking_code, "TRACK123")
 
     def test_admin_cancel_order_payment_not_confirmed(self):
         url = f"/api/orders/admin/{self.order.id}/"
@@ -684,7 +722,7 @@ class OrderDispatchViewTests(APITestCase):
             subtotal=100.00,
             total_amount=115.00,
             shipping_cost=15.00,
-            status=OrderStatus.PAID,
+            status=OrderStatus.PREPARING,
             tracking_code=None,
             shipping_zip_code="71000000",
             shipping_street="Rua Teste",

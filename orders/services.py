@@ -429,3 +429,22 @@ def update_status(order, new_status, changed_by=None, tracking_code=None, commen
     )
 
     return order
+
+def update_tracking_code(order, tracking_code, changed_by=None, comment=None):
+    if order.status != OrderStatus.SHIPPED:
+        raise ValidationError({
+            "tracking_code": (
+                "O código de rastreio só pode ser alterado "
+                "em pedidos enviados."
+            )
+        })
+
+    if not tracking_code or not tracking_code.strip():
+        raise ValidationError({
+            "tracking_code": "O código de rastreio é obrigatório."
+        })
+
+    order.tracking_code = tracking_code
+    order.save(update_fields=["tracking_code", "updated_at"])
+
+    return order

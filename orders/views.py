@@ -53,6 +53,7 @@ from .services import (
     remove_item_from_cart,
     update_item_quantity,
     update_status,
+    update_tracking_code,
 )
 
 User = get_user_model()
@@ -291,15 +292,22 @@ class AdminOrderDetailView(APIView):
             return Response(
                 {"message": "Tracking code obrigatório ao enviar pedido."}, status=400
             )
-
-        previous_status = order.status
         
-        update_status(
-            order=order,
-            new_status=status_value,
-            tracking_code=tracking_code,
-            changed_by=request.user
-        )
+        if (order.status == OrderStatus.SHIPPED and status_value == OrderStatus.SHIPPED):
+            update_tracking_code(
+                order=order,
+                tracking_code=tracking_code,
+                changed_by=request.user,
+                comment=comment,
+            )
+        else:
+            update_status(
+                order=order,
+                new_status=status_value,
+                tracking_code=tracking_code,
+                changed_by=request.user,
+                comment=comment,
+            )
 
         if (
             status_value == OrderStatus.CANCELED
@@ -309,15 +317,6 @@ class AdminOrderDetailView(APIView):
             if order.payment.status != PaymentStatus.PAID:
                 order.payment.status = PaymentStatus.FAILED
                 order.payment.save()
-
-        OrderStatusLog.objects.create(
-            order=order,
-            changed_by=request.user,
-            previous_status=previous_status,
-            new_status=status_value,
-            tracking_code=tracking_code,
-            comment=comment,
-        )
 
         return Response(OrderDetailSerializer(order).data, status=status.HTTP_200_OK)
 
@@ -632,13 +631,20 @@ class OrderTrackingView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        update_status(
-            order=order,
-            new_status=OrderStatus.SHIPPED,
-            changed_by=request.user,
-            tracking_code=tracking_code,
-            comment="Código de rastreio registado.",
-        )
+        if order.status == OrderStatus.PREPARING:
+            update_status(
+                order=order,
+                new_status=OrderStatus.SHIPPED,
+                tracking_code=tracking_code,
+                changed_by=request.user,
+            )
+
+        elif order.status == OrderStatus.SHIPPED:
+            update_tracking_code(
+                order=order,
+                tracking_code=tracking_code,
+                changed_by=request.user,
+            )
 
         return Response(
             {
@@ -739,13 +745,6 @@ class OrderDispatchView(APIView):
             new_status=OrderStatus.SHIPPED,
             changed_by=request.user,
             tracking_code=tracking_code,
-            comment="Despacho automático via pré-postagem Correios.",
-        )
-
-        OrderStatusLog.objects.create(
-            order=order,
-            changed_by=request.user,
-            new_status=OrderStatus.SHIPPED,
             comment=f"Pedido despachado automaticamente via Correios. Código de rastreio: {tracking_code}",
         )
 
