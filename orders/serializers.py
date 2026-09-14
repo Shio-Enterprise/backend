@@ -153,6 +153,8 @@ class CartRepresentationSerializer(serializers.Serializer):
     id = serializers.UUIDField(allow_null=True)
     items = CartItemRepresentationSerializer(many=True)
     subtotal = serializers.DecimalField(max_digits=10, decimal_places=2)
+    eligible_for_welcome_discount = serializers.BooleanField()
+    welcome_discount_amount = serializers.DecimalField(max_digits=10, decimal_places=2)
 
 
 class CartItemAddSerializer(serializers.Serializer):
