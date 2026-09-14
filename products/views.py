@@ -205,12 +205,14 @@ class DropCampaignListCreateView(APIView):
             "Lista paginada de campanhas de drop.\n\n"
             "**Público** (não autenticado ou não-admin): aplica automaticamente a "
             "política de visibilidade da issue #6 — retorna apenas drops com "
-            "`is_public=True`, `is_active=True` e dentro da janela "
-            "`[launch_date, end_date]`. Não é necessário (nem possível) desativar "
-            "esse filtro.\n\n"
-            "**Admin**: por padrão vê todos os drops (incluindo ocultos/privados/"
-            "encerrados). Use `?visible=true` para pré-visualizar exatamente o que "
-            "o público vê."
+            "`is_public=True`. Não é necessário (nem possível) desativar esse "
+            "filtro. Note que um drop Rascunho (`is_active=False`), Programado "
+            "(`launch_date` futuro), Encerrado (`end_date` passado) ou Esgotado "
+            "(`max_quantity` atingido) continua aparecendo aqui — esses estados "
+            "só afetam `is_sellable` (se dá para comprar), não a visibilidade. "
+            "Só `is_public=False` (Privado) é ocultado.\n\n"
+            "**Admin**: por padrão vê todos os drops (incluindo privados). Use "
+            "`?visible=true` para pré-visualizar exatamente o que o público vê."
         ),
         parameters=[
             OpenApiParameter(
@@ -298,10 +300,10 @@ class DropCampaignDetailView(APIView):
         summary="Detalhe do drop com produtos",
         description=(
             "Retorna o drop com os produtos aninhados.\n\n"
-            "Retorna 404 para utilizadores não-admin quando o drop não estiver "
-            "publicamente visível (política da issue #6: `is_public`, `is_active` "
-            "e janela `[launch_date, end_date]`). Admin sempre vê o drop, "
-            "independente da visibilidade."
+            "Retorna 404 para utilizadores não-admin apenas quando `is_public=False` "
+            "(política da issue #6). Rascunho, Programado, Encerrado e Esgotado "
+            "continuam retornando 200 — esses estados só afetam `is_sellable`. "
+            "Admin sempre vê o drop, independente da visibilidade."
         ),
         responses={
             200: DropCampaignDetailSerializer,
@@ -466,10 +468,12 @@ class ProductListCreateView(APIView):
             "Lista paginada do catálogo.\n\n"
             "**Público** (não autenticado ou não-admin): aplica automaticamente a "
             "política de visibilidade da issue #6 — oculta produtos inativos e "
-            "produtos vinculados a um drop não visível (privado, inativo, futuro "
-            "ou encerrado). Produtos sem drop seguem apenas `Product.is_active`.\n\n"
+            "produtos vinculados a um drop privado (`is_public=False`). Produtos "
+            "de um drop Rascunho, Programado, Encerrado ou Esgotado continuam "
+            "aparecendo (veja `is_sellable` no produto para saber se dá pra "
+            "comprar). Produtos sem drop seguem apenas `Product.is_active`.\n\n"
             "**Admin**: por padrão vê todos os produtos, incluindo inativos e "
-            "vinculados a drops ocultos. `?is_active=true|false` filtra por "
+            "vinculados a drops privados. `?is_active=true|false` filtra por "
             "atividade; `?visible=true` pré-visualiza exatamente o que o público vê.\n\n"
             "Outros filtros via query: `category={uuid}`, `drop={uuid}`, "
             "`search={text}` (busca em name/description).\n\n"
@@ -597,8 +601,8 @@ class ProductDetailView(APIView):
         description=(
             "Retorna o produto com variations, images, category e drop expandidos.\n\n"
             "Retorna 404 para não-admin quando `is_active=False` ou quando o "
-            "produto está vinculado a um drop não visível (política da issue #6). "
-            "Admin sempre vê o produto."
+            "produto está vinculado a um drop privado (`is_public=False`, política "
+            "da issue #6). Admin sempre vê o produto."
         ),
         responses={
             200: ProductDetailSerializer,
