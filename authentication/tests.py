@@ -17,7 +17,7 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from orders.models import CustomerOrder, OrderStatus
+from orders.models import CustomerOrder, OrderStatus, Payment, PaymentStatus
 
 from .models import UserProfile, UserRole
 from .services import GoogleAuthService, InvalidGoogleTokenException
@@ -364,8 +364,8 @@ class CustomerCRMViewSetTests(APITestCase):
         UserProfile.objects.create(user=self.customer, role=UserRole.CUSTOMER)
         self.client.force_authenticate(user=self.admin)
 
-    def create_order(self, status_value, total_amount):
-        return CustomerOrder.objects.create(
+    def create_order(self, status_value, total_amount, payment_status=PaymentStatus.PENDING):
+        order = CustomerOrder.objects.create(
             user=self.customer,
             status=status_value,
             subtotal=total_amount,
@@ -377,9 +377,18 @@ class CustomerCRMViewSetTests(APITestCase):
             shipping_city="Brasília",
             shipping_state="DF",
         )
+        Payment.objects.create(
+            order=order,
+            method="PIX",
+            status=payment_status,
+            total_amount=total_amount,
+        )
+        return order
 
     def test_metricas_consideram_somente_status_aceitos_como_venda(self):
-        paid_order = self.create_order(OrderStatus.PAID, "120.00")
+        paid_order = self.create_order(
+            OrderStatus.DELIVERED, "120.00", PaymentStatus.PAID
+        )
         self.create_order(OrderStatus.AWAITING_PAYMENT, "80.00")
         self.create_order(OrderStatus.CANCELED, "60.00")
 
@@ -390,17 +399,21 @@ class CustomerCRMViewSetTests(APITestCase):
         customer = payload[0] if isinstance(payload, list) else payload["results"][0]
         self.assertEqual(customer["total_orders"], 1)
         self.assertEqual(customer["total_spent"], "120.00")
-        self.assertEqual(parse_datetime(customer["last_purchase_date"]), paid_order.created_at)
+        self.assertEqual(
+            parse_datetime(customer["last_purchase_date"]), paid_order.payment.paid_at
+        )
 
-    def test_filtro_de_frequencia_usa_apenas_vendas(self):
-        self.create_order(OrderStatus.AWAITING_PAYMENT, "80.00")
+    def test_filtro_do_crm_pesquisa_somente_nome_ou_email(self):
+        other = User.objects.create_user(email="outra@example.com", name="Outra Pessoa")
+        UserProfile.objects.create(user=other, role=UserRole.CUSTOMER)
 
-        response = self.client.get(self.url, {"min_frequency": 1})
+        response = self.client.get(self.url, {"search": "CRM Customer"})
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         payload = response.json()
         customers = payload if isinstance(payload, list) else payload["results"]
-        self.assertEqual(customers, [])
+        self.assertEqual(len(customers), 1)
+        self.assertEqual(customers[0]["email"], "crm-customer@example.com")
 
 
 class LogoutViewTests(APITestCase):
