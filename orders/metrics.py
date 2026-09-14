@@ -98,3 +98,24 @@ def revenue_value(order: CustomerOrder) -> Decimal:
     value = Decimal(order.total_amount)
     return -value if order.payment.status == PaymentStatus.REFUNDED else value
 
+
+def is_recurring_customer(user, params=None) -> bool:
+    if params is None:
+        orders = CustomerOrder.objects.filter(user=user).filter(VALID_SALE_Q)
+    else:
+        orders = positive_sales(metric_orders(params)).filter(user=user)
+    purchased = set(
+        orders
+        .values_list("items__variation__product__drop_id", flat=True)
+        .exclude(items__variation__product__drop_id__isnull=True)
+    )
+    if len(purchased) < 2:
+        return False
+
+    from products.models import DropCampaign
+
+    all_ids = list(
+        DropCampaign.objects.order_by("launch_date", "created_at", "id").values_list("id", flat=True)
+    )
+    positions = sorted(all_ids.index(drop_id) for drop_id in purchased if drop_id in all_ids)
+    return any(current == previous + 1 for previous, current in zip(positions, positions[1:]))
