@@ -81,9 +81,23 @@ class DropCampaignSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(f"Banner não pode passar de {max_mb}MB.")
         return value
 
+    def validate_max_quantity(self, value):
+        if value is not None and value <= 0:
+            raise serializers.ValidationError(
+                "max_quantity deve ser um inteiro maior que zero, ou nulo (sem limite)."
+            )
+        return value
+
     def validate(self, attrs):
-        launch = attrs.get("launch_date")
-        end = attrs.get("end_date")
+        # Em atualizações parciais, um campo de data ausente no payload deve
+        # cair para o valor já persistido (não para None) antes de comparar.
+        if self.instance is not None:
+            launch = attrs.get("launch_date", self.instance.launch_date)
+            end = attrs.get("end_date", self.instance.end_date)
+        else:
+            launch = attrs.get("launch_date")
+            end = attrs.get("end_date")
+
         if launch and end and end <= launch:
             raise serializers.ValidationError(
                 {"end_date": "end_date deve ser posterior a launch_date."}
