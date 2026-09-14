@@ -15,6 +15,7 @@ from orders.models import (
     Payment,
     PaymentStatus,
 )
+from products.availability import is_product_sellable
 from products.models import ProductVariation
 
 
@@ -207,9 +208,16 @@ def add_item_to_cart(request, variation_id, quantity):
     if request.user.is_authenticated:
         with transaction.atomic():
             variation = get_object_or_404(
-                ProductVariation.objects.select_for_update().select_related("product"),
+                ProductVariation.objects.select_for_update().select_related(
+                    "product", "product__drop"
+                ),
                 id=variation_id,
             )
+
+            if not is_product_sellable(variation.product):
+                raise ValueError(
+                    f"{variation.product.name} não está disponível para compra no momento."
+                )
 
             cart = get_or_create_user_cart(request.user)
             cart_item, _ = CartItem.objects.get_or_create(
@@ -229,8 +237,15 @@ def add_item_to_cart(request, variation_id, quantity):
             cart_item.save()
     else:
         variation = get_object_or_404(
-            ProductVariation.objects.select_related("product"), id=variation_id
+            ProductVariation.objects.select_related("product", "product__drop"),
+            id=variation_id,
         )
+
+        if not is_product_sellable(variation.product):
+            raise ValueError(
+                f"{variation.product.name} não está disponível para compra no momento."
+            )
+
         session_cart = request.session.get("cart", {})
         var_id_str = str(variation.id)
 
@@ -253,8 +268,14 @@ def add_item_to_cart(request, variation_id, quantity):
 
 def update_item_quantity(request, variation_id, quantity):
     variation = get_object_or_404(
-        ProductVariation.objects.select_related("product"), id=variation_id
+        ProductVariation.objects.select_related("product", "product__drop"),
+        id=variation_id,
     )
+
+    if not is_product_sellable(variation.product):
+        raise ValueError(
+            f"{variation.product.name} não está disponível para compra no momento."
+        )
 
     if quantity > variation.stock_quantity:
         raise ValueError(

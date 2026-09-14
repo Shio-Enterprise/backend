@@ -1,9 +1,10 @@
 import datetime
 import logging
+from collections import defaultdict
 
 from django.contrib.auth import get_user_model
 from django.db import transaction
-from django.db.models import Sum
+from django.db.models import F, Sum
 from django.http import Http404
 from django.utils import timezone
 from drf_spectacular.utils import (
@@ -18,7 +19,8 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from authentication.permissions import IsStaffOrSuperUser
-from products.models import ProductVariation
+from products.availability import get_drop_sold_quantity, is_product_visible
+from products.models import DropCampaign, ProductVariation
 
 from .correios import (
     CorreiosAuthenticationError,
@@ -355,6 +357,7 @@ class CheckoutAPIView(APIView):
         responses={
             201: OpenApiTypes.OBJECT,
             400: OpenApiTypes.OBJECT,
+            409: OpenApiTypes.OBJECT,
             500: OpenApiTypes.OBJECT,
         },
     )
@@ -387,7 +390,96 @@ class CheckoutAPIView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        subtotal = sum(item.quantity * item.unit_price for item in cart.items.all())
+        cart_items = list(cart.items.select_related("variation", "variation__product"))
+
+        # Trava as variações (estoque) e os drops (max_quantity) envolvidos antes
+        # de revalidar e decrementar, para impedir overselling entre requisições
+        # concorrentes. Ordenadas por id para evitar deadlock entre checkouts
+        # concorrentes que compartilham variações/drops.
+        variation_ids = sorted({item.variation_id for item in cart_items})
+        locked_variations = {
+            v.id: v
+            for v in ProductVariation.objects.select_for_update()
+            .filter(id__in=variation_ids)
+            .select_related("product", "product__drop")
+            .order_by("id")
+        }
+
+        drop_ids = sorted(
+            {
+                v.product.drop_id
+                for v in locked_variations.values()
+                if v.product.drop_id
+            }
+        )
+        locked_drops = {
+            d.id: d
+            for d in DropCampaign.objects.select_for_update()
+            .filter(id__in=drop_ids)
+            .order_by("id")
+        }
+
+        for item in cart_items:
+            variation = locked_variations.get(item.variation_id)
+            if variation is None:
+                transaction.set_rollback(True)
+                return Response(
+                    {"success": False, "message": "Um item do carrinho não existe mais."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # Só visibilidade (is_active + drop visível) aqui — o limite de
+            # max_quantity do drop é decidido exclusivamente pelo bloco atômico
+            # abaixo (com o DropCampaign já travado), que responde 409.
+            if not is_product_visible(variation.product):
+                transaction.set_rollback(True)
+                return Response(
+                    {
+                        "success": False,
+                        "message": (
+                            f"{variation.product.name} não está mais disponível "
+                            "para compra."
+                        ),
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            if variation.stock_quantity < item.quantity:
+                transaction.set_rollback(True)
+                return Response(
+                    {
+                        "success": False,
+                        "message": f"Estoque insuficiente para {variation.product.name}.",
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        requested_quantity_by_drop = defaultdict(int)
+        for item in cart_items:
+            drop_id = locked_variations[item.variation_id].product.drop_id
+            if drop_id:
+                requested_quantity_by_drop[drop_id] += item.quantity
+
+        for drop_id, requested_quantity in requested_quantity_by_drop.items():
+            drop = locked_drops[drop_id]
+            if drop.max_quantity is None:
+                continue
+            sold_quantity = get_drop_sold_quantity(drop)
+            if sold_quantity + requested_quantity > drop.max_quantity:
+                transaction.set_rollback(True)
+                remaining = max(drop.max_quantity - sold_quantity, 0)
+                return Response(
+                    {
+                        "success": False,
+                        "message": (
+                            f"Quantidade solicitada do drop '{drop.name}' excede o "
+                            f"limite disponível. Restam {remaining} unidade(s)."
+                        ),
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+        subtotal = sum(item.quantity * item.unit_price for item in cart_items)
         shipping_cost = request.data.get("shipping_cost", 0.00)
         total_amount = float(subtotal) + float(shipping_cost)
 
@@ -406,27 +498,35 @@ class CheckoutAPIView(APIView):
             shipping_state=address.state,
         )
 
-        for item in cart.items.all():
-            if item.variation.stock_quantity < item.quantity:
+        for item in cart_items:
+            variation = locked_variations[item.variation_id]
+
+            # UPDATE condicional (WHERE stock_quantity >= quantity) em vez de
+            # "ler em Python, subtrair, salvar": garante corretude mesmo sem
+            # locking real de linha (ex.: SQLite, onde select_for_update() é
+            # um no-op) — a checagem é reavaliada pelo próprio banco no
+            # momento da escrita, não no momento da leitura anterior.
+            updated_rows = ProductVariation.objects.filter(
+                id=variation.id, stock_quantity__gte=item.quantity
+            ).update(stock_quantity=F("stock_quantity") - item.quantity)
+
+            if updated_rows == 0:
                 transaction.set_rollback(True)
                 return Response(
                     {
                         "success": False,
-                        "message": f"Estoque insuficiente para {item.variation.product.name}.",
+                        "message": f"Estoque insuficiente para {variation.product.name}.",
                     },
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            item.variation.stock_quantity -= item.quantity
-            item.variation.save()
-
             OrderItem.objects.create(
                 order=order,
-                variation=item.variation,
+                variation=variation,
                 quantity=item.quantity,
                 unit_price=item.unit_price,
-                product_name=f"{item.variation.product.name} - {item.variation.size}",
-                sku_snapshot=item.variation.sku,
+                product_name=f"{variation.product.name} - {variation.size}",
+                sku_snapshot=variation.sku,
             )
 
         cart.status = "FINISHED"
