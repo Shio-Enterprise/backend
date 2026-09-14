@@ -139,6 +139,7 @@ class CartItemRepresentationSerializer(serializers.Serializer):
     unit_price = serializers.DecimalField(max_digits=10, decimal_places=2)
     total_price = serializers.DecimalField(max_digits=10, decimal_places=2)
     stock_quantity = serializers.IntegerField()
+    is_sellable = serializers.BooleanField()
 
 
 class CartRepresentationSerializer(serializers.Serializer):

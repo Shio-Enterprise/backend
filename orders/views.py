@@ -19,7 +19,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from authentication.permissions import IsStaffOrSuperUser
-from products.availability import get_drop_sold_quantity, is_product_visible
+from products.availability import get_drop_sold_quantity, is_product_open_for_sale
 from products.models import DropCampaign, ProductVariation
 
 from .correios import (
@@ -428,10 +428,13 @@ class CheckoutAPIView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            # Só visibilidade (is_active + drop visível) aqui — o limite de
-            # max_quantity do drop é decidido exclusivamente pelo bloco atômico
-            # abaixo (com o DropCampaign já travado), que responde 409.
-            if not is_product_visible(variation.product):
+            # "Aberto para venda" aqui (is_active + dentro da janela), não
+            # apenas "visível" (que só depende de is_public) — um drop
+            # Rascunho/Programado/Encerrado é visível na loja mas não pode
+            # ser comprado. O limite de max_quantity é decidido exclusivamente
+            # pelo bloco atômico abaixo (com o DropCampaign já travado), que
+            # responde 409.
+            if not is_product_open_for_sale(variation.product):
                 transaction.set_rollback(True)
                 return Response(
                     {

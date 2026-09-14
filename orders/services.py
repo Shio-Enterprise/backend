@@ -127,7 +127,10 @@ def get_cart_data(request):
 
         items = []
         subtotal = Decimal("0.00")
-        for item in cart.items.select_related("variation", "variation__product").all():
+        cart_items = cart.items.select_related(
+            "variation", "variation__product", "variation__product__drop"
+        ).all()
+        for item in cart_items:
             total_price = item.quantity * item.unit_price
             subtotal += total_price
             items.append(
@@ -141,6 +144,7 @@ def get_cart_data(request):
                     "unit_price": item.unit_price,
                     "total_price": total_price,
                     "stock_quantity": item.variation.stock_quantity,
+                    "is_sellable": is_product_sellable(item.variation.product),
                 }
             )
         return {
@@ -157,7 +161,7 @@ def get_cart_data(request):
         variation_ids = list(session_cart.keys())
         variations = ProductVariation.objects.filter(
             id__in=variation_ids
-        ).select_related("product")
+        ).select_related("product", "product__drop")
         variations_by_id = {str(v.id): v for v in variations}
 
         for var_id_str, item_data in session_cart.items():
@@ -188,6 +192,7 @@ def get_cart_data(request):
                     "unit_price": unit_price,
                     "total_price": total_price,
                     "stock_quantity": variation.stock_quantity,
+                    "is_sellable": is_product_sellable(variation.product),
                 }
             )
 
