@@ -56,6 +56,15 @@ class PaymentSerializer(serializers.ModelSerializer):
         ]
 
 
+class PaymentReturnSerializer(serializers.Serializer):
+    order_nsu = serializers.UUIDField()
+
+
+class PaymentWebhookSerializer(PaymentReturnSerializer):
+    transaction_nsu = serializers.CharField(max_length=255)
+    invoice_slug = serializers.CharField(max_length=255)
+
+
 class AdminAddressSerializer(serializers.Serializer):
     id = serializers.UUIDField()
     zip_code = serializers.CharField()

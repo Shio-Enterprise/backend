@@ -1,10 +1,12 @@
 import datetime
 import logging
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.db import transaction
+from django.db import DatabaseError, transaction
 from django.db.models import Sum
-from django.http import Http404
+from django.http import Http404, HttpResponseRedirect
 from django.utils import timezone
 from django.utils.decorators import method_decorator
 from drf_spectacular.utils import (
@@ -45,12 +47,14 @@ from .serializers import (
     DashboardRecentOrderSerializer,
     OrderDetailSerializer,
     OrderStatusUpdateSerializer,
+    PaymentReturnSerializer,
+    PaymentWebhookSerializer,
 )
 from .services import (
     add_item_to_cart,
-    check_payment_status,
     clear_cart,
     complete_checkout_attempt,
+    confirm_infinitepay_payment,
     create_shipping_quote,
     get_cart_data,
     prepare_checkout_attempt,
@@ -264,9 +268,10 @@ class AdminOrderDetailView(APIView):
             404: OpenApiTypes.OBJECT,
         },
     )
+    @transaction.atomic
     def patch(self, request, order_id):
         try:
-            order = CustomerOrder.objects.select_related("payment").get(id=order_id)
+            order = CustomerOrder.objects.select_for_update().get(id=order_id)
         except CustomerOrder.DoesNotExist:
             return Response({"message": "Pedido não encontrado."}, status=404)
 
@@ -275,6 +280,14 @@ class AdminOrderDetailView(APIView):
         status_value = serializer.validated_data.get("status")
         tracking_code = serializer.validated_data.get("tracking_code")
         comment = serializer.validated_data.get("comment")
+
+        if status_value == OrderStatus.PAID and (
+            not hasattr(order, "payment") or order.payment.status != PaymentStatus.PAID
+        ):
+            return Response(
+                {"message": "O pagamento precisa ser confirmado pelo gateway."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         # Rules: cannot cancel if payment already PAID
         if status_value == OrderStatus.CANCELED:
@@ -395,80 +408,50 @@ class CheckoutAPIView(APIView):
 
 class PaymentSuccessRedirectView(APIView):
     permission_classes = [AllowAny]
+    authentication_classes = []
 
     @extend_schema(
-        summary="Confirmação de Pagamento (Redirect InfinitePay)",
-        description=(
-            "Rota de fallback acessada pelo navegador do cliente após o pagamento na InfinitePay. "
-            "Recebe os parâmetros via query string, consulta o status real da transação no servidor "
-            "da InfinitePay e efetiva a baixa do pedido (muda status para PAID) caso aprovado.\n\n"
-            "⚠️ *Não envia token JWT. O front-end deve exibir uma tela de 'Processando' ao carregar esta rota.*"
-        ),
-        parameters=[
-            OpenApiParameter(
-                name="order_nsu",
-                type=str,
-                location=OpenApiParameter.QUERY,
-                description="UUID do pedido gerado no nosso sistema",
-            ),
-            OpenApiParameter(
-                name="transaction_nsu",
-                type=str,
-                location=OpenApiParameter.QUERY,
-                description="ID único da transação gerado pela InfinitePay",
-            ),
-            OpenApiParameter(
-                name="slug",
-                type=str,
-                location=OpenApiParameter.QUERY,
-                description="Código da fatura gerado pela InfinitePay",
-            ),
-        ],
-        responses={
-            200: OpenApiTypes.OBJECT,
-            400: OpenApiTypes.OBJECT,
-            404: OpenApiTypes.OBJECT,
-        },
+        summary="Retorno do pagamento",
+        description="Encaminha o navegador para a consulta autenticada no frontend, sem confirmar pagamento.",
+        parameters=[OpenApiParameter(name="order_nsu", type=OpenApiTypes.UUID)],
+        responses={302: None, 400: OpenApiTypes.OBJECT},
     )
     def get(self, request):
-        order_nsu = request.query_params.get("order_nsu")
-        transaction_nsu = request.query_params.get("transaction_nsu")
-        slug = request.query_params.get("slug")
+        serializer = PaymentReturnSerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+        target = urlsplit(settings.INFINITEPAY_RETURN_URL)
+        query = urlencode({"order_nsu": str(serializer.validated_data["order_nsu"])})
+        return HttpResponseRedirect(
+            urlunsplit(target._replace(query=query, fragment=""))
+        )
 
-        if not all([order_nsu, transaction_nsu, slug]):
+
+@method_decorator(transaction.non_atomic_requests, name="dispatch")
+class InfinitePayWebhookView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    @extend_schema(
+        summary="Notificação de pagamento InfinitePay",
+        description="Confere a transação diretamente no gateway antes de atualizar o pagamento. Erros retornam 400 para permitir reenvio pelo provedor.",
+        request=PaymentWebhookSerializer,
+        responses={200: OpenApiTypes.OBJECT, 400: OpenApiTypes.OBJECT},
+    )
+    def post(self, request):
+        serializer = PaymentWebhookSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            confirm_infinitepay_payment(**serializer.validated_data)
+        except DatabaseError:
+            logger.warning("Falha ao persistir confirmação de pagamento InfinitePay.")
             return Response(
-                {"message": "Faltam parâmetros de validação."},
+                {
+                    "success": False,
+                    "message": "Falha temporária. Reenvie a notificação.",
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
-        try:
-            order = CustomerOrder.objects.get(id=order_nsu)
-        except CustomerOrder.DoesNotExist:
-            return Response(
-                {"message": "Pedido não encontrado."}, status=status.HTTP_404_NOT_FOUND
-            )
-
-        if order.status != OrderStatus.PAID:
-            check_data = check_payment_status(order_nsu, transaction_nsu, slug)
-
-            if check_data and check_data.get("paid") is True:
-                order.payment.gateway_transaction_id = transaction_nsu
-                order.payment.status = PaymentStatus.PAID
-                order.payment.save()
-                order.status = OrderStatus.PAID
-                order.save()
-
-        if order.status == OrderStatus.PAID:
-            return Response(
-                {"message": "Pagamento confirmado com sucesso!", "order_id": order_nsu}
-            )
-
-        return Response(
-            {
-                "message": "Pagamento pendente ou em processamento.",
-                "order_id": order_nsu,
-            }
-        )
+        return Response({"success": True, "message": None})
 
 
 class OrderTrackingView(APIView):
