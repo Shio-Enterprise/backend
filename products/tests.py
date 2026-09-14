@@ -704,8 +704,18 @@ class ProductCreateTests(APITestCase):
                 "description": "Algodão",
                 "base_price": "120.00",
                 "variations": [
-                    {"size": "P", "color": "Azul", "sku": "CAM-P", "stock_quantity": 10},
-                    {"size": "M", "color": "Vermelho", "sku": "CAM-M", "stock_quantity": 5},
+                    {
+                        "size": "P",
+                        "color": "Azul",
+                        "sku": "CAM-P",
+                        "stock_quantity": 10,
+                    },
+                    {
+                        "size": "M",
+                        "color": "Vermelho",
+                        "sku": "CAM-M",
+                        "stock_quantity": 5,
+                    },
                 ],
             },
             format="json",

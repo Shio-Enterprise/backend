@@ -50,6 +50,7 @@ from .services import (
     clear_cart,
     create_infinitepay_checkout,
     get_cart_data,
+    get_welcome_discount,
     remove_item_from_cart,
     update_item_quantity,
     update_status,
@@ -389,13 +390,16 @@ class CheckoutAPIView(APIView):
 
         subtotal = sum(item.quantity * item.unit_price for item in cart.items.all())
         shipping_cost = request.data.get("shipping_cost", 0.00)
-        total_amount = float(subtotal) + float(shipping_cost)
+        welcome_coupon, discount_amount = get_welcome_discount(user, subtotal)
+        total_amount = float(subtotal) - float(discount_amount) + float(shipping_cost)
 
         order = CustomerOrder.objects.create(
             user=user,
             address=address,
+            coupon=welcome_coupon,
             subtotal=subtotal,
             shipping_cost=shipping_cost,
+            discount_amount=discount_amount,
             total_amount=total_amount,
             shipping_zip_code=address.zip_code,
             shipping_street=address.street,
@@ -666,7 +670,7 @@ class OrderDispatchView(APIView):
             "Restrito a administradores. Use este endpoint em vez do PATCH de rastreio manual "
             "quando quiser que o sistema gere o código automaticamente."
         ),
-        request=None, 
+        request=None,
         responses={
             200: OpenApiTypes.OBJECT,
             400: OpenApiTypes.OBJECT,
@@ -887,5 +891,3 @@ class CartItemDetailAPIView(APIView):
         return Response(
             CartRepresentationSerializer(cart_data).data, status=status.HTTP_200_OK
         )
-
-
