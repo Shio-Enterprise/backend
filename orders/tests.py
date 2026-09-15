@@ -24,6 +24,7 @@ from orders.models import (
     StockReservation,
     StockReservationStatus,
 )
+from orders.services import active_reserved_quantity
 from products.models import (
     Category,
     Product,
@@ -133,9 +134,12 @@ class CheckoutAPITests(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
         self.assertEqual(CustomerOrder.objects.count(), 0)
+        self.assertEqual(StockReservation.objects.count(), 0)
+        self.assertEqual(StockMovement.objects.count(), 0)
 
         self.variation.refresh_from_db()
         self.assertEqual(self.variation.stock_quantity, 10)
+        self.assertEqual(active_reserved_quantity(self.variation), 0)
 
 
 class PaymentSuccessRedirectTests(APITestCase):
@@ -270,6 +274,10 @@ class PaymentSuccessRedirectTests(APITestCase):
 
         self.reservation.refresh_from_db()
         self.assertEqual(self.reservation.status, StockReservationStatus.ACTIVE)
+        self.assertEqual(
+            StockMovement.objects.filter(variation=self.variation).count(),
+            0,
+        )
 
     def test_parametros_faltando_retorna_400(self):
         """Deve retornar erro se a query string estiver incompleta."""
@@ -762,12 +770,16 @@ class AdminOrderManagementTests(APITestCase):
             shipping_city="Z",
             shipping_state="DF",
         )
-        OrderItem.objects.create(
+        self.order_item = OrderItem.objects.create(
             order=self.order,
             variation=self.variation,
             quantity=2,
             unit_price=50.00,
             product_name="Camiseta M",
+        )
+        self.reservation = StockReservation.objects.create(
+            order_item=self.order_item,
+            expires_at=timezone.now() + timedelta(minutes=30),
         )
         self.payment = Payment.objects.create(
             order=self.order,
@@ -898,8 +910,17 @@ class AdminOrderManagementTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.order.refresh_from_db()
         self.payment.refresh_from_db()
+        self.reservation.refresh_from_db()
+        self.variation.refresh_from_db()
         self.assertEqual(self.order.status, OrderStatus.CANCELED)
         self.assertEqual(self.payment.status, PaymentStatus.FAILED)
+        self.assertEqual(self.reservation.status, StockReservationStatus.RELEASED)
+        self.assertEqual(self.variation.stock_quantity, 5)
+        self.assertEqual(active_reserved_quantity(self.variation), 0)
+        self.assertEqual(
+            StockMovement.objects.filter(variation=self.variation).count(),
+            0,
+        )
 
 
 class OrderDispatchViewTests(APITestCase):

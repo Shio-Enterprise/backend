@@ -52,6 +52,7 @@ from .services import (
     create_reservations_for_order,
     get_cart_data,
     release_expired_reservations,
+    release_reservations_for_order,
     remove_item_from_cart,
     update_item_quantity,
     update_status,
@@ -303,12 +304,13 @@ class AdminOrderDetailView(APIView):
 
         order.save()
 
-        if (
-            status_value == OrderStatus.CANCELED
-            and hasattr(order, "payment")
-            and order.payment
-        ):
-            if order.payment.status != PaymentStatus.PAID:
+        if status_value == OrderStatus.CANCELED:
+            release_reservations_for_order(order)
+            if (
+                hasattr(order, "payment")
+                and order.payment
+                and order.payment.status != PaymentStatus.PAID
+            ):
                 order.payment.status = PaymentStatus.FAILED
                 order.payment.save()
 

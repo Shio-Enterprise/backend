@@ -454,6 +454,20 @@ def convert_reservations_to_sale(order):
         locked_order.save(update_fields=["status", "updated_at"])
 
 
+def release_reservations_for_order(order):
+    for item in order.items.all():
+        try:
+            reservation = item.reservation
+        except ObjectDoesNotExist:
+            continue
+
+        if reservation.status != StockReservationStatus.ACTIVE:
+            continue
+
+        reservation.status = StockReservationStatus.RELEASED
+        reservation.save(update_fields=["status", "updated_at"])
+
+
 def release_expired_reservations(order):
     if order.status != OrderStatus.AWAITING_PAYMENT:
         return
@@ -503,8 +517,9 @@ def update_status(order, new_status, changed_by=None, tracking_code=None, commen
     except Exception:
         payment = None
 
-    if new_status == OrderStatus.CANCELED and payment:
-        if payment.status != PaymentStatus.PAID:
+    if new_status == OrderStatus.CANCELED:
+        release_reservations_for_order(order)
+        if payment and payment.status != PaymentStatus.PAID:
             payment.status = PaymentStatus.FAILED
             payment.save()
 
