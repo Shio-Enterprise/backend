@@ -1,8 +1,12 @@
 import uuid
+from decimal import ROUND_HALF_UP, Decimal
 
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.core.validators import FileExtensionValidator, MinValueValidator
 from django.db import models
+from django.db.models.functions import Lower
+from django.utils import timezone
 
 
 class Category(models.Model):
@@ -71,9 +75,57 @@ class Product(models.Model):
     base_price = models.DecimalField(
         max_digits=10, decimal_places=2, validators=[MinValueValidator(0)]
     )
+    cost_price = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(0)],
+    )
+    promotional_price = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True
+    )
+    promo_start = models.DateTimeField(null=True, blank=True)
+    promo_end = models.DateTimeField(null=True, blank=True)
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    def promotion_active_at(self, at):
+        return bool(
+            self.promotional_price is not None
+            and self.promo_start
+            and self.promo_end
+            and self.promo_start <= at < self.promo_end
+        )
+
+    def price_at(self, at):
+        return (
+            self.promotional_price if self.promotion_active_at(at) else self.base_price
+        )
+
+    @property
+    def effective_price(self):
+        return self.price_at(timezone.now())
+
+    @property
+    def is_promotion_active(self):
+        return self.promotion_active_at(timezone.now())
+
+    @property
+    def margin_amount(self):
+        return (
+            None if self.cost_price is None else self.effective_price - self.cost_price
+        )
+
+    @property
+    def margin_percent(self):
+        price = self.effective_price
+        if self.cost_price is None or not price:
+            return None
+        return ((price - self.cost_price) * 100 / price).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
 
     def __str__(self):
         return self.name
@@ -90,6 +142,26 @@ class ProductVariation(models.Model):
     stock_quantity = models.PositiveIntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                Lower("size"),
+                Lower("color"),
+                "product",
+                name="unique_product_size_color",
+            ),
+            models.UniqueConstraint(Lower("sku"), name="unique_normalized_sku"),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            old = type(self).objects.get(pk=self.pk)
+            if old.sku != self.sku:
+                raise ValidationError("SKU é imutável.")
+            if old.stock_quantity != self.stock_quantity:
+                raise ValidationError("Altere o estoque pelo ledger.")
+        super().save(*args, **kwargs)
 
     def __str__(self):
         if self.color:
@@ -131,6 +203,7 @@ class StockMovementKind(models.TextChoices):
 
 
 class StockMovementReason(models.TextChoices):
+    ESTOQUE_INICIAL = "ESTOQUE_INICIAL", "Estoque inicial"
     COMPRA = "COMPRA", "Compra"
     DEVOLUCAO = "DEVOLUCAO", "Devolução"
     AJUSTE = "AJUSTE", "Ajuste"
@@ -139,11 +212,23 @@ class StockMovementReason(models.TextChoices):
     OUTRO = "OUTRO", "Outro"
 
 
+class ImmutableQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise ValidationError("Registros de auditoria são imutáveis.")
+
+    def delete(self):
+        raise ValidationError("Registros de auditoria não podem ser excluídos.")
+
+    def bulk_update(self, *args, **kwargs):
+        raise ValidationError("Registros de auditoria são imutáveis.")
+
+
 class StockMovement(models.Model):
+    objects = ImmutableQuerySet.as_manager()
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     variation = models.ForeignKey(
         ProductVariation,
-        on_delete=models.CASCADE,
+        on_delete=models.PROTECT,
         related_name="stock_movements",
     )
     kind = models.CharField(max_length=10, choices=StockMovementKind.choices)
@@ -159,8 +244,73 @@ class StockMovement(models.Model):
     )
     created_at = models.DateTimeField(auto_now_add=True)
 
+    balance_after = models.PositiveIntegerField(null=True, blank=True)
+    sequence = models.PositiveIntegerField(null=True, blank=True)
+    is_legacy = models.BooleanField(default=False)
+    origin_type = models.CharField(
+        max_length=30,
+        choices=[
+            (v, v) for v in ("INITIAL_STOCK", "MANUAL_ADJUSTMENT", "ORDER", "LEGACY")
+        ],
+    )
+    origin_id = models.UUIDField()
+    order_item = models.ForeignKey(
+        "orders.OrderItem",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="stock_movements",
+    )
+    idempotency_key = models.CharField(max_length=150, unique=True)
+    reverses_movement = models.OneToOneField(
+        "self",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="compensation",
+    )
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise ValidationError("Movimentos de estoque são imutáveis.")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Use um movimento compensatório.")
+
     class Meta:
-        ordering = ["-created_at"]
+        ordering = ["-created_at", "-sequence"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["variation", "sequence"], name="unique_stock_sequence"
+            ),
+            models.CheckConstraint(
+                check=models.Q(is_legacy=True)
+                | (
+                    models.Q(balance_after__isnull=False)
+                    & models.Q(sequence__isnull=False)
+                    & models.Q(quantity__gt=0)
+                ),
+                name="stock_audited_balance",
+            ),
+        ]
 
     def __str__(self):
         return f"{self.kind} {self.quantity} ({self.reason})"
+
+
+class StockOpeningBalance(models.Model):
+    objects = ImmutableQuerySet.as_manager()
+    variation = models.OneToOneField(
+        ProductVariation, on_delete=models.PROTECT, related_name="opening_balance"
+    )
+    balance = models.PositiveIntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise ValidationError("Saldo de abertura é imutável.")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Saldo de abertura é imutável.")

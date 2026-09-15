@@ -7,6 +7,7 @@ from .views import (
     DropCampaignListCreateView,
     DropProductManageView,
     ProductDetailView,
+    ProductDuplicateView,
     ProductImageCreateView,
     ProductImageDeleteView,
     ProductImageUpdateView,
@@ -20,6 +21,11 @@ from .views import (
 app_name = "products"
 
 urlpatterns = [
+    path(
+        "products/<uuid:pk>/duplicate/",
+        ProductDuplicateView.as_view(),
+        name="product-duplicate",
+    ),
     # GET (público) - Lista categorias / POST (admin) - Cria categoria
     path(
         "categories/",
