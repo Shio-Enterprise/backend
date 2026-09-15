@@ -17,10 +17,10 @@ from unittest.mock import patch
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError as ModelValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.urls import path
 from django.db import close_old_connections, connection
 from django.db.migrations.executor import MigrationExecutor
 from django.test import TransactionTestCase, skipUnlessDBFeature
+from django.urls import path
 from django.utils import timezone
 from drf_spectacular.generators import SchemaGenerator
 from drf_spectacular.validation import validate_schema
@@ -32,14 +32,25 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from authentication.models import UserProfile, UserRole
 from orders import tests as order_fixtures
-from orders.models import CustomerOrder, OrderStatus, OrderItem
+from orders.models import CustomerOrder, OrderItem, OrderStatus
 from orders.services import restore_order_stock, update_status
 
 from .catalog import filter_catalog
-from .models import (Category, DropCampaign, Product, ProductImage, ProductVariation, StockMovement)
-from .views import (CatalogFilterOptionsView, ProductListCreateView, ProductRecommendationsView)
+from .models import (
+    Category,
+    DropCampaign,
+    Product,
+    ProductImage,
+    ProductVariation,
+    StockMovement,
+)
 from .serializers import StockMovementSerializer
 from .services import create_variation, move_stock
+from .views import (
+    CatalogFilterOptionsView,
+    ProductListCreateView,
+    ProductRecommendationsView,
+)
 
 User = get_user_model()
 
@@ -609,9 +620,12 @@ class ProductListTests(APITestCase):
         )
 
     def test_listagem_publica_exige_estoque_sem_duplicar_produtos(self):
-        for stock in (0, 2):
+        for size, stock in (("M", 0), ("G", 2)):
             ProductVariation.objects.create(
-                product=self.ativo, sku=f"ativo-{stock}", stock_quantity=stock
+                product=self.ativo,
+                size=size,
+                sku=f"ativo-{stock}",
+                stock_quantity=stock,
             )
         for user in (None, self.customer):
             headers = auth_header(user) if user else {}
@@ -639,12 +653,18 @@ class ProductListTests(APITestCase):
 
     def test_admin_filtra_booleano_validado_sem_exigir_estoque(self):
         headers = auth_header(self.admin)
-        for value, active in (("true", True), ("false", False), ("1", True), ("0", False)):
+        for value, active in (
+            ("true", True),
+            ("false", False),
+            ("1", True),
+            ("0", False),
+        ):
             with self.subTest(value=value):
                 response = self.client.get(self.url, {"is_active": value}, **headers)
                 self.assertEqual(response.status_code, status.HTTP_200_OK)
                 expected = {
-                    str(product.id) for product in Product.objects.filter(is_active=active)
+                    str(product.id)
+                    for product in Product.objects.filter(is_active=active)
                 }
                 body = response.json()
                 self.assertEqual(body["count"], len(expected))
@@ -904,7 +924,10 @@ class ProductListContractTests(APITestCase):
         schema = SchemaGenerator(
             patterns=[
                 path("api/catalog/products/", ProductListCreateView.as_view()),
-                path("api/catalog/products/filter-options/", CatalogFilterOptionsView.as_view()),
+                path(
+                    "api/catalog/products/filter-options/",
+                    CatalogFilterOptionsView.as_view(),
+                ),
             ]
         ).get_schema(public=True)
         validate_schema(schema)
@@ -928,7 +951,8 @@ class ProductListContractTests(APITestCase):
             }.issubset(names)
         )
         is_active_parameter = next(
-            parameter for parameter in operation["parameters"]
+            parameter
+            for parameter in operation["parameters"]
             if parameter["name"] == "is_active"
         )
         self.assertEqual(is_active_parameter["in"], "query")
@@ -1002,7 +1026,7 @@ class ProductListContractTests(APITestCase):
 
         product = self.products[0]
         variation = ProductVariation.objects.create(
-            product=product, sku="ranking-status"
+            product=product, size="M", sku="ranking-status"
         )
         order = CustomerOrder.objects.create(
             user=make_user("ranking-status@example.com"),
@@ -1070,7 +1094,7 @@ class ProductListContractTests(APITestCase):
             (inactive, 100),
         ):
             variation = ProductVariation.objects.create(
-                product=product, sku=str(product.id)
+                product=product, size="M", sku=str(product.id)
             )
             OrderItem.objects.create(
                 order=order,
@@ -1885,6 +1909,17 @@ class CatalogDecisionTests(APITestCase):
         self.assertEqual(len(data["variations"]), 1)
         self.assertEqual(data["variations"][0]["size"], "Único")
         self.assertEqual(StockMovement.objects.count(), 0)
+        move_stock(
+            variation=ProductVariation.objects.get(pk=data["variations"][0]["id"]),
+            kind="ENTRADA",
+            reason="AJUSTE",
+            quantity=1,
+            origin_type="MANUAL_ADJUSTMENT",
+            origin_id=uuid.uuid4(),
+            idempotency_key=str(uuid.uuid4()),
+            created_by=self.admin,
+            note="Disponibilizar produto para verificar privacidade no catálogo público",
+        )
         self.client.force_authenticate(None)
         for url in (self.url, f"{self.url}{data['id']}/"):
             public = self.client.get(url).data

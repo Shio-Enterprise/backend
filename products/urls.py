@@ -23,7 +23,16 @@ from .views import (
 app_name = "products"
 
 urlpatterns = [
-    path("products/filter-options/", CatalogFilterOptionsView.as_view(), name="catalog-filter-options"),
+    path(
+        "products/<uuid:pk>/duplicate/",
+        ProductDuplicateView.as_view(),
+        name="product-duplicate",
+    ),
+    path(
+        "products/filter-options/",
+        CatalogFilterOptionsView.as_view(),
+        name="catalog-filter-options",
+    ),
     # GET (público) - Lista categorias / POST (admin) - Cria categoria
     path(
         "categories/",

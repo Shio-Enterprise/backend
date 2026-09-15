@@ -1,6 +1,5 @@
 from django.db import migrations
 
-
 COLOR_NAMES = {
     "verde": "Verde",
     "vermelho": "Vermelho",
@@ -28,7 +27,7 @@ def normalize_variation_colors(apps, schema_editor):
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("products", "0004_productvariation_color"),
+        ("products", "0005_stockopeningbalance_alter_stockmovement_options_and_more"),
     ]
 
     operations = [
