@@ -20,7 +20,10 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import close_old_connections, connection
 from django.db.migrations.executor import MigrationExecutor
 from django.test import TransactionTestCase, skipUnlessDBFeature
+from django.urls import path
 from django.utils import timezone
+from drf_spectacular.generators import SchemaGenerator
+from drf_spectacular.validation import validate_schema
 from PIL import Image
 from rest_framework import status
 from rest_framework.exceptions import ValidationError
@@ -29,9 +32,10 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from authentication.models import UserProfile, UserRole
 from orders import tests as order_fixtures
-from orders.models import CustomerOrder, OrderStatus
+from orders.models import CustomerOrder, OrderItem, OrderStatus
 from orders.services import restore_order_stock, update_status
 
+from .catalog import filter_catalog
 from .models import (
     Category,
     DropCampaign,
@@ -42,6 +46,11 @@ from .models import (
 )
 from .serializers import StockMovementSerializer
 from .services import create_variation, move_stock
+from .views import (
+    CatalogFilterOptionsView,
+    ProductListCreateView,
+    ProductRecommendationsView,
+)
 
 User = get_user_model()
 
@@ -71,6 +80,17 @@ def make_product(name="Camiseta", **kwargs):
     defaults = {"description": "desc", "base_price": 100, "is_active": True}
     defaults.update(kwargs)
     return Product.objects.create(name=name, **defaults)
+
+
+def make_stocked_product(**kwargs):
+    product = make_product(**kwargs)
+    ProductVariation.objects.create(
+        product=product, sku=f"available-{product.id}", stock_quantity=1
+    )
+    return product
+
+
+# ─── List & Create ────────────────────────────────────────────────────────────
 
 
 class CategoryListCreateTests(APITestCase):
@@ -568,11 +588,16 @@ class ProductListTests(APITestCase):
         self.drop = DropCampaign.objects.create(
             name="Verão", slug="verao", is_active=True
         )
-        self.ativo = make_product(
+        self.ativo = make_stocked_product(
             name="Camisa Branca", category=self.category, drop=self.drop
         )
-        make_product(name="Camisa Preta", category=self.category)
-        self.inativo = make_product(name="Removido", is_active=False)
+        self.preto = make_stocked_product(name="Camisa Preta", category=self.category)
+        self.inativo = make_stocked_product(name="Removido", is_active=False)
+        self.sem_variacoes = make_product(name="Sem variações")
+        self.esgotado = make_product(name="Esgotado")
+        ProductVariation.objects.create(
+            product=self.esgotado, sku="esgotado", stock_quantity=0
+        )
 
     def test_listagem_publica_so_retorna_ativos(self):
         """Sem token, só produtos com is_active=True são retornados."""
@@ -584,9 +609,99 @@ class ProductListTests(APITestCase):
         self.assertNotIn("Removido", names)
 
     def test_admin_ve_inativos(self):
-        """Admin vê produtos inativos por default."""
+        """Admin vê produtos inativos e sem estoque por default."""
         response = self.client.get(self.url, **auth_header(self.admin))
-        self.assertEqual(response.json()["count"], 3)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = response.json()
+        self.assertEqual(body["count"], 5)
+        self.assertEqual(
+            {item["id"] for item in body["results"]},
+            {str(product.id) for product in Product.objects.all()},
+        )
+
+    def test_listagem_publica_exige_estoque_sem_duplicar_produtos(self):
+        for size, stock in (("M", 0), ("G", 2)):
+            ProductVariation.objects.create(
+                product=self.ativo,
+                size=size,
+                sku=f"ativo-{stock}",
+                stock_quantity=stock,
+            )
+        for user in (None, self.customer):
+            headers = auth_header(user) if user else {}
+            for params in ({}, {"is_active": "true"}, {"is_active": "false"}):
+                with self.subTest(user=user, params=params):
+                    response = self.client.get(self.url, params, **headers)
+                    self.assertEqual(response.status_code, status.HTTP_200_OK)
+                    body = response.json()
+                    self.assertEqual(body["count"], 2)
+                    self.assertCountEqual(
+                        [item["id"] for item in body["results"]],
+                        [str(self.ativo.id), str(self.preto.id)],
+                    )
+
+    def test_public_filters_require_stock_in_selected_variation(self):
+        ProductVariation.objects.create(
+            product=self.ativo,
+            size="M",
+            color="Azul",
+            sku="SOLD-OUT-M",
+            stock_quantity=0,
+        )
+        ProductVariation.objects.create(
+            product=self.ativo,
+            size="G",
+            color="Preto",
+            sku="AVAILABLE-G",
+            stock_quantity=2,
+        )
+        for params in (
+            {"size": "M"},
+            {"color": "Azul"},
+            {"size": "M", "color": "Azul"},
+        ):
+            for user in (None, self.customer, self.admin):
+                with self.subTest(params=params, user=user):
+                    response = self.client.get(
+                        self.url, params, **(auth_header(user) if user else {})
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    ids = [item["id"] for item in response.data["results"]]
+                    self.assertEqual(str(self.ativo.id) in ids, user == self.admin)
+        response = self.client.get(self.url, {"size": "G", "color": ["Azul", "Preto"]})
+        self.assertEqual(
+            [item["id"] for item in response.data["results"]], [str(self.ativo.id)]
+        )
+
+    def test_is_active_invalido_retorna_400(self):
+        for user in (None, self.customer, self.admin):
+            headers = auth_header(user) if user else {}
+            for value in ("invalid", "", "2", "null"):
+                with self.subTest(user=user, value=value):
+                    response = self.client.get(
+                        self.url, {"is_active": value}, **headers
+                    )
+                    self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                    self.assertIn("is_active", response.json())
+
+    def test_admin_filtra_booleano_validado_sem_exigir_estoque(self):
+        headers = auth_header(self.admin)
+        for value, active in (
+            ("true", True),
+            ("false", False),
+            ("1", True),
+            ("0", False),
+        ):
+            with self.subTest(value=value):
+                response = self.client.get(self.url, {"is_active": value}, **headers)
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                expected = {
+                    str(product.id)
+                    for product in Product.objects.filter(is_active=active)
+                }
+                body = response.json()
+                self.assertEqual(body["count"], len(expected))
+                self.assertEqual({item["id"] for item in body["results"]}, expected)
 
     def test_admin_filtra_is_active_false(self):
         """Admin pode passar ?is_active=false e ver só inativos."""
@@ -619,6 +734,649 @@ class ProductListTests(APITestCase):
 
         self.assertEqual(
             ids_returned[0], str(Product.objects.get(name="Camisa Preta").id)
+        )
+
+
+# ─── Product — Detail ─────────────────────────────────────────────────────────
+
+
+class ProductListContractTests(APITestCase):
+    url = "/api/catalog/products/"
+
+    def setUp(self):
+        self.category = Category.objects.create(name="Camisetas", slug="camisetas")
+        self.products = [
+            make_stocked_product(
+                name=f"Produto {index}",
+                category=self.category,
+                base_price=index,
+                description="Algodão exclusivo" if index == 0 else "Descrição",
+            )
+            for index in range(25)
+        ]
+
+    def test_pagination_defaults_links_and_custom_size(self):
+        first = self.client.get(self.url).json()
+        self.assertEqual(set(first), {"count", "next", "previous", "results"})
+        self.assertEqual(first["count"], 25)
+        self.assertEqual(len(first["results"]), 20)
+        self.assertIsNone(first["previous"])
+        second = self.client.get(first["next"]).json()
+        self.assertEqual(len(second["results"]), 5)
+        self.assertIsNone(second["next"])
+        self.assertIsNotNone(second["previous"])
+        self.assertFalse(
+            {item["id"] for item in first["results"]}
+            & {item["id"] for item in second["results"]}
+        )
+        page = self.client.get(self.url, {"page": 2, "page_size": 7}).json()
+        self.assertEqual(page["count"], 25)
+        self.assertEqual(len(page["results"]), 7)
+        self.assertIn("page_size=7", page["next"])
+        self.assertEqual(page["results"][0]["id"], str(self.products[17].id))
+
+    def test_page_size_is_capped(self):
+        products = Product.objects.bulk_create(
+            [Product(name=f"Extra {i}", base_price=1) for i in range(80)]
+        )
+        ProductVariation.objects.bulk_create(
+            [
+                ProductVariation(
+                    product=product, sku=f"available-{product.id}", stock_quantity=1
+                )
+                for product in products
+            ]
+        )
+        body = self.client.get(self.url, {"page_size": 999}).json()
+        self.assertEqual(body["count"], 105)
+        self.assertEqual(len(body["results"]), 50)
+        self.assertIsNotNone(body["next"])
+
+    def test_category_slug_uuid_and_unknown(self):
+        other = Category.objects.create(name="Bonés", slug="bones")
+        make_stocked_product(category=other)
+        for category, count in (
+            ("camisetas", 25),
+            (str(self.category.id), 25),
+            ("bones", 1),
+            ("inexistente", 0),
+        ):
+            with self.subTest(category=category):
+                body = self.client.get(self.url, {"category": category}).json()
+                self.assertEqual(body["count"], count)
+
+    def test_uuid_shaped_category_is_always_an_id(self):
+        category = Category.objects.create(name="Slug UUID", slug=str(self.category.id))
+        make_stocked_product(category=category)
+        body = self.client.get(self.url, {"category": category.slug}).json()
+        self.assertEqual(body["count"], 25)
+
+    def test_search_finds_description_outside_first_page(self):
+        body = self.client.get(self.url, {"search": "EXCLUSIVO"}).json()
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["results"][0]["id"], str(self.products[0].id))
+
+    def test_search_name_and_inclusive_price_boundaries(self):
+        body = self.client.get(
+            self.url, {"search": "pRoDuTo 0", "min_price": "0", "max_price": "0"}
+        ).json()
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["results"][0]["id"], str(self.products[0].id))
+
+    def test_each_variation_filter_and_unknown_values(self):
+        ProductVariation.objects.create(
+            product=self.products[0],
+            size="M",
+            color="Azul",
+            sku="FILTER-M",
+            stock_quantity=1,
+        )
+        for params, expected in (
+            ({"size": "M"}, 1),
+            ({"color": "Azul"}, 1),
+            ({"size": "Inexistente"}, 0),
+            ({"color": "Inexistente"}, 0),
+        ):
+            with self.subTest(params=params):
+                body = self.client.get(self.url, params).json()
+                self.assertEqual(body["count"], expected)
+
+    def test_list_metadata_preserves_relation_ids(self):
+        drop = DropCampaign.objects.create(name="Coleção", slug="colecao")
+        product = self.products[0]
+        product.drop = drop
+        product.save()
+        with self.assertNumQueries(4):
+            body = self.client.get(self.url, {"search": "EXCLUSIVO"}).json()
+        item = body["results"][0]
+        self.assertEqual(item["category"], str(self.category.id))
+        self.assertEqual(item["drop"], str(drop.id))
+        self.assertEqual(item["category_details"]["slug"], "camisetas")
+        self.assertEqual(item["drop_details"]["slug"], "colecao")
+
+    def test_filter_options_cover_all_active_products_without_duplicates(self):
+        inactive = make_product(is_active=False, base_price=9999)
+        for product, size, color in (
+            (self.products[0], "M", "Azul"),
+            (self.products[-1], "M", "Azul"),
+            (self.products[1], "G", ""),
+            (inactive, "EXCLUSIVO", "Oculta"),
+        ):
+            ProductVariation.objects.create(
+                product=product, size=size, color=color, sku=str(uuid.uuid4())
+            )
+        with self.assertNumQueries(3):
+            response = self.client.get(self.url + "filter-options/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {
+                "min_price": "0.00",
+                "max_price": "24.00",
+                "sizes": ["G", "M"],
+                "colors": ["Azul"],
+            },
+        )
+
+    def test_empty_filter_options_and_nullable_list_metadata(self):
+        Product.objects.all().delete()
+        self.assertEqual(
+            self.client.get(self.url + "filter-options/").json(),
+            {
+                "min_price": None,
+                "max_price": None,
+                "sizes": [],
+                "colors": [],
+            },
+        )
+        make_stocked_product()
+        item = self.client.get(self.url).json()["results"][0]
+        self.assertIsNone(item["category_details"])
+        self.assertIsNone(item["drop_details"])
+
+    def test_combined_filters_require_same_variation_without_duplicates(self):
+        matching = self.products[10]
+        for product, size, color in (
+            (matching, "M", "Azul"),
+            (matching, "M", "Preto"),
+            (self.products[11], "M", "Branco"),
+            (self.products[11], "G", "Azul"),
+            (self.products[9], "M", "Azul"),
+        ):
+            ProductVariation.objects.create(
+                product=product,
+                size=size,
+                color=color,
+                sku=str(uuid.uuid4()),
+                stock_quantity=1,
+            )
+        body = self.client.get(
+            self.url + "?size=M&color=Azul&color=Preto&min_price=10&max_price=11"
+        ).json()
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["results"][0]["id"], str(matching.id))
+
+    def test_invalid_parameters_return_400(self):
+        for params in (
+            {"page": 0},
+            {"page": "abc"},
+            {"page": -1},
+            {"page": 1.5},
+            {"page_size": 0},
+            {"page_size": "abc"},
+            {"page_size": -2},
+            {"min_price": "abc"},
+            {"min_price": "NaN"},
+            {"max_price": "Infinity"},
+            {"min_price": -1},
+            {"max_price": "1.234"},
+            {"min_price": 10, "max_price": 9},
+            {"ordering": "name"},
+            {"ordering": "?"},
+            {"drop": "invalid"},
+            {"color": ""},
+        ):
+            with self.subTest(params=params):
+                response = self.client.get(self.url, params)
+                self.assertEqual(response.status_code, 400, response.content)
+        self.assertEqual(self.client.get(self.url, {"page": 999}).status_code, 404)
+
+    def test_price_ordering_and_stable_ties(self):
+        for ordering, expected in (
+            ("base_price", self.products[0]),
+            ("-base_price", self.products[-1]),
+        ):
+            body = self.client.get(self.url, {"ordering": ordering}).json()
+            self.assertEqual(body["results"][0]["id"], str(expected.id))
+        Product.objects.update(created_at=timezone.now(), base_price=1)
+        expected = sorted(str(product.id) for product in self.products)
+        for ordering in ("-created_at", "base_price", "-base_price", "-sales_count"):
+            body = self.client.get(
+                self.url, {"ordering": ordering, "page_size": 100}
+            ).json()
+            self.assertEqual([item["id"] for item in body["results"]], expected)
+
+    def test_related_data_is_loaded_in_constant_queries(self):
+        with self.assertNumQueries(4):
+            response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 200)
+
+    def test_openapi_documents_query_and_paginated_response(self):
+        schema = SchemaGenerator(
+            patterns=[
+                path("api/catalog/products/", ProductListCreateView.as_view()),
+                path(
+                    "api/catalog/products/filter-options/",
+                    CatalogFilterOptionsView.as_view(),
+                ),
+            ]
+        ).get_schema(public=True)
+        validate_schema(schema)
+        filter_options_operation = schema["paths"][self.url + "filter-options/"]["get"]
+        self.assertIn("200", filter_options_operation["responses"])
+        operation = schema["paths"][self.url]["get"]
+        names = {parameter["name"] for parameter in operation["parameters"]}
+        self.assertTrue(
+            {
+                "page",
+                "page_size",
+                "category",
+                "drop",
+                "search",
+                "size",
+                "color",
+                "min_price",
+                "max_price",
+                "ordering",
+                "is_active",
+            }.issubset(names)
+        )
+        is_active_parameter = next(
+            parameter
+            for parameter in operation["parameters"]
+            if parameter["name"] == "is_active"
+        )
+        self.assertEqual(is_active_parameter["in"], "query")
+        self.assertEqual(is_active_parameter["schema"]["type"], "boolean")
+        self.assertFalse(is_active_parameter.get("required", False))
+        response_schema = operation["responses"]["200"]["content"]["application/json"][
+            "schema"
+        ]
+        component = response_schema["$ref"].rsplit("/", 1)[1]
+        self.assertEqual(
+            set(schema["components"]["schemas"][component]["properties"]),
+            {"count", "next", "previous", "results"},
+        )
+
+    def test_sales_sum_quantities_and_ignore_invalid_orders_with_filters(self):
+        user = make_user("sales@example.com")
+        winner, runner_up, invalid = self.products[:3]
+        variations = {}
+        for product in (winner, runner_up, invalid):
+            variations[product.id] = [
+                ProductVariation.objects.create(
+                    product=product,
+                    size="M",
+                    color=color,
+                    sku=str(uuid.uuid4()),
+                    stock_quantity=1,
+                )
+                for color in ("Azul", "Preto")
+            ]
+        for order_status in OrderStatus.values:
+            valid = order_status not in (
+                OrderStatus.AWAITING_PAYMENT,
+                OrderStatus.CANCELED,
+            )
+            order = CustomerOrder.objects.create(
+                user=user,
+                status=order_status,
+                subtotal=100,
+                total_amount=100,
+                shipping_zip_code="01001000",
+                shipping_street="Rua Teste",
+                shipping_number="1",
+                shipping_neighborhood="Centro",
+                shipping_city="São Paulo",
+                shipping_state="SP",
+            )
+            for product, quantity in (
+                ((winner, 2), (runner_up, 1)) if valid else ((invalid, 100),)
+            ):
+                for variation in variations[product.id]:
+                    OrderItem.objects.create(
+                        order=order,
+                        variation=variation,
+                        quantity=quantity,
+                        unit_price=1,
+                        product_name=product.name,
+                    )
+        body = self.client.get(
+            self.url + "?ordering=-sales_count&size=M&color=Azul&color=Preto"
+        ).json()
+        self.assertEqual(body["count"], 3)
+        self.assertEqual(
+            [item["id"] for item in body["results"]],
+            [str(product.id) for product in (winner, runner_up, invalid)],
+        )
+        ranked = filter_catalog(Product.objects.all(), {"ordering": "-sales_count"})
+        totals = dict(ranked.values_list("id", "sales_count"))
+        self.assertEqual(totals[winner.id], 16)
+        self.assertEqual(totals[runner_up.id], 8)
+        self.assertEqual(totals[invalid.id], 0)
+        self.assertEqual(totals[self.products[-1].id], 0)
+
+    def test_sales_ranking_tracks_each_order_status_and_ignores_payment_status(self):
+        from orders.models import Payment, PaymentMethod, PaymentStatus
+
+        product = self.products[0]
+        variation = ProductVariation.objects.create(
+            product=product, size="M", sku="ranking-status"
+        )
+        order = CustomerOrder.objects.create(
+            user=make_user("ranking-status@example.com"),
+            subtotal=100,
+            total_amount=100,
+            shipping_zip_code="01001000",
+            shipping_street="Rua Teste",
+            shipping_number="1",
+            shipping_neighborhood="Centro",
+            shipping_city="São Paulo",
+            shipping_state="SP",
+        )
+        OrderItem.objects.create(
+            order=order,
+            variation=variation,
+            quantity=7,
+            unit_price=100,
+            product_name=product.name,
+        )
+        payment = Payment.objects.create(
+            order=order,
+            method=PaymentMethod.PIX,
+            status=PaymentStatus.PENDING,
+            total_amount=100,
+        )
+        for order_status, expected in (
+            (OrderStatus.AWAITING_PAYMENT, 0),
+            (OrderStatus.PAID, 7),
+            (OrderStatus.PREPARING, 7),
+            (OrderStatus.SHIPPED, 7),
+            (OrderStatus.DELIVERED, 7),
+            (OrderStatus.CANCELED, 0),
+        ):
+            for payment_status in (PaymentStatus.PENDING, PaymentStatus.PAID):
+                with self.subTest(order=order_status, payment=payment_status):
+                    order.status = order_status
+                    order.save(update_fields=["status"])
+                    payment.status = payment_status
+                    payment.save(update_fields=["status"])
+                    ranked = filter_catalog(
+                        Product.objects.all(), {"ordering": "-sales_count"}
+                    )
+                    self.assertEqual(ranked.get(pk=product.pk).sales_count, expected)
+
+    def test_sales_ranking_precedes_pagination_and_has_stable_ties(self):
+        # O produto mais antigo fica fora da primeira página por recência.
+        winner, tied_a, tied_b = self.products[:3]
+        order = CustomerOrder.objects.create(
+            user=make_user("ranking-page@example.com"),
+            status=OrderStatus.PAID,
+            subtotal=100,
+            total_amount=100,
+            shipping_zip_code="01001000",
+            shipping_street="Rua Teste",
+            shipping_number="1",
+            shipping_neighborhood="Centro",
+            shipping_city="São Paulo",
+            shipping_state="SP",
+        )
+        inactive = make_product(name="Inativo", is_active=False)
+        for product, quantity in (
+            (winner, 10),
+            (tied_a, 5),
+            (tied_b, 5),
+            (inactive, 100),
+        ):
+            variation = ProductVariation.objects.create(
+                product=product, size="M", sku=str(product.id)
+            )
+            OrderItem.objects.create(
+                order=order,
+                variation=variation,
+                quantity=quantity,
+                unit_price=100,
+                product_name=product.name,
+            )
+        expected_ties = [str(tied_b.id), str(tied_a.id)]
+        for same_date in (False, True):
+            if same_date:
+                Product.objects.filter(pk__in=[tied_a.pk, tied_b.pk]).update(
+                    created_at=timezone.now()
+                )
+                expected_ties = sorted(expected_ties)
+            with self.subTest(same_date=same_date):
+                with self.assertNumQueries(4):
+                    response = self.client.get(
+                        self.url, {"ordering": "-sales_count", "page_size": 4}
+                    )
+                self.assertEqual(response.status_code, 200)
+                body = response.json()
+                self.assertEqual(body["count"], 25)
+                self.assertEqual(len(body["results"]), 4)
+                ids = [item["id"] for item in body["results"]]
+                self.assertEqual(ids[:3], [str(winner.id), *expected_ties])
+                self.assertNotIn(str(inactive.id), ids)
+                self.assertIsNotNone(body["next"])
+
+
+class ProductRecommendationTests(APITestCase):
+    def setUp(self):
+        self.category = Category.objects.create(name="Camisetas", slug="camisetas")
+        self.other_category = Category.objects.create(name="Calças", slug="calcas")
+        self.drop = DropCampaign.objects.create(name="Drop", slug="drop")
+        self.product = self.make_available(category=self.category, drop=self.drop)
+        self.url = f"/api/catalog/products/{self.product.id}/recommendations/"
+
+    def make_available(self, stock=2, **kwargs):
+        product = make_product(**kwargs)
+        ProductVariation.objects.create(
+            product=product, size="M", sku=str(uuid.uuid4()), stock_quantity=stock
+        )
+        return product
+
+    def assert_recommendations(self, expected, **params):
+        response = self.client.get(self.url, params)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(
+            [item["id"] for item in body["results"]],
+            [str(product.id) for product in expected],
+        )
+        return body
+
+    def test_public_recommendations_require_active_products_with_stock(self):
+        available = self.make_available(category=self.category)
+        ProductVariation.objects.create(
+            product=available, size="G", sku="second-stock", stock_quantity=3
+        )
+        self.make_available(category=self.category, is_active=False)
+        self.make_available(category=self.category, stock=0)
+        make_product(category=self.category)
+        with self.assertNumQueries(5):
+            body = self.assert_recommendations([available])
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["results"][0]["category_details"]["slug"], "camisetas")
+        self.assertEqual(len(body["results"][0]["variations"]), 2)
+        self.assertIn("images", body["results"][0])
+
+    def test_category_then_drop_priority_precedes_recency(self):
+        both = self.make_available(category=self.category, drop=self.drop)
+        category_only = self.make_available(category=self.category)
+        drop_only = self.make_available(category=self.other_category, drop=self.drop)
+        general = self.make_available(category=self.other_category)
+        self.assert_recommendations([both, category_only, drop_only, general])
+
+    def test_fallback_fills_page_from_same_category_then_general_catalog(self):
+        category_only = self.make_available(category=self.category)
+        general = self.make_available(category=self.other_category)
+        body = self.assert_recommendations([category_only, general])
+        self.assertEqual(body["count"], 2)
+        self.assertIsNone(body["next"])
+
+    def test_fallback_to_general_catalog_when_category_is_unavailable(self):
+        self.make_available(category=self.category, stock=0)
+        self.make_available(category=self.category, is_active=False)
+        older = self.make_available(category=self.other_category)
+        newer = self.make_available()
+        self.assert_recommendations([newer, older])
+
+    def test_no_drop_does_not_prioritize_other_products_without_drop(self):
+        self.product.drop = None
+        self.product.save(update_fields=["drop"])
+        without_drop = self.make_available(category=self.category)
+        with_drop = self.make_available(category=self.category, drop=self.drop)
+        self.assert_recommendations([with_drop, without_drop])
+
+    def test_no_category_uses_drop_then_general_catalog(self):
+        self.product.category = None
+        self.product.save(update_fields=["category"])
+        same_drop = self.make_available(category=self.category, drop=self.drop)
+        without_category = self.make_available()
+        general = self.make_available(category=self.other_category)
+        self.assert_recommendations([same_drop, general, without_category])
+
+    def test_sales_sum_all_variations_and_only_valid_order_statuses(self):
+        winner = self.make_available(category=self.category, drop=self.drop)
+        second_variation = ProductVariation.objects.create(
+            product=winner, size="G", sku="sold-out-sales", stock_quantity=0
+        )
+        runner_up = self.make_available(category=self.category, drop=self.drop)
+        unpaid = self.make_available(category=self.category, drop=self.drop)
+        general = self.make_available(category=self.other_category)
+        user = make_user("recommendations@example.com")
+        for order_status in OrderStatus.values:
+            order = CustomerOrder.objects.create(
+                user=user,
+                status=order_status,
+                subtotal=100,
+                total_amount=100,
+                shipping_zip_code="01001000",
+                shipping_street="Rua Teste",
+                shipping_number="1",
+                shipping_neighborhood="Centro",
+                shipping_city="São Paulo",
+                shipping_state="SP",
+            )
+            valid = order_status in (
+                OrderStatus.PAID,
+                OrderStatus.PREPARING,
+                OrderStatus.SHIPPED,
+                OrderStatus.DELIVERED,
+            )
+            for variation, quantity in (
+                (winner.variations.get(size="M"), 2 if valid else 0),
+                (second_variation, 2 if valid else 0),
+                (runner_up.variations.get(), 3 if valid else 0),
+                (unpaid.variations.get(), 0 if valid else 100),
+                (general.variations.get(), 100 if valid else 0),
+            ):
+                if quantity:
+                    OrderItem.objects.create(
+                        order=order,
+                        variation=variation,
+                        quantity=quantity,
+                        unit_price=1,
+                        product_name=variation.product.name,
+                    )
+        self.assert_recommendations([winner, runner_up, unpaid, general])
+
+    def test_ties_use_recency_then_id(self):
+        older = self.make_available()
+        newer = self.make_available()
+        Product.objects.filter(pk=older.pk).update(
+            created_at=timezone.now() - timedelta(days=1)
+        )
+        self.assert_recommendations([newer, older])
+        Product.objects.filter(pk__in=[older.pk, newer.pk]).update(
+            created_at=timezone.now()
+        )
+        self.assert_recommendations(
+            sorted([older, newer], key=lambda product: product.id)
+        )
+
+    def test_priorities_apply_before_pagination_with_a_safe_page_size_limit(self):
+        preferred = self.make_available(category=self.category, drop=self.drop)
+        others = [self.make_available() for _ in range(54)]
+        expected = [preferred, *reversed(others)]
+        body = self.assert_recommendations(expected[:4])
+        self.assertEqual(body["count"], 55)
+        self.assertIsNotNone(body["next"])
+        self.assertIsNone(body["previous"])
+        body = self.assert_recommendations(expected[4:8], page=2, page_size=4)
+        self.assertIsNotNone(body["previous"])
+        body = self.assert_recommendations(expected[:50], page_size=1000)
+        self.assertEqual(body["count"], 55)
+        body = self.assert_recommendations(expected[50:], page_size=1000, page=2)
+        self.assertIsNone(body["next"])
+
+    def test_invalid_pagination_and_missing_page(self):
+        for name in ("page", "page_size"):
+            for value in ("zero", "0", "-1", "1.5"):
+                with self.subTest(parameter=name, value=value):
+                    self.assertEqual(
+                        self.client.get(self.url, {name: value}).status_code, 400
+                    )
+        self.assertEqual(self.client.get(self.url, {"page": 2}).status_code, 404)
+
+    def test_missing_or_inactive_source_returns_404_even_for_admin(self):
+        admin = make_user(
+            "recommendations-admin@example.com", role=UserRole.ADMIN, is_staff=True
+        )
+        inactive = make_product(is_active=False)
+        for headers in ({}, auth_header(admin)):
+            for product_id in (uuid.uuid4(), inactive.id):
+                with self.subTest(authenticated=bool(headers), product_id=product_id):
+                    response = self.client.get(
+                        f"/api/catalog/products/{product_id}/recommendations/",
+                        **headers,
+                    )
+                    self.assertEqual(response.status_code, 404)
+
+    def test_sold_out_source_can_still_receive_recommendations(self):
+        self.product.variations.update(stock_quantity=0)
+        available = self.make_available()
+        self.assert_recommendations([available])
+
+    def test_empty_catalog_returns_empty_paginated_response(self):
+        self.assertEqual(
+            self.assert_recommendations([]),
+            {"count": 0, "next": None, "previous": None, "results": []},
+        )
+
+    def test_openapi_documents_paginated_recommendations(self):
+        schema = SchemaGenerator(
+            patterns=[
+                path(
+                    "api/catalog/products/<uuid:pk>/recommendations/",
+                    ProductRecommendationsView.as_view(),
+                ),
+            ]
+        ).get_schema(public=True)
+        validate_schema(schema)
+        operation = next(iter(schema["paths"].values()))["get"]
+        self.assertTrue(
+            {"page", "page_size"}.issubset(
+                parameter["name"] for parameter in operation["parameters"]
+            )
+        )
+        response_schema = operation["responses"]["200"]["content"]["application/json"][
+            "schema"
+        ]
+        component = response_schema["$ref"].rsplit("/", 1)[1]
+        self.assertEqual(
+            set(schema["components"]["schemas"][component]["properties"]),
+            {"count", "next", "previous", "results"},
         )
 
 
@@ -835,6 +1593,44 @@ class VariationCRUDTests(APITestCase):
         )
         self.create_url = f"/api/catalog/products/{self.product.id}/variations/"
         self.detail_url = f"/api/catalog/variations/{self.variation.id}/"
+
+    def test_color_normalization_create_update_and_catalog(self):
+        created = self.client.post(
+            self.create_url,
+            {"size": "M", "color": "  aZuL  ", "stock_quantity": 2},
+            format="json",
+            **auth_header(self.admin),
+        )
+        self.assertEqual(created.status_code, 201, created.data)
+        self.assertEqual(created.data["color"], "Azul")
+        updated = self.client.put(
+            self.detail_url,
+            {"color": "AZUL"},
+            format="json",
+            **auth_header(self.admin),
+        )
+        self.assertEqual(updated.status_code, 200, updated.data)
+        self.variation.refresh_from_db()
+        self.assertEqual(self.variation.color, "Azul")
+        for color in ("Azul", "azul", " AZUL "):
+            response = self.client.get("/api/catalog/products/", {"color": color})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(
+                [item["id"] for item in response.data["results"]],
+                [str(self.product.id)],
+            )
+        options = self.client.get("/api/catalog/products/filter-options/").data
+        self.assertEqual(options["colors"], ["Azul"])
+
+    def test_normalized_color_still_rejects_duplicate_combination(self):
+        create_variation(self.product, {"size": "M", "color": "Azul"})
+        response = self.client.post(
+            self.create_url,
+            {"size": "M", "color": " azul "},
+            format="json",
+            **auth_header(self.admin),
+        )
+        self.assertEqual(response.status_code, 400)
 
     def test_admin_cria_variacao(self):
         response = self.client.post(
@@ -1196,6 +1992,17 @@ class CatalogDecisionTests(APITestCase):
         self.assertEqual(len(data["variations"]), 1)
         self.assertEqual(data["variations"][0]["size"], "Único")
         self.assertEqual(StockMovement.objects.count(), 0)
+        move_stock(
+            variation=ProductVariation.objects.get(pk=data["variations"][0]["id"]),
+            kind="ENTRADA",
+            reason="AJUSTE",
+            quantity=1,
+            origin_type="MANUAL_ADJUSTMENT",
+            origin_id=uuid.uuid4(),
+            idempotency_key=str(uuid.uuid4()),
+            created_by=self.admin,
+            note="Disponibilizar produto para verificar privacidade no catálogo público",
+        )
         self.client.force_authenticate(None)
         for url in (self.url, f"{self.url}{data['id']}/"):
             public = self.client.get(url).data

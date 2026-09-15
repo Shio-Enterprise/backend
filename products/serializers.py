@@ -14,7 +14,58 @@ from .models import (
     ProductVariation,
     StockMovement,
 )
-from .services import create_variation, move_stock, normalize_variation
+from .services import create_variation, move_stock, normalize_color, normalize_variation
+
+
+class CatalogPageQuerySerializer(serializers.Serializer):
+    page = serializers.IntegerField(min_value=1, required=False)
+    page_size = serializers.IntegerField(min_value=1, required=False)
+
+
+class ProductListQuerySerializer(CatalogPageQuerySerializer):
+    """Valida a query antes de construir filtros ou executar a paginação."""
+
+    is_active = serializers.BooleanField(required=False)
+    category = serializers.SlugField(max_length=150, required=False)
+    drop = serializers.UUIDField(required=False)
+    search = serializers.CharField(required=False, allow_blank=True)
+    size = serializers.CharField(max_length=50, required=False)
+    color = serializers.ListField(
+        child=serializers.CharField(max_length=100), required=False, allow_empty=False
+    )
+    min_price = serializers.DecimalField(
+        max_digits=10, decimal_places=2, min_value=0, required=False
+    )
+    max_price = serializers.DecimalField(
+        max_digits=10, decimal_places=2, min_value=0, required=False
+    )
+    ordering = serializers.ChoiceField(
+        choices=("-created_at", "base_price", "-base_price", "-sales_count"),
+        default="-created_at",
+    )
+
+    def validate_color(self, values):
+        return [normalize_color(value) for value in values]
+
+    def validate(self, attrs):
+        minimum = attrs.get("min_price")
+        maximum = attrs.get("max_price")
+        if minimum is not None and maximum is not None and minimum > maximum:
+            raise serializers.ValidationError(
+                {"max_price": "Deve ser maior ou igual a min_price."}
+            )
+        return attrs
+
+
+class CatalogFilterOptionsSerializer(serializers.Serializer):
+    min_price = serializers.DecimalField(
+        max_digits=10, decimal_places=2, allow_null=True
+    )
+    max_price = serializers.DecimalField(
+        max_digits=10, decimal_places=2, allow_null=True
+    )
+    sizes = serializers.ListField(child=serializers.CharField())
+    colors = serializers.ListField(child=serializers.CharField())
 
 
 class CategorySerializer(serializers.ModelSerializer):
@@ -339,6 +390,8 @@ class ProductListSerializer(ProductPricingSerializer):
 
     variations = ProductVariationSerializer(many=True, read_only=True)
     images = ProductImageSerializer(many=True, read_only=True)
+    category_details = CategoryNestedSerializer(source="category", read_only=True)
+    drop_details = DropNestedSerializer(source="drop", read_only=True)
 
     class Meta:
         model = Product
@@ -350,6 +403,8 @@ class ProductListSerializer(ProductPricingSerializer):
             "is_active",
             "category",
             "drop",
+            "category_details",
+            "drop_details",
             "variations",
             "images",
             "created_at",

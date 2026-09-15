@@ -3,7 +3,7 @@ import uuid
 
 from django.core.files.base import ContentFile
 from django.db import transaction
-from django.db.models import Max, Q, Sum
+from django.db.models import Exists, Max, OuterRef, Q, Sum
 from django.db.models.deletion import ProtectedError
 from django.http import JsonResponse
 from django.shortcuts import get_object_or_404
@@ -19,6 +19,13 @@ from rest_framework.views import APIView
 
 from authentication.permissions import IsStaffOrSuperUser
 
+from .catalog import (
+    CatalogPagination,
+    RecommendationPagination,
+    catalog_filter_options,
+    filter_catalog,
+    recommend_products,
+)
 from .models import (
     Category,
     DropCampaign,
@@ -27,12 +34,15 @@ from .models import (
     ProductVariation,
 )
 from .serializers import (
+    CatalogFilterOptionsSerializer,
+    CatalogPageQuerySerializer,
     CategorySerializer,
     DropCampaignDetailSerializer,
     DropCampaignSerializer,
     ProductDetailSerializer,
     ProductDuplicateSerializer,
     ProductImageSerializer,
+    ProductListQuerySerializer,
     ProductListSerializer,
     ProductVariationSerializer,
     ProductWriteSerializer,
@@ -400,8 +410,23 @@ class DropProductManageView(APIView):
 # ─── Products ─────────────────────────────────────────────────────────────────
 
 
+class CatalogFilterOptionsView(APIView):
+    permission_classes = [AllowAny]
+
+    @extend_schema(
+        tags=["Products"],
+        summary="Opções de filtros do catálogo público",
+        description="Preços, tamanhos e cores de todos os produtos ativos, independentemente da página ou dos filtros selecionados.",
+        responses={200: CatalogFilterOptionsSerializer},
+    )
+    def get(self, request):
+        return Response(CatalogFilterOptionsSerializer(catalog_filter_options()).data)
+
+
 class ProductListCreateView(APIView):
     """Listar produtos (público, com filtros) e criar (admin)."""
+
+    pagination_class = CatalogPagination
 
     def get_permissions(self):
         if self.request.method == "POST":
@@ -420,14 +445,35 @@ class ProductListCreateView(APIView):
         summary="Listar produtos",
         description=(
             "Lista paginada do catálogo. Endpoint público — só retorna produtos "
-            "com `is_active=True` para chamadas não autenticadas e clientes.\n\n"
-            "Filtros via query: `category={uuid}`, `drop={uuid}`, `search={text}` "
-            "(busca em name/description), `is_active=true|false` (só admin pode passar false).\n\n"
-            "Ordenação padrão: `-created_at`."
+            "com `is_active=True` e ao menos uma variação com `stock_quantity > 0` "
+            "para chamadas não autenticadas e clientes.\n\n"
+            "Categoria por slug; valores reconhecidos como UUID são sempre IDs legados. "
+            "Drop por UUID. Busca sem distinção de maiúsculas em name/description. "
+            "Cores exatas repetidas: `color=Preto&color=Azul`; tamanho e cor na mesma "
+            "variação. Preços inclusivos, não negativos, com até duas casas decimais. "
+            "Página inicial 1, tamanho padrão 20 e máximo 50 (valores maiores são limitados). "
+            "Parâmetros inválidos retornam 400; página inexistente retorna 404. "
+            "Para clientes e visitantes, tamanho e cor devem corresponder a uma mesma "
+            "variação com estoque positivo. Nomes de cores conhecidos são normalizados. "
+            "Ordenação padrão -created_at, com id como desempate; preços e vendas "
+            "desempatam por -created_at e id. Vendas somam quantidades de pedidos PAID, "
+            "PREPARING, SHIPPED e DELIVERED. "
+            "`is_active=true|false` mantém o comportamento administrativo existente."
         ),
-        responses={200: ProductListSerializer(many=True)},
+        parameters=[ProductListQuerySerializer],
+        responses={
+            200: ProductListSerializer(many=True),
+            400: OpenApiResponse(description="Parâmetros de consulta inválidos."),
+            404: OpenApiResponse(description="Página inexistente."),
+        },
     )
     def get(self, request):
+        # Evita tratar booleano ausente como checkbox HTML desmarcado.
+        params = request.query_params.dict()
+        if "color" in params:
+            params["color"] = request.query_params.getlist("color")
+        query = ProductListQuerySerializer(data=params)
+        query.is_valid(raise_exception=True)
         qs = Product.objects.select_related("category", "drop").prefetch_related(
             "variations", "images"
         )
@@ -435,26 +481,17 @@ class ProductListCreateView(APIView):
         is_admin = request.user.is_authenticated and getattr(
             request.user, "is_admin", False
         )
-        is_active_param = request.query_params.get("is_active")
+        is_active_param = query.validated_data.get("is_active")
         if is_admin and is_active_param is not None:
-            qs = qs.filter(is_active=is_active_param.lower() == "true")
+            qs = qs.filter(is_active=is_active_param)
         elif not is_admin:
-            qs = qs.filter(is_active=True)
+            available = ProductVariation.objects.filter(
+                product_id=OuterRef("pk"), stock_quantity__gt=0
+            )
+            qs = qs.filter(Exists(available), is_active=True)
 
-        category = request.query_params.get("category")
-        if category:
-            qs = qs.filter(category_id=category)
-
-        drop = request.query_params.get("drop")
-        if drop:
-            qs = qs.filter(drop_id=drop)
-
-        search = request.query_params.get("search")
-        if search:
-            qs = qs.filter(Q(name__icontains=search) | Q(description__icontains=search))
-
-        qs = qs.order_by("-created_at")
-        paginator = PageNumberPagination()
+        qs = filter_catalog(qs, query.validated_data, require_stock=not is_admin)
+        paginator = self.pagination_class()
         page = paginator.paginate_queryset(qs, request, view=self)
         serializer = ProductListSerializer(
             page, many=True, context={"request": request}
@@ -494,6 +531,44 @@ class ProductListCreateView(APIView):
             ProductDetailSerializer(product, context={"request": request}).data,
             status=status.HTTP_201_CREATED,
         )
+
+
+class ProductRecommendationsView(APIView):
+    permission_classes = [AllowAny]
+    pagination_class = RecommendationPagination
+    serializer_class = ProductListSerializer
+
+    @extend_schema(
+        tags=["Products"],
+        summary="Recomendações para um produto",
+        description=(
+            "Produtos ativos com pelo menos uma variação em estoque, excluindo o atual. "
+            "Prioriza mesma categoria, depois mesmo drop (quando presentes), vendas "
+            "válidas, recência decrescente e ID crescente. Completa os resultados com "
+            "outros produtos disponíveis do catálogo. Vendas consideram quantidades "
+            "de pedidos PAID, PREPARING, SHIPPED e DELIVERED. "
+            "Página inicial 1, tamanho padrão 4 e máximo 50; valores maiores são limitados. "
+            "Produto de origem inativo ou inexistente retorna 404, inclusive para admin."
+        ),
+        parameters=[CatalogPageQuerySerializer],
+        responses={
+            200: ProductListSerializer(many=True),
+            400: OpenApiResponse(description="Parâmetros de paginação inválidos."),
+            404: OpenApiResponse(description="Produto ou página não encontrado."),
+        },
+    )
+    def get(self, request, pk):
+        query = CatalogPageQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        product = get_object_or_404(Product, pk=pk, is_active=True)
+        paginator = self.pagination_class()
+        page = paginator.paginate_queryset(
+            recommend_products(product), request, view=self
+        )
+        serializer = self.serializer_class(
+            page, many=True, context={"request": request}
+        )
+        return paginator.get_paginated_response(serializer.data)
 
 
 class ProductDetailView(APIView):

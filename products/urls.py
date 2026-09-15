@@ -1,6 +1,7 @@
 from django.urls import path
 
 from .views import (
+    CatalogFilterOptionsView,
     CategoryDetailView,
     CategoryListCreateView,
     DropCampaignDetailView,
@@ -12,6 +13,7 @@ from .views import (
     ProductImageDeleteView,
     ProductImageUpdateView,
     ProductListCreateView,
+    ProductRecommendationsView,
     ProductVariationCreateView,
     ProductVariationDetailView,
     StockMovementListCreateView,
@@ -25,6 +27,11 @@ urlpatterns = [
         "products/<uuid:pk>/duplicate/",
         ProductDuplicateView.as_view(),
         name="product-duplicate",
+    ),
+    path(
+        "products/filter-options/",
+        CatalogFilterOptionsView.as_view(),
+        name="catalog-filter-options",
     ),
     # GET (público) - Lista categorias / POST (admin) - Cria categoria
     path(
@@ -67,6 +74,11 @@ urlpatterns = [
         "products/<uuid:pk>/",
         ProductDetailView.as_view(),
         name="product-detail",
+    ),
+    path(
+        "products/<uuid:pk>/recommendations/",
+        ProductRecommendationsView.as_view(),
+        name="product-recommendations",
     ),
     # POST (admin) - Cria variação no produto
     path(
