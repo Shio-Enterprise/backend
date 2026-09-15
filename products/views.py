@@ -453,6 +453,8 @@ class ProductListCreateView(APIView):
             "variação. Preços inclusivos, não negativos, com até duas casas decimais. "
             "Página inicial 1, tamanho padrão 20 e máximo 50 (valores maiores são limitados). "
             "Parâmetros inválidos retornam 400; página inexistente retorna 404. "
+            "Para clientes e visitantes, tamanho e cor devem corresponder a uma mesma "
+            "variação com estoque positivo. Nomes de cores conhecidos são normalizados. "
             "Ordenação padrão -created_at, com id como desempate; preços e vendas "
             "desempatam por -created_at e id. Vendas somam quantidades de pedidos PAID, "
             "PREPARING, SHIPPED e DELIVERED. "
@@ -476,7 +478,9 @@ class ProductListCreateView(APIView):
             "variations", "images"
         )
 
-        is_admin = request.user.is_authenticated and getattr(request.user, "is_admin", False)
+        is_admin = request.user.is_authenticated and getattr(
+            request.user, "is_admin", False
+        )
         is_active_param = query.validated_data.get("is_active")
         if is_admin and is_active_param is not None:
             qs = qs.filter(is_active=is_active_param)
@@ -486,7 +490,7 @@ class ProductListCreateView(APIView):
             )
             qs = qs.filter(Exists(available), is_active=True)
 
-        qs = filter_catalog(qs, query.validated_data)
+        qs = filter_catalog(qs, query.validated_data, require_stock=not is_admin)
         paginator = self.pagination_class()
         page = paginator.paginate_queryset(qs, request, view=self)
         serializer = ProductListSerializer(
@@ -558,8 +562,12 @@ class ProductRecommendationsView(APIView):
         query.is_valid(raise_exception=True)
         product = get_object_or_404(Product, pk=pk, is_active=True)
         paginator = self.pagination_class()
-        page = paginator.paginate_queryset(recommend_products(product), request, view=self)
-        serializer = self.serializer_class(page, many=True, context={"request": request})
+        page = paginator.paginate_queryset(
+            recommend_products(product), request, view=self
+        )
+        serializer = self.serializer_class(
+            page, many=True, context={"request": request}
+        )
         return paginator.get_paginated_response(serializer.data)
 
 

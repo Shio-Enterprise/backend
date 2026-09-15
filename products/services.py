@@ -9,6 +9,31 @@ from rest_framework.exceptions import APIException, ValidationError
 
 from .models import Product, ProductVariation, StockMovement, StockOpeningBalance
 
+COLOR_NAMES = {
+    name.casefold(): name
+    for name in (
+        "Verde",
+        "Vermelho",
+        "Amarelo",
+        "Laranja",
+        "Ciano",
+        "Azul",
+        "Roxo",
+        "Rosa",
+        "Branco",
+        "Preto",
+    )
+}
+
+
+def normalize_color(value):
+    color = " ".join(value.split())
+    if color.startswith("#"):
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+            raise ValidationError({"color": "Use #RRGGBB."})
+        return color.upper()
+    return COLOR_NAMES.get(color.casefold(), color)
+
 
 class OperationConflict(APIException):
     status_code = 409
@@ -19,12 +44,7 @@ def normalize_variation(data):
     data = dict(data)
     size = " ".join(data.get("size", "Único").split()) or "Único"
     data["size"] = "Único" if size.casefold() in ("unico", "único") else size
-    color = " ".join(data.get("color", "").split())
-    if color.startswith("#"):
-        if not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
-            raise ValidationError({"color": "Use #RRGGBB."})
-        color = color.upper()
-    data["color"] = color
+    data["color"] = normalize_color(data.get("color", ""))
     sku = data.get("sku", "").strip().upper()
     if sku and not re.fullmatch(r"[A-Z0-9_-]{1,100}", sku):
         raise ValidationError(

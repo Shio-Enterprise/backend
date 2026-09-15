@@ -14,7 +14,7 @@ from .models import (
     ProductVariation,
     StockMovement,
 )
-from .services import create_variation, move_stock, normalize_variation
+from .services import create_variation, move_stock, normalize_color, normalize_variation
 
 
 class CatalogPageQuerySerializer(serializers.Serializer):
@@ -43,6 +43,9 @@ class ProductListQuerySerializer(CatalogPageQuerySerializer):
         choices=("-created_at", "base_price", "-base_price", "-sales_count"),
         default="-created_at",
     )
+
+    def validate_color(self, values):
+        return [normalize_color(value) for value in values]
 
     def validate(self, attrs):
         minimum = attrs.get("min_price")

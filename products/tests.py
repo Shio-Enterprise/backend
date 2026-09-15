@@ -640,6 +640,39 @@ class ProductListTests(APITestCase):
                         [str(self.ativo.id), str(self.preto.id)],
                     )
 
+    def test_public_filters_require_stock_in_selected_variation(self):
+        ProductVariation.objects.create(
+            product=self.ativo,
+            size="M",
+            color="Azul",
+            sku="SOLD-OUT-M",
+            stock_quantity=0,
+        )
+        ProductVariation.objects.create(
+            product=self.ativo,
+            size="G",
+            color="Preto",
+            sku="AVAILABLE-G",
+            stock_quantity=2,
+        )
+        for params in (
+            {"size": "M"},
+            {"color": "Azul"},
+            {"size": "M", "color": "Azul"},
+        ):
+            for user in (None, self.customer, self.admin):
+                with self.subTest(params=params, user=user):
+                    response = self.client.get(
+                        self.url, params, **(auth_header(user) if user else {})
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    ids = [item["id"] for item in response.data["results"]]
+                    self.assertEqual(str(self.ativo.id) in ids, user == self.admin)
+        response = self.client.get(self.url, {"size": "G", "color": ["Azul", "Preto"]})
+        self.assertEqual(
+            [item["id"] for item in response.data["results"]], [str(self.ativo.id)]
+        )
+
     def test_is_active_invalido_retorna_400(self):
         for user in (None, self.customer, self.admin):
             headers = auth_header(user) if user else {}
@@ -792,7 +825,11 @@ class ProductListContractTests(APITestCase):
 
     def test_each_variation_filter_and_unknown_values(self):
         ProductVariation.objects.create(
-            product=self.products[0], size="M", color="Azul", sku="FILTER-M"
+            product=self.products[0],
+            size="M",
+            color="Azul",
+            sku="FILTER-M",
+            stock_quantity=1,
         )
         for params, expected in (
             ({"size": "M"}, 1),
@@ -867,7 +904,11 @@ class ProductListContractTests(APITestCase):
             (self.products[9], "M", "Azul"),
         ):
             ProductVariation.objects.create(
-                product=product, size=size, color=color, sku=str(uuid.uuid4())
+                product=product,
+                size=size,
+                color=color,
+                sku=str(uuid.uuid4()),
+                stock_quantity=1,
             )
         body = self.client.get(
             self.url + "?size=M&color=Azul&color=Preto&min_price=10&max_price=11"
@@ -974,7 +1015,11 @@ class ProductListContractTests(APITestCase):
         for product in (winner, runner_up, invalid):
             variations[product.id] = [
                 ProductVariation.objects.create(
-                    product=product, size="M", color=color, sku=str(uuid.uuid4())
+                    product=product,
+                    size="M",
+                    color=color,
+                    sku=str(uuid.uuid4()),
+                    stock_quantity=1,
                 )
                 for color in ("Azul", "Preto")
             ]
@@ -1548,6 +1593,44 @@ class VariationCRUDTests(APITestCase):
         )
         self.create_url = f"/api/catalog/products/{self.product.id}/variations/"
         self.detail_url = f"/api/catalog/variations/{self.variation.id}/"
+
+    def test_color_normalization_create_update_and_catalog(self):
+        created = self.client.post(
+            self.create_url,
+            {"size": "M", "color": "  aZuL  ", "stock_quantity": 2},
+            format="json",
+            **auth_header(self.admin),
+        )
+        self.assertEqual(created.status_code, 201, created.data)
+        self.assertEqual(created.data["color"], "Azul")
+        updated = self.client.put(
+            self.detail_url,
+            {"color": "AZUL"},
+            format="json",
+            **auth_header(self.admin),
+        )
+        self.assertEqual(updated.status_code, 200, updated.data)
+        self.variation.refresh_from_db()
+        self.assertEqual(self.variation.color, "Azul")
+        for color in ("Azul", "azul", " AZUL "):
+            response = self.client.get("/api/catalog/products/", {"color": color})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(
+                [item["id"] for item in response.data["results"]],
+                [str(self.product.id)],
+            )
+        options = self.client.get("/api/catalog/products/filter-options/").data
+        self.assertEqual(options["colors"], ["Azul"])
+
+    def test_normalized_color_still_rejects_duplicate_combination(self):
+        create_variation(self.product, {"size": "M", "color": "Azul"})
+        response = self.client.post(
+            self.create_url,
+            {"size": "M", "color": " azul "},
+            format="json",
+            **auth_header(self.admin),
+        )
+        self.assertEqual(response.status_code, 400)
 
     def test_admin_cria_variacao(self):
         response = self.client.post(

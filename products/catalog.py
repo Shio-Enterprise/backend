@@ -1,6 +1,17 @@
 from uuid import UUID
 
-from django.db.models import Case, Exists, Max, Min, OuterRef, Q, Subquery, Sum, Value, When
+from django.db.models import (
+    Case,
+    Exists,
+    Max,
+    Min,
+    OuterRef,
+    Q,
+    Subquery,
+    Sum,
+    Value,
+    When,
+)
 from django.db.models.functions import Coalesce
 from rest_framework.pagination import PageNumberPagination
 
@@ -86,7 +97,7 @@ def recommend_products(product):
     )
 
 
-def filter_catalog(queryset, params):
+def filter_catalog(queryset, params, *, require_stock=False):
     """Aplica parâmetros já validados; tamanho e cor devem existir na mesma variação."""
     # Mantém compatibilidade com UUIDs existentes, mas aceita slug como contrato público da categoria.
     category = params.get("category")
@@ -119,6 +130,8 @@ def filter_catalog(queryset, params):
     if params.get("color"):
         variations["variations__color__in"] = params["color"]
     if variations:
+        if require_stock:
+            variations["variations__stock_quantity__gt"] = 0
         queryset = queryset.filter(**variations).distinct()
 
     ordering = params["ordering"]
