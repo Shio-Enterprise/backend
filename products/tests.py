@@ -243,35 +243,42 @@ class DropCampaignListCreateTests(APITestCase):
             launch_date=now - timedelta(days=60),
             end_date=now - timedelta(days=10),
         )
+        DropCampaign.objects.create(
+            name="Privado", slug="privado-listcreate", is_public=False, is_active=True,
+        )
 
     def test_listagem_publica_sem_autenticacao(self):
-        """Sem token, a visibilidade pública (issue #6) é aplicada automaticamente:
-        só retorna drops is_public+is_active dentro da janela de datas."""
+        """Sem token, a visibilidade pública (issue #6) só depende de is_public:
+        rascunho/programado/encerrado aparecem (só afetam is_sellable); só
+        is_public=False é ocultado."""
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         data = response.json()
-        self.assertEqual(data["count"], 1)
-        self.assertEqual(data["results"][0]["name"], "Verão 2026")
+        names = [d["name"] for d in data["results"]]
+        self.assertEqual(data["count"], 3)
+        self.assertIn("Verão 2026", names)
+        self.assertIn("Inativo", names)
+        self.assertIn("Já terminou", names)
+        self.assertNotIn("Privado", names)
 
     def test_active_true_e_irrelevante_para_publico_pois_ja_e_automatico(self):
-        """?active=true não é mais necessário: o público já recebe só o visível."""
+        """?active=true não é mais necessário: o público já recebe o filtro automático."""
         response = self.client.get(f"{self.url}?active=true")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        data = response.json()
-        self.assertEqual(data["count"], 1)
-        self.assertEqual(data["results"][0]["name"], "Verão 2026")
+        self.assertEqual(response.json()["count"], 3)
 
     def test_admin_ve_todos_os_drops_por_padrao(self):
-        """Admin não sofre o filtro automático — vê os 3 drops, incl. ocultos/encerrados."""
+        """Admin não sofre o filtro automático — vê os 4 drops, incl. o privado."""
         response = self.client.get(self.url, **auth_header(self.admin))
-        self.assertEqual(response.json()["count"], 3)
+        self.assertEqual(response.json()["count"], 4)
 
     def test_admin_com_visible_true_pre_visualiza_o_publico(self):
         """?visible=true para admin replica exatamente o que o público vê."""
         response = self.client.get(f"{self.url}?visible=true", **auth_header(self.admin))
         data = response.json()
-        self.assertEqual(data["count"], 1)
-        self.assertEqual(data["results"][0]["name"], "Verão 2026")
+        names = [d["name"] for d in data["results"]]
+        self.assertEqual(data["count"], 3)
+        self.assertNotIn("Privado", names)
 
     def test_admin_cria_drop_sem_banner(self):
         """POST de admin com payload JSON simples deve criar drop."""
@@ -1135,9 +1142,10 @@ class StockMovementTests(APITestCase):
 
 
 class DropVisibilityPolicyTests(APITestCase):
-    """Visível = is_public AND is_active AND dentro da janela de datas.
-    Um drop esgotado (max_quantity atingido) continua visível — só a compra
-    é bloqueada, testado em orders/tests.py."""
+    """Visível = só is_public. is_active, janela de datas e max_quantity NÃO
+    escondem o drop — só afetam is_sellable (se dá pra comprar). Rascunho,
+    Programado, Encerrado e Esgotado aparecem no catálogo com o botão de
+    compra desabilitado; só is_public=False (Privado) dá 404."""
 
     list_url = "/api/catalog/drops/"
 
@@ -1178,52 +1186,104 @@ class DropVisibilityPolicyTests(APITestCase):
             max_quantity=1,
         )
 
-    def test_listagem_publica_mostra_so_visiveis_mas_inclui_esgotado(self):
+    def test_listagem_publica_mostra_todos_menos_privado(self):
         response = self.client.get(self.list_url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         names = [d["name"] for d in response.json()["results"]]
 
         self.assertIn("Visível", names)
         self.assertIn("Esgotado", names)
+        self.assertIn("InativoPolicy", names)
+        self.assertIn("Futuro", names)
+        self.assertIn("Encerrado", names)
         self.assertNotIn("Privado", names)
-        self.assertNotIn("InativoPolicy", names)
-        self.assertNotIn("Futuro", names)
-        self.assertNotIn("Encerrado", names)
 
     def test_admin_ve_todos_os_6_drops_por_padrao(self):
         response = self.client.get(self.list_url, **auth_header(self.admin))
         self.assertEqual(response.json()["count"], 6)
 
-    def test_admin_com_visible_true_nao_ve_privado_nem_futuro(self):
+    def test_admin_com_visible_true_nao_ve_so_privado(self):
         response = self.client.get(
             f"{self.list_url}?visible=true", **auth_header(self.admin)
         )
         names = [d["name"] for d in response.json()["results"]]
         self.assertNotIn("Privado", names)
-        self.assertNotIn("Futuro", names)
-        self.assertNotIn("Encerrado", names)
-        self.assertNotIn("InativoPolicy", names)
+        self.assertIn("Futuro", names)
+        self.assertIn("Encerrado", names)
+        self.assertIn("InativoPolicy", names)
 
     def test_detalhe_publico_404_para_drop_privado(self):
         response = self.client.get(f"{self.list_url}{self.private_drop.id}/")
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
-    def test_detalhe_publico_404_para_drop_inativo(self):
+    def test_detalhe_publico_200_para_drop_inativo_mas_nao_vendavel(self):
+        """Rascunho (is_active=False) aparece no catálogo — só não é vendável."""
         response = self.client.get(f"{self.list_url}{self.inactive_drop.id}/")
-        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        self.assertTrue(data["is_visible"])
+        self.assertFalse(data["is_sellable"])
 
-    def test_detalhe_publico_404_para_drop_futuro(self):
+    def test_detalhe_publico_200_para_drop_futuro_mas_nao_vendavel(self):
         response = self.client.get(f"{self.list_url}{self.future_drop.id}/")
-        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        self.assertTrue(data["is_visible"])
+        self.assertFalse(data["is_sellable"])
 
-    def test_detalhe_publico_404_para_drop_encerrado(self):
+    def test_detalhe_publico_200_para_drop_encerrado_mas_nao_vendavel(self):
         response = self.client.get(f"{self.list_url}{self.ended_drop.id}/")
-        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        self.assertTrue(data["is_visible"])
+        self.assertFalse(data["is_sellable"])
 
     def test_detalhe_publico_200_para_drop_esgotado(self):
         """Esgotado continua visível — só não é vendável."""
         response = self.client.get(f"{self.list_url}{self.sold_out_drop.id}/")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        self.assertTrue(data["is_visible"])
+        # Ninguém comprou ainda: max_quantity=1 não foi atingido.
+        self.assertTrue(data["is_sellable"])
+
+    def test_drop_com_max_quantity_atingido_reporta_is_sellable_false(self):
+        """Depois de consumir o max_quantity, is_sellable vira False mas
+        is_visible continua True — o frontend usa esses dois campos da API
+        em vez de recalcular a política em JS."""
+        from orders.models import CustomerOrder, OrderItem, OrderStatus
+
+        product = Product.objects.create(
+            name="ProdutoEsgotadoPolicy",
+            description="x",
+            base_price=10,
+            drop=self.sold_out_drop,
+        )
+        variation = ProductVariation.objects.create(
+            product=product, size="U", sku="ESGOT-POLICY-1", stock_quantity=5
+        )
+        order = CustomerOrder.objects.create(
+            user=self.admin,
+            subtotal=10,
+            total_amount=10,
+            status=OrderStatus.PAID,
+            shipping_zip_code="71000000",
+            shipping_street="R",
+            shipping_number="1",
+            shipping_neighborhood="B",
+            shipping_city="C",
+            shipping_state="DF",
+        )
+        OrderItem.objects.create(
+            order=order, variation=variation, quantity=1, unit_price=10,
+            product_name="ProdutoEsgotadoPolicy - U",
+        )
+
+        response = self.client.get(f"{self.list_url}{self.sold_out_drop.id}/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        self.assertTrue(data["is_visible"])
+        self.assertFalse(data["is_sellable"])
 
     def test_admin_acessa_detalhe_de_drop_oculto(self):
         response = self.client.get(
@@ -1285,6 +1345,25 @@ class ProductVisibilityViaDropTests(APITestCase):
         names = [p["name"] for p in response.json()["results"]]
         self.assertNotIn("ComDropOcultoPV", names)
         self.assertIn("SemDropPV", names)
+
+    def test_produto_de_drop_rascunho_e_visivel_mas_nao_vendavel(self):
+        """Regressão: drop Rascunho (is_active=False) + Público continua
+        aparecendo no catálogo (200), só is_sellable é que fica False — o
+        botão de comprar/adicionar ao carrinho no front deve ficar desabilitado,
+        o produto não deve sumir da loja."""
+        draft_drop = DropCampaign.objects.create(
+            name="DropRascunhoPV", slug="droprascunho-pv", is_public=True, is_active=False,
+        )
+        product = make_product(name="ComDropRascunhoPV", drop=draft_drop)
+
+        list_response = self.client.get(self.products_url)
+        names = [p["name"] for p in list_response.json()["results"]]
+        self.assertIn("ComDropRascunhoPV", names)
+
+        detail_response = self.client.get(f"{self.products_url}{product.id}/")
+        self.assertEqual(detail_response.status_code, status.HTTP_200_OK)
+        data = detail_response.json()
+        self.assertFalse(data["is_sellable"])
 
 
 class DropDateCombinationValidationTests(APITestCase):

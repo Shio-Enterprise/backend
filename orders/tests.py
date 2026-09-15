@@ -1356,6 +1356,9 @@ class CartSellabilityTests(APITestCase):
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # O frontend usa este campo para decidir se bloqueia/remove o item do
+        # carrinho, em vez de recalcular a política de disponibilidade em JS.
+        self.assertTrue(response.json()["items"][0]["is_sellable"])
 
 
 class CheckoutRevalidationTests(APITestCase):
