@@ -73,8 +73,6 @@ def make_product(name="Camiseta", **kwargs):
     return Product.objects.create(name=name, **defaults)
 
 
-
-
 class CategoryListCreateTests(APITestCase):
     """Testes para GET/POST /api/catalog/categories/."""
 
@@ -142,8 +140,6 @@ class CategoryListCreateTests(APITestCase):
             **auth_header(self.admin),
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
-
 
 
 class CategoryDetailTests(APITestCase):
@@ -221,8 +217,6 @@ class CategoryDetailTests(APITestCase):
         """DELETE de utilizador não-admin deve retornar 403."""
         response = self.client.delete(self.url, **auth_header(self.customer))
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-
-
 
 
 class DropCampaignListCreateTests(APITestCase):
@@ -390,8 +384,6 @@ class DropCampaignListCreateTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
-
-
 class DropCampaignDetailTests(APITestCase):
     """Testes para GET/PUT/DELETE /api/catalog/drops/{id}/."""
 
@@ -486,8 +478,6 @@ class DropCampaignDetailTests(APITestCase):
         self.assertEqual(response.json()["slug"], "outono-2026")
 
 
-
-
 class DropProductManageTests(APITestCase):
     """Testes para POST/DELETE /api/catalog/drops/{drop_id}/products/{product_id}/."""
 
@@ -564,8 +554,6 @@ class DropProductManageTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
 
-
-
 class ProductListTests(APITestCase):
     """Testes para GET/POST /api/catalog/products/."""
 
@@ -628,12 +616,10 @@ class ProductListTests(APITestCase):
         response = self.client.get(self.url)
         results = response.json()["results"]
         ids_returned = [r["id"] for r in results]
-        
+
         self.assertEqual(
             ids_returned[0], str(Product.objects.get(name="Camisa Preta").id)
         )
-
-
 
 
 class ProductDetailTests(APITestCase):
@@ -676,7 +662,6 @@ class ProductDetailTests(APITestCase):
     def test_uuid_inexistente_404(self):
         response = self.client.get(f"/api/catalog/products/{uuid.uuid4()}/")
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
-
 
 
 class ProductCreateTests(APITestCase):
@@ -838,8 +823,6 @@ class ProductDeleteTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
 
-
-
 class VariationCRUDTests(APITestCase):
     def setUp(self):
         self.admin = make_user(
@@ -931,7 +914,6 @@ class VariationCRUDTests(APITestCase):
         self.variation.color = "Verde"
         self.variation.save()
         self.assertEqual(str(self.variation), f"{self.product.name} - P / Verde")
-
 
 
 def make_product_image_file(name="img.jpg"):
@@ -1048,7 +1030,6 @@ class ImagePersistTests(APITestCase):
             **auth_header(self.customer),
         )
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-
 
 
 class StockMovementTests(APITestCase):
@@ -1181,7 +1162,6 @@ class StockMovementTests(APITestCase):
     def test_sem_token_401(self):
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
-
 
 
 class CatalogDecisionTests(APITestCase):
@@ -1618,7 +1598,6 @@ class CatalogMigrationTests(TransactionTestCase):
         self.assertEqual(Variation.objects.get(pk=first.pk).stock_quantity, 4)
         self.assertEqual(Variation.objects.get(pk=second.pk).stock_quantity, 7)
         Variation.objects.filter(pk=second.pk).update(size="G")
-
 
 
 class InventoryConcurrencyTests(TransactionTestCase):

@@ -147,3 +147,14 @@ class Address(models.Model):
 
     def __str__(self):
         return f"{self.title} - {self.user.email}"
+
+
+class NewsletterSubscriber(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    email = models.EmailField(unique=True, verbose_name="Email")
+    consent_lgpd = models.BooleanField(default=False, verbose_name="Consentimento LGPD")
+    subscribed_at = models.DateTimeField(auto_now_add=True)
+    unsubscribed_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self):
+        return self.email

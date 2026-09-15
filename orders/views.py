@@ -52,6 +52,7 @@ from .services import (
     clear_cart,
     create_infinitepay_checkout,
     get_cart_data,
+    get_welcome_discount,
     remove_item_from_cart,
     restore_order_stock,
     update_item_quantity,
@@ -456,13 +457,16 @@ class CheckoutAPIView(APIView):
             return Response({"message": "Frete inválido."}, status=400)
         if not shipping_cost.is_finite() or shipping_cost < 0:
             return Response({"message": "Frete inválido."}, status=400)
-        total_amount = subtotal + shipping_cost
+        welcome_coupon, discount_amount = get_welcome_discount(user, subtotal)
+        total_amount = subtotal - discount_amount + shipping_cost
 
         order = CustomerOrder.objects.create(
             user=user,
             address=address,
+            coupon=welcome_coupon,
             subtotal=subtotal,
             shipping_cost=shipping_cost,
+            discount_amount=discount_amount,
             total_amount=total_amount,
             shipping_zip_code=address.zip_code,
             shipping_street=address.street,

@@ -47,13 +47,19 @@ class CepLookupView(APIView):
 
         try:
             raw_data = fetch_address_data_by_cep(cep_clean)
-            return Response(format_cep_address_response(raw_data), status=status.HTTP_200_OK)
+            return Response(
+                format_cep_address_response(raw_data), status=status.HTTP_200_OK
+            )
         except CorreiosCepNotFoundError:
             return Response(
                 {"message": f"CEP {cep} não encontrado."},
                 status=status.HTTP_404_NOT_FOUND,
             )
-        except (CorreiosAuthenticationError, CorreiosTrackingUnavailableError, Exception):
+        except (
+            CorreiosAuthenticationError,
+            CorreiosTrackingUnavailableError,
+            Exception,
+        ):
             logger.exception("Falha ao consultar CEP %s nos Correios", cep)
             return Response(
                 {"message": "Serviço de CEP temporariamente indisponível."},
@@ -78,7 +84,9 @@ class ShippingOptionsView(APIView):
             OpenApiParameter(name="cep_destino", type=OpenApiTypes.STR, required=True),
             OpenApiParameter(name="cep_origem", type=OpenApiTypes.STR, required=False),
             OpenApiParameter(name="peso", type=OpenApiTypes.STR, required=False),
-            OpenApiParameter(name="codigo_servico", type=OpenApiTypes.STR, required=False),
+            OpenApiParameter(
+                name="codigo_servico", type=OpenApiTypes.STR, required=False
+            ),
         ],
         responses={
             200: OpenApiTypes.OBJECT,
@@ -87,10 +95,14 @@ class ShippingOptionsView(APIView):
         },
     )
     def get(self, request):
-        cep_destino = request.query_params.get("cep_destino", "").replace("-", "").strip()
-        cep_origem = request.query_params.get(
-            "cep_origem", settings.CORREIOS_REMETENTE_CEP
-        ).replace("-", "").strip()
+        cep_destino = (
+            request.query_params.get("cep_destino", "").replace("-", "").strip()
+        )
+        cep_origem = (
+            request.query_params.get("cep_origem", settings.CORREIOS_REMETENTE_CEP)
+            .replace("-", "")
+            .strip()
+        )
         peso = request.query_params.get("peso", settings.CORREIOS_PESO_PADRAO_GRAMAS)
         codigo_servico = request.query_params.get(
             "codigo_servico", settings.CORREIOS_CODIGO_SERVICO
@@ -98,7 +110,9 @@ class ShippingOptionsView(APIView):
 
         if not cep_destino or len(cep_destino) != 8 or not cep_destino.isdigit():
             return Response(
-                {"message": "cep_destino é obrigatório e deve ter 8 dígitos numéricos."},
+                {
+                    "message": "cep_destino é obrigatório e deve ter 8 dígitos numéricos."
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -116,7 +130,9 @@ class ShippingOptionsView(APIView):
         except (CorreiosAuthenticationError, Exception):
             logger.exception("Falha ao calcular frete nos Correios")
             return Response(
-                {"message": "Serviço de cálculo de frete temporariamente indisponível."},
+                {
+                    "message": "Serviço de cálculo de frete temporariamente indisponível."
+                },
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
 
@@ -155,7 +171,9 @@ class AgencySearchView(APIView):
             size = int(request.query_params.get("size", 10))
         except ValueError:
             return Response(
-                {"message": "Os parâmetros 'page' e 'size' devem ser números inteiros."},
+                {
+                    "message": "Os parâmetros 'page' e 'size' devem ser números inteiros."
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -167,6 +185,8 @@ class AgencySearchView(APIView):
         except (CorreiosAuthenticationError, Exception):
             logger.exception("Falha ao buscar agências nos Correios")
             return Response(
-                {"message": "Serviço de busca de agências temporariamente indisponível."},
+                {
+                    "message": "Serviço de busca de agências temporariamente indisponível."
+                },
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
