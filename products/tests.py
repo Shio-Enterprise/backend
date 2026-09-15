@@ -1462,49 +1462,115 @@ class CheckoutDecisionTests(APITestCase):
             promo_start=now - timedelta(hours=2),
             promo_end=now - timedelta(hours=1),
         )
-        payload = {"address_id": str(self.address.pk), "confirmed_subtotal": "160.00"}
-        response = self.client.post(self.url, payload, format="json")
+        payload = {
+            "address_id": str(self.address.pk),
+            "confirmed_subtotal": "160.00",
+        }
+        response = self.client.post(
+            self.url,
+            payload,
+            format="json",
+        )
+
         self.assertEqual(response.status_code, 409, response.data)
         self.assertEqual(response.data["subtotal"], "200.00")
         self.assertFalse(CustomerOrder.objects.exists())
         self.assertFalse(StockMovement.objects.exists())
+
         gateway.assert_not_called()
+
         response = self.client.post(
-            self.url, {**payload, "confirmed_subtotal": "200.00"}, format="json"
+            self.url,
+            {
+                **payload,
+                "confirmed_subtotal": "200.00",
+            },
+            format="json",
         )
+
         self.assertEqual(response.status_code, 201, response.data)
+
         order = CustomerOrder.objects.get()
         sale = StockMovement.objects.get(reason="VENDA")
+
         self.assertEqual(sale.balance_after, 8)
         self.assertEqual(sale.origin_id, order.pk)
+
         self.assertEqual(sale.order_item.unit_price, Decimal("100.00"))
+
         Product.objects.filter(pk=self.product.pk).update(base_price=200)
+
         self.assertEqual(order.items.get().unit_price, Decimal("100.00"))
-        update_status(order, OrderStatus.CANCELED, changed_by=self.user)
-        update_status(order, OrderStatus.CANCELED, changed_by=self.user)
+
+        update_status(
+            order,
+            OrderStatus.CANCELED,
+            changed_by=self.user,
+        )
+
+        restore_order_stock(order, changed_by=self.user)
+        restore_order_stock(order, changed_by=self.user)
+
         self.variation.refresh_from_db()
+
         self.assertEqual(self.variation.stock_quantity, 10)
-        self.assertEqual(StockMovement.objects.filter(reason="DEVOLUCAO").count(), 1)
+        self.assertEqual(
+            StockMovement.objects.filter(
+                reason="DEVOLUCAO"
+            ).count(),
+            1,
+        )
 
     @patch(
         "orders.views.create_infinitepay_checkout",
         return_value="https://example.test/pay",
     )
     def test_shipped_cancel_waits_for_physical_return(self, gateway):
-        self.client.post(
+        response = self.client.post(
             self.url,
-            {"address_id": str(self.address.pk), "confirmed_subtotal": "200.00"},
+            {
+                "address_id": str(self.address.pk),
+                "confirmed_subtotal": "200.00",
+            },
             format="json",
         )
+
+        self.assertEqual(
+            response.status_code,
+            201,
+            response.data,
+        )
+
         order = CustomerOrder.objects.get()
+
+        update_status(order, OrderStatus.PAID)
+        update_status(order, OrderStatus.PREPARING)
         update_status(order, OrderStatus.SHIPPED, tracking_code="TRACK")
-        update_status(order, OrderStatus.CANCELED)
+
         self.variation.refresh_from_db()
+
         self.assertEqual(self.variation.stock_quantity, 8)
-        restore_order_stock(order, changed_by=self.user, physical_return=True)
-        restore_order_stock(order, changed_by=self.user, physical_return=True)
+        restore_order_stock(
+            order,
+            changed_by=self.user,
+            physical_return=True,
+        )
+
+        restore_order_stock(
+            order,
+            changed_by=self.user,
+            physical_return=True,
+        )
+
         self.variation.refresh_from_db()
+
         self.assertEqual(self.variation.stock_quantity, 10)
+        self.assertEqual(
+            StockMovement.objects.filter(
+                reason="DEVOLUCAO"
+            ).count(),
+            1,
+        )
 
     @patch(
         "orders.views.create_infinitepay_checkout",
