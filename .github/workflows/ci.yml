@@ -1,0 +1,45 @@
+name: Backend CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci:
+    name: Lint + Testes + Check
+    runs-on: ubuntu-latest
+
+    env:
+      DJANGO_SECRET_KEY: ci-test-secret-key-not-for-production
+      GOOGLE_CLIENT_ID: ci-test-google-client-id
+      SETTINGS_FILE_PATH: core.settings.test
+
+    steps:
+      - name: checkout do codigo
+        uses: actions/checkout@v4
+
+      - name: configurar python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Lint com ruff
+        run: ruff check .
+
+      - name: Verificar formatacao com ruff
+        run: ruff format --check .
+
+      - name: Django system check
+        run: python manage.py check --settings=core.settings.test
+
+      - name: verificar migrations pendentes
+        run: python manage.py makemigrations --check --dry-run --settings=core.settings.test
+
+      - name: rodar testes com Pytest
+        run: pytest --tb=short -q
