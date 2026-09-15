@@ -2,7 +2,7 @@ from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from django.contrib.auth.forms import UserChangeForm, UserCreationForm
 
-from .models import User
+from .models import NewsletterSubscriber, User
 
 
 class CustomUserCreationForm(UserCreationForm):
@@ -89,3 +89,11 @@ class UserAdmin(BaseUserAdmin):
             },
         ),
     )
+
+
+@admin.register(NewsletterSubscriber)
+class NewsletterSubscriberAdmin(admin.ModelAdmin):
+    list_display = ["email", "consent_lgpd", "subscribed_at", "unsubscribed_at"]
+    list_filter = ["consent_lgpd"]
+    search_fields = ["email"]
+    ordering = ["-subscribed_at"]

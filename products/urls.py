@@ -8,6 +8,7 @@ from .views import (
     DropCampaignListCreateView,
     DropProductManageView,
     ProductDetailView,
+    ProductDuplicateView,
     ProductImageCreateView,
     ProductImageDeleteView,
     ProductImageUpdateView,
