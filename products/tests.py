@@ -72,6 +72,14 @@ def make_product(name="Camiseta", **kwargs):
     return Product.objects.create(name=name, **defaults)
 
 
+def make_stocked_product(**kwargs):
+    product = make_product(**kwargs)
+    ProductVariation.objects.create(
+        product=product, sku=f"available-{product.id}", stock_quantity=1
+    )
+    return product
+
+
 # ─── List & Create ────────────────────────────────────────────────────────────
 
 
@@ -585,11 +593,16 @@ class ProductListTests(APITestCase):
         self.drop = DropCampaign.objects.create(
             name="Verão", slug="verao", is_active=True
         )
-        self.ativo = make_product(
+        self.ativo = make_stocked_product(
             name="Camisa Branca", category=self.category, drop=self.drop
         )
-        make_product(name="Camisa Preta", category=self.category)
-        self.inativo = make_product(name="Removido", is_active=False)
+        self.preto = make_stocked_product(name="Camisa Preta", category=self.category)
+        self.inativo = make_stocked_product(name="Removido", is_active=False)
+        self.sem_variacoes = make_product(name="Sem variações")
+        self.esgotado = make_product(name="Esgotado")
+        ProductVariation.objects.create(
+            product=self.esgotado, sku="esgotado", stock_quantity=0
+        )
 
     def test_listagem_publica_so_retorna_ativos(self):
         """Sem token, só produtos com is_active=True são retornados."""
@@ -601,9 +614,57 @@ class ProductListTests(APITestCase):
         self.assertNotIn("Removido", names)
 
     def test_admin_ve_inativos(self):
-        """Admin vê produtos inativos por default."""
+        """Admin vê produtos inativos e sem estoque por default."""
         response = self.client.get(self.url, **auth_header(self.admin))
-        self.assertEqual(response.json()["count"], 3)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = response.json()
+        self.assertEqual(body["count"], 5)
+        self.assertEqual(
+            {item["id"] for item in body["results"]},
+            {str(product.id) for product in Product.objects.all()},
+        )
+
+    def test_listagem_publica_exige_estoque_sem_duplicar_produtos(self):
+        for stock in (0, 2):
+            ProductVariation.objects.create(
+                product=self.ativo, sku=f"ativo-{stock}", stock_quantity=stock
+            )
+        for user in (None, self.customer):
+            headers = auth_header(user) if user else {}
+            for params in ({}, {"is_active": "true"}, {"is_active": "false"}):
+                with self.subTest(user=user, params=params):
+                    response = self.client.get(self.url, params, **headers)
+                    self.assertEqual(response.status_code, status.HTTP_200_OK)
+                    body = response.json()
+                    self.assertEqual(body["count"], 2)
+                    self.assertCountEqual(
+                        [item["id"] for item in body["results"]],
+                        [str(self.ativo.id), str(self.preto.id)],
+                    )
+
+    def test_is_active_invalido_retorna_400(self):
+        for user in (None, self.customer, self.admin):
+            headers = auth_header(user) if user else {}
+            for value in ("invalid", "", "2", "null"):
+                with self.subTest(user=user, value=value):
+                    response = self.client.get(
+                        self.url, {"is_active": value}, **headers
+                    )
+                    self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                    self.assertIn("is_active", response.json())
+
+    def test_admin_filtra_booleano_validado_sem_exigir_estoque(self):
+        headers = auth_header(self.admin)
+        for value, active in (("true", True), ("false", False), ("1", True), ("0", False)):
+            with self.subTest(value=value):
+                response = self.client.get(self.url, {"is_active": value}, **headers)
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                expected = {
+                    str(product.id) for product in Product.objects.filter(is_active=active)
+                }
+                body = response.json()
+                self.assertEqual(body["count"], len(expected))
+                self.assertEqual({item["id"] for item in body["results"]}, expected)
 
     def test_admin_filtra_is_active_false(self):
         """Admin pode passar ?is_active=false e ver só inativos."""
@@ -648,7 +709,7 @@ class ProductListContractTests(APITestCase):
     def setUp(self):
         self.category = Category.objects.create(name="Camisetas", slug="camisetas")
         self.products = [
-            make_product(
+            make_stocked_product(
                 name=f"Produto {index}",
                 category=self.category,
                 base_price=index,
@@ -678,8 +739,16 @@ class ProductListContractTests(APITestCase):
         self.assertEqual(page["results"][0]["id"], str(self.products[17].id))
 
     def test_page_size_is_capped(self):
-        Product.objects.bulk_create(
+        products = Product.objects.bulk_create(
             [Product(name=f"Extra {i}", base_price=1) for i in range(80)]
+        )
+        ProductVariation.objects.bulk_create(
+            [
+                ProductVariation(
+                    product=product, sku=f"available-{product.id}", stock_quantity=1
+                )
+                for product in products
+            ]
         )
         body = self.client.get(self.url, {"page_size": 999}).json()
         self.assertEqual(body["count"], 105)
@@ -688,7 +757,7 @@ class ProductListContractTests(APITestCase):
 
     def test_category_slug_uuid_and_unknown(self):
         other = Category.objects.create(name="Bonés", slug="bones")
-        make_product(category=other)
+        make_stocked_product(category=other)
         for category, count in (
             ("camisetas", 25),
             (str(self.category.id), 25),
@@ -701,7 +770,7 @@ class ProductListContractTests(APITestCase):
 
     def test_uuid_shaped_category_is_always_an_id(self):
         category = Category.objects.create(name="Slug UUID", slug=str(self.category.id))
-        make_product(category=category)
+        make_stocked_product(category=category)
         body = self.client.get(self.url, {"category": category.slug}).json()
         self.assertEqual(body["count"], 25)
 
@@ -779,7 +848,7 @@ class ProductListContractTests(APITestCase):
                 "colors": [],
             },
         )
-        make_product()
+        make_stocked_product()
         item = self.client.get(self.url).json()["results"][0]
         self.assertIsNone(item["category_details"])
         self.assertIsNone(item["drop_details"])
@@ -871,8 +940,16 @@ class ProductListContractTests(APITestCase):
                 "min_price",
                 "max_price",
                 "ordering",
+                "is_active",
             }.issubset(names)
         )
+        is_active_parameter = next(
+            parameter for parameter in operation["parameters"]
+            if parameter["name"] == "is_active"
+        )
+        self.assertEqual(is_active_parameter["in"], "query")
+        self.assertEqual(is_active_parameter["schema"]["type"], "boolean")
+        self.assertFalse(is_active_parameter.get("required", False))
         response_schema = operation["responses"]["200"]["content"]["application/json"][
             "schema"
         ]

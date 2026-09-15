@@ -1,7 +1,7 @@
 import logging
 
 from django.db import transaction
-from django.db.models import Max, Q, Sum
+from django.db.models import Exists, Max, OuterRef, Q, Sum
 from django.http import JsonResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -441,7 +441,8 @@ class ProductListCreateView(APIView):
         summary="Listar produtos",
         description=(
             "Lista paginada do catálogo. Endpoint público — só retorna produtos "
-            "com `is_active=True` para chamadas não autenticadas e clientes.\n\n"
+            "com `is_active=True` e ao menos uma variação com `stock_quantity > 0` "
+            "para chamadas não autenticadas e clientes.\n\n"
             "Categoria por slug; valores reconhecidos como UUID são sempre IDs legados. "
             "Drop por UUID. Busca sem distinção de maiúsculas em name/description. "
             "Cores exatas repetidas: `color=Preto&color=Azul`; tamanho e cor na mesma "
@@ -461,18 +462,25 @@ class ProductListCreateView(APIView):
         },
     )
     def get(self, request):
-        query = ProductListQuerySerializer(data=request.query_params)
+        # Evita tratar booleano ausente como checkbox HTML desmarcado.
+        params = request.query_params.dict()
+        if "color" in params:
+            params["color"] = request.query_params.getlist("color")
+        query = ProductListQuerySerializer(data=params)
         query.is_valid(raise_exception=True)
         qs = Product.objects.select_related("category", "drop").prefetch_related(
             "variations", "images"
         )
 
         is_admin = request.user.is_authenticated and getattr(request.user, "is_admin", False)
-        is_active_param = request.query_params.get("is_active")
+        is_active_param = query.validated_data.get("is_active")
         if is_admin and is_active_param is not None:
-            qs = qs.filter(is_active=is_active_param.lower() == "true")
+            qs = qs.filter(is_active=is_active_param)
         elif not is_admin:
-            qs = qs.filter(is_active=True)
+            available = ProductVariation.objects.filter(
+                product_id=OuterRef("pk"), stock_quantity__gt=0
+            )
+            qs = qs.filter(Exists(available), is_active=True)
 
         qs = filter_catalog(qs, query.validated_data)
         paginator = self.pagination_class()

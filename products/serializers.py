@@ -20,6 +20,7 @@ class CatalogPageQuerySerializer(serializers.Serializer):
 class ProductListQuerySerializer(CatalogPageQuerySerializer):
     """Valida a query antes de construir filtros ou executar a paginação."""
 
+    is_active = serializers.BooleanField(required=False)
     category = serializers.SlugField(max_length=150, required=False)
     drop = serializers.UUIDField(required=False)
     search = serializers.CharField(required=False, allow_blank=True)
