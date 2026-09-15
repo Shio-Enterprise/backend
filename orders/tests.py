@@ -73,7 +73,11 @@ class CheckoutAPITests(APITestCase):
         """Deve retornar 201, criar o pedido, finalizar o carrinho e deduzir estoque."""
         mock_create_checkout.return_value = "https://pay.infinitepay.io/mock-url"
 
-        payload = {"address_id": str(self.address.id), "shipping_cost": 15.00}
+        payload = {
+            "address_id": str(self.address.id),
+            "shipping_cost": 15.00,
+            "confirmed_subtotal": "200.00",
+        }
 
         response = self.client.post(self.url, payload, format="json")
 
@@ -97,7 +101,11 @@ class CheckoutAPITests(APITestCase):
         """Deve retornar 400 se o usuário não tiver itens no carrinho ativo."""
         self.cart.items.all().delete()
 
-        payload = {"address_id": str(self.address.id), "shipping_cost": 15.00}
+        payload = {
+            "address_id": str(self.address.id),
+            "shipping_cost": 15.00,
+            "confirmed_subtotal": "200.00",
+        }
 
         response = self.client.post(self.url, payload, format="json")
 
@@ -109,7 +117,11 @@ class CheckoutAPITests(APITestCase):
         self.cart_item.quantity = 20
         self.cart_item.save()
 
-        payload = {"address_id": str(self.address.id), "shipping_cost": 15.00}
+        payload = {
+            "address_id": str(self.address.id),
+            "shipping_cost": 15.00,
+            "confirmed_subtotal": "2000.00",
+        }
 
         response = self.client.post(self.url, payload, format="json")
 
@@ -126,7 +138,11 @@ class CheckoutAPITests(APITestCase):
         """Deve proteger o banco de dados se a API da InfinitePay cair."""
         mock_create_checkout.side_effect = Exception("InfinitePay Timeout")
 
-        payload = {"address_id": str(self.address.id), "shipping_cost": 15.00}
+        payload = {
+            "address_id": str(self.address.id),
+            "shipping_cost": 15.00,
+            "confirmed_subtotal": "200.00",
+        }
 
         response = self.client.post(self.url, payload, format="json")
 
@@ -140,7 +156,11 @@ class CheckoutAPITests(APITestCase):
     def test_primeira_compra_aplica_desconto_de_boas_vindas(self, mock_create_checkout):
         mock_create_checkout.return_value = "https://pay.infinitepay.io/mock-url"
 
-        payload = {"address_id": str(self.address.id), "shipping_cost": 15.00}
+        payload = {
+            "address_id": str(self.address.id),
+            "shipping_cost": 15.00,
+            "confirmed_subtotal": "200.00",
+        }
         response = self.client.post(self.url, payload, format="json")
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
@@ -160,7 +180,11 @@ class CheckoutAPITests(APITestCase):
             status=OrderStatus.PAID,
         )
 
-        payload = {"address_id": str(self.address.id), "shipping_cost": 15.00}
+        payload = {
+            "address_id": str(self.address.id),
+            "shipping_cost": 15.00,
+            "confirmed_subtotal": "200.00",
+        }
         response = self.client.post(self.url, payload, format="json")
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
@@ -238,7 +262,11 @@ class InfinitePayCardSimulationTests(APITestCase):
 
         response = self.client.post(
             self.checkout_url,
-            {"address_id": str(self.address.id), "shipping_cost": 15.00},
+            {
+                "address_id": str(self.address.id),
+                "shipping_cost": 15.00,
+                "confirmed_subtotal": "100.00",
+            },
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
