@@ -57,6 +57,7 @@ from .services import (
     restore_order_stock,
     update_item_quantity,
     update_status,
+    update_tracking_code,
 )
 
 User = get_user_model()
@@ -308,13 +309,32 @@ class AdminOrderDetailView(APIView):
             return Response(
                 {"message": "Retorno físico exige expedição anterior."}, status=400
             )
-        update_status(
-            order,
-            status_value,
-            changed_by=request.user,
-            tracking_code=tracking_code,
-            comment=comment,
-        )
+        
+        if (order.status == OrderStatus.SHIPPED and status_value == OrderStatus.SHIPPED):
+            update_tracking_code(
+                order=order,
+                tracking_code=tracking_code,
+                changed_by=request.user,
+                comment=comment,
+            )
+        else:
+            update_status(
+                order=order,
+                new_status=status_value,
+                tracking_code=tracking_code,
+                changed_by=request.user,
+                comment=comment,
+            )
+
+        if (
+            status_value == OrderStatus.CANCELED
+            and hasattr(order, "payment")
+            and order.payment
+        ):
+            if order.payment.status != PaymentStatus.PAID:
+                order.payment.status = PaymentStatus.FAILED
+                order.payment.save()
+
         if serializer.validated_data.get("physical_return_confirmed"):
             restore_order_stock(order, changed_by=request.user, physical_return=True)
 
@@ -580,8 +600,8 @@ class PaymentSuccessRedirectView(APIView):
                 order.payment.gateway_transaction_id = transaction_nsu
                 order.payment.status = PaymentStatus.PAID
                 order.payment.save()
-                order.status = OrderStatus.PAID
-                order.save()
+
+                update_status(order=order, new_status=OrderStatus.PAID)
 
         if order.status == OrderStatus.PAID:
             return Response(
@@ -700,13 +720,20 @@ class OrderTrackingView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        update_status(
-            order=order,
-            new_status=OrderStatus.SHIPPED,
-            changed_by=request.user,
-            tracking_code=tracking_code,
-            comment="Código de rastreio registado.",
-        )
+        if order.status == OrderStatus.PREPARING:
+            update_status(
+                order=order,
+                new_status=OrderStatus.SHIPPED,
+                tracking_code=tracking_code,
+                changed_by=request.user,
+            )
+
+        elif order.status == OrderStatus.SHIPPED:
+            update_tracking_code(
+                order=order,
+                tracking_code=tracking_code,
+                changed_by=request.user,
+            )
 
         return Response(
             {
@@ -747,7 +774,7 @@ class OrderDispatchView(APIView):
     )
     def post(self, request, order_id):
         order = (
-            CustomerOrder.objects.select_related("user", "user__profile")
+            CustomerOrder.objects.select_related("user", "user__profile", "payment")
             .filter(id=order_id)
             .first()
         )
@@ -757,15 +784,24 @@ class OrderDispatchView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        undispatchable_statuses = [
-            OrderStatus.DELIVERED,
-            OrderStatus.CANCELED,
-            OrderStatus.SHIPPED,
-        ]
-        if order.status in undispatchable_statuses:
+        if order.status != OrderStatus.PREPARING:
             return Response(
                 {
                     "message": f"Pedido com status '{order.status}' não pode ser despachado."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if (
+            not hasattr(order, "payment")
+            or order.payment.status != PaymentStatus.PAID
+        ):
+            return Response(
+                {
+                    "message": (
+                        "Pedido sem pagamento confirmado "
+                        "não pode ser despachado."
+                    )
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
@@ -807,13 +843,6 @@ class OrderDispatchView(APIView):
             new_status=OrderStatus.SHIPPED,
             changed_by=request.user,
             tracking_code=tracking_code,
-            comment="Despacho automático via pré-postagem Correios.",
-        )
-
-        OrderStatusLog.objects.create(
-            order=order,
-            changed_by=request.user,
-            new_status=OrderStatus.SHIPPED,
             comment=f"Pedido despachado automaticamente via Correios. Código de rastreio: {tracking_code}",
         )
 

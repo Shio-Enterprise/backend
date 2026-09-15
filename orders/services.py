@@ -9,6 +9,8 @@ from django.db import models, transaction
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 
+from rest_framework.exceptions import ValidationError
+
 from orders.models import (
     Cart,
     CartItem,
@@ -21,6 +23,24 @@ from orders.models import (
 )
 from products.models import ProductVariation, StockMovement
 from products.services import move_stock
+
+ALLOWED_TRANSITIONS = {
+    OrderStatus.AWAITING_PAYMENT: {
+        OrderStatus.PAID,
+        OrderStatus.CANCELED,
+    },
+    OrderStatus.PAID: {
+        OrderStatus.PREPARING,
+    },
+    OrderStatus.PREPARING: {
+        OrderStatus.SHIPPED,
+    },
+    OrderStatus.SHIPPED: {
+        OrderStatus.DELIVERED,
+    },
+    OrderStatus.DELIVERED: set(),
+    OrderStatus.CANCELED: set(),
+}
 
 
 def create_infinitepay_checkout(order, request):
@@ -102,8 +122,6 @@ def create_infinitepay_checkout(order, request):
 
     payment.status = PaymentStatus.PROCESSING
     payment.save()
-    order.status = OrderStatus.AWAITING_PAYMENT
-    order.save()
 
     return data.get("url")
 
@@ -429,6 +447,16 @@ def update_status(order, new_status, changed_by=None, tracking_code=None, commen
         if not shipped:
             restore_order_stock(order, changed_by=changed_by)
 
+    allowed = ALLOWED_TRANSITIONS.get(previous_status, set())
+
+    if new_status not in allowed:
+        raise ValidationError({
+            "status": (
+                f"Transição inválida: "
+                f"{previous_status} -> {new_status}."
+            )
+        })
+
     if tracking_code:
         order.tracking_code = tracking_code
 
@@ -443,7 +471,7 @@ def update_status(order, new_status, changed_by=None, tracking_code=None, commen
     if new_status == OrderStatus.CANCELED and payment:
         if payment.status != PaymentStatus.PAID:
             payment.status = PaymentStatus.FAILED
-            payment.save()
+            payment.save(update_fields=["status"])
 
     OrderStatusLog.objects.create(
         order=order,
@@ -453,6 +481,28 @@ def update_status(order, new_status, changed_by=None, tracking_code=None, commen
         tracking_code=tracking_code,
         comment=comment,
     )
+
+    return order
+
+
+def update_tracking_code(order, tracking_code, changed_by=None, comment=None):
+    if order.status != OrderStatus.SHIPPED:
+        raise ValidationError({
+            "tracking_code": (
+                "O código de rastreio só pode ser alterado "
+                "em pedidos enviados."
+            )
+        })
+
+    if not tracking_code or not tracking_code.strip():
+        raise ValidationError({
+            "tracking_code": "O código de rastreio é obrigatório."
+        })
+
+    order.tracking_code = tracking_code
+    order.save(update_fields=["tracking_code", "updated_at"])
+
+    return order
 
 
 @transaction.atomic

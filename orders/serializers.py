@@ -93,7 +93,15 @@ class OrderDetailSerializer(serializers.ModelSerializer):
     items = SimpleOrderItemSerializer(many=True)
     payment = PaymentSerializer(read_only=True)
     user = AdminUserSerializer(read_only=True)
-    status_logs = OrderStatusLogSerializer(many=True, read_only=True)
+    status_logs = serializers.SerializerMethodField()
+
+    def get_status_logs(self, obj):
+        logs = obj.status_logs.order_by("created_at")
+
+        return OrderStatusLogSerializer(
+            logs,
+            many=True,
+        ).data
 
     class Meta:
         model = CustomerOrder
