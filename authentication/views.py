@@ -1,10 +1,19 @@
 import logging
+from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.db import models
-from django.db.models import Count, Max, Sum
+from django.db.models import (
+    Count,
+    F,
+    IntegerField,
+    Max,
+    OuterRef,
+    Subquery,
+    Sum,
+    Value,
+)
 from django.db.models.functions import Coalesce
-from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import (
     OpenApiExample,
     OpenApiResponse,
@@ -17,6 +26,7 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from authentication.signals import google_login_completed
+from orders.models import CustomerOrder, OrderStatus, PaymentStatus
 
 from .models import NewsletterSubscriber
 from .permissions import IsStaffOrSuperUser
@@ -518,7 +528,6 @@ class CustomerCRMViewSet(viewsets.ReadOnlyModelViewSet):
 
     permission_classes = [IsStaffOrSuperUser]
     filter_backends = [
-        DjangoFilterBackend,
         filters.OrderingFilter,
         filters.SearchFilter,
     ]
@@ -532,26 +541,38 @@ class CustomerCRMViewSet(viewsets.ReadOnlyModelViewSet):
     ]
     ordering = ["-created_at"]
 
-    filterset_fields = {
-        "created_at": ["gte", "lte", "exact"],
-    }
-
     def get_queryset(self):
+        base_orders = CustomerOrder.objects.filter(user=OuterRef("pk"))
+
+        sales_orders = base_orders.filter(
+            status=OrderStatus.DELIVERED,
+            payment__status=PaymentStatus.PAID,
+        ).distinct()
+        refunded_orders = base_orders.filter(payment__status=PaymentStatus.REFUNDED).distinct()
+        money_field = models.DecimalField(max_digits=14, decimal_places=2)
+        sales_group = sales_orders.values("user")
+        refund_group = refunded_orders.values("user")
         qs = User.objects.filter(profile__role="CUSTOMER").annotate(
-            total_orders=Count("orders"),
-            total_spent=Coalesce(
-                Sum("orders__total_amount"), 0.0, output_field=models.DecimalField()
+            total_orders=Coalesce(
+                Subquery(sales_group.annotate(value=Count("id")).values("value")[:1]),
+                Value(0), output_field=IntegerField(),
             ),
-            last_purchase_date=Max("orders__created_at"),
+            positive_spent=Coalesce(
+                Subquery(sales_group.annotate(value=Sum("total_amount")).values("value")[:1]),
+                Value(Decimal("0")), output_field=money_field,
+            ),
+            refunded_spent=Coalesce(
+                Subquery(refund_group.annotate(value=Sum("total_amount")).values("value")[:1]),
+                Value(Decimal("0")), output_field=money_field,
+            ),
+            total_spent=F("positive_spent") - F("refunded_spent"),
+            last_purchase_date=Subquery(
+                sales_group.annotate(value=Max("payment__paid_at")).values("value")[:1]
+            ),
         )
 
-        min_freq = self.request.query_params.get("min_frequency")
-        max_freq = self.request.query_params.get("max_frequency")
-
-        if min_freq is not None:
-            qs = qs.filter(total_orders__gte=min_freq)
-        if max_freq is not None:
-            qs = qs.filter(total_orders__lte=max_freq)
+        if self.request.query_params.get("customer"):
+            qs = qs.filter(id=self.request.query_params["customer"])
 
         return qs
 

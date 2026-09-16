@@ -10,13 +10,24 @@ User = get_user_model()
 
 class DashboardRecentOrderSerializer(serializers.ModelSerializer):
     customer_name = serializers.SerializerMethodField()
+    paid_at = serializers.DateTimeField(source="payment.paid_at", read_only=True)
+    payment_status = serializers.CharField(source="payment.status", read_only=True)
+    revenue_value = serializers.SerializerMethodField()
 
     class Meta:
         model = CustomerOrder
-        fields = ["id", "customer_name", "total_amount", "status", "created_at"]
+        fields = [
+            "id", "customer_name", "total_amount", "status", "payment_status",
+            "paid_at", "created_at", "revenue_value",
+        ]
 
     def get_customer_name(self, obj) -> str:
         return getattr(obj.user, "name", None) or obj.user.email
+
+    def get_revenue_value(self, obj) -> str:
+        from .metrics import revenue_value
+
+        return f"{revenue_value(obj):.2f}"
 
 
 class DashboardLowStockSerializer(serializers.ModelSerializer):
@@ -52,6 +63,7 @@ class PaymentSerializer(serializers.ModelSerializer):
             "installment_value",
             "gateway_transaction_id",
             "qrcode_pix",
+            "paid_at",
             "created_at",
         ]
 

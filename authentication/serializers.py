@@ -163,9 +163,29 @@ class AddressSerializer(serializers.ModelSerializer):
 class CustomerOrderHistorySerializer(serializers.ModelSerializer):
     """Serializer do histórico de compras para o CRM."""
 
+    payment_status = serializers.CharField(source="payment.status", read_only=True)
+    paid_at = serializers.DateTimeField(source="payment.paid_at", read_only=True)
+    commercial_status = serializers.SerializerMethodField()
+
     class Meta:
         model = CustomerOrder
-        fields = ["id", "status", "total_amount", "created_at", "tracking_code"]
+        fields = [
+            "id", "status", "payment_status", "commercial_status", "total_amount",
+            "paid_at", "created_at", "tracking_code",
+        ]
+
+    def get_commercial_status(self, obj) -> str:
+        from orders.models import OrderStatus, PaymentStatus
+
+        if getattr(obj, "payment", None) and obj.payment.status == PaymentStatus.REFUNDED:
+            return "REFUNDED"
+        if (
+            obj.status == OrderStatus.DELIVERED
+            and getattr(obj, "payment", None)
+            and obj.payment.status == PaymentStatus.PAID
+        ):
+            return "VALID_SALE"
+        return "NOT_REVENUE"
 
 
 class CustomerCRMSerializer(serializers.ModelSerializer):
@@ -176,6 +196,7 @@ class CustomerCRMSerializer(serializers.ModelSerializer):
         max_digits=10, decimal_places=2, read_only=True
     )
     last_purchase_date = serializers.DateTimeField(read_only=True)
+    is_recurring = serializers.SerializerMethodField()
 
     class Meta:
         model = User
@@ -187,7 +208,13 @@ class CustomerCRMSerializer(serializers.ModelSerializer):
             "total_orders",
             "total_spent",
             "last_purchase_date",
+            "is_recurring",
         ]
+
+    def get_is_recurring(self, obj) -> bool:
+        from orders.metrics import is_recurring_customer
+
+        return is_recurring_customer(obj)
 
 
 class CustomerCRMDetailSerializer(CustomerCRMSerializer):
@@ -199,7 +226,7 @@ class CustomerCRMDetailSerializer(CustomerCRMSerializer):
         fields = CustomerCRMSerializer.Meta.fields + ["order_history"]
 
     def get_order_history(self, obj) -> list:
-        orders = obj.orders.all().order_by("-created_at")
+        orders = obj.orders.select_related("payment").all().order_by("-created_at")
         return CustomerOrderHistorySerializer(orders, many=True).data
 
 
