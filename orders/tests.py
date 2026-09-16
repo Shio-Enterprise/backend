@@ -713,6 +713,7 @@ class OrderDispatchViewTests(APITestCase):
         self.assertEqual(self.order.status, OrderStatus.SHIPPED)
 
         from orders.models import OrderStatusLog
+
         log = OrderStatusLog.objects.filter(order=self.order).first()
         self.assertIsNotNone(log)
         self.assertEqual(log.new_status, OrderStatus.SHIPPED)
@@ -813,6 +814,7 @@ class CepLookupViewTests(APITestCase):
     @patch("orders.correios_views.fetch_address_data_by_cep")
     def test_cep_inexistente_retorna_404(self, mock_fetch):
         from orders.correios import CorreiosCepNotFoundError
+
         mock_fetch.side_effect = CorreiosCepNotFoundError("CEP não encontrado")
 
         response = self.client.get(self.cep_url("00000000"))
@@ -829,7 +831,9 @@ class CepLookupViewTests(APITestCase):
 class ShippingOptionsViewTests(APITestCase):
     def setUp(self):
         self.user = User.objects.create_user(
-            email="frete_user@shio.com", name="Usuario Frete", password="senha_forte_123"
+            email="frete_user@shio.com",
+            name="Usuario Frete",
+            password="senha_forte_123",
         )
         self.url = "/api/orders/correios/frete/"
 

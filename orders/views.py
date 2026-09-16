@@ -666,7 +666,7 @@ class OrderDispatchView(APIView):
             "Restrito a administradores. Use este endpoint em vez do PATCH de rastreio manual "
             "quando quiser que o sistema gere o código automaticamente."
         ),
-        request=None, 
+        request=None,
         responses={
             200: OpenApiTypes.OBJECT,
             400: OpenApiTypes.OBJECT,
@@ -887,5 +887,3 @@ class CartItemDetailAPIView(APIView):
         return Response(
             CartRepresentationSerializer(cart_data).data, status=status.HTTP_200_OK
         )
-
-

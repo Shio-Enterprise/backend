@@ -25,10 +25,10 @@ from .serializers import (
     CustomerCRMSerializer,
     GoogleAuthSerializer,
     LogoutInputSerializer,
+    PasswordLoginSerializer,
+    RegisterSerializer,
     TokenRefreshInputSerializer,
     UserSerializer,
-    RegisterSerializer,
-    PasswordLoginSerializer,
 )
 from .services import GoogleAuthService, InvalidGoogleTokenException
 
@@ -240,7 +240,9 @@ class PasswordLoginView(APIView):
     authentication_classes = []
 
     def post(self, request):
-        serializer = PasswordLoginSerializer(data=request.data, context={"request": request})
+        serializer = PasswordLoginSerializer(
+            data=request.data, context={"request": request}
+        )
         if serializer.is_valid():
             user = serializer.validated_data["user"]
             tokens = get_tokens_for_user(user)
@@ -309,10 +311,10 @@ class TokenRefreshView(APIView):
             token.blacklist()
             user = User.objects.get(id=token["user_id"])
             new_token = RefreshToken.for_user(user)
-            return Response({
-                "access": str(new_token.access_token),
-                "refresh": str(new_token)
-            }, status=status.HTTP_200_OK)
+            return Response(
+                {"access": str(new_token.access_token), "refresh": str(new_token)},
+                status=status.HTTP_200_OK,
+            )
         except Exception as e:
             logger.warning(f"Refresh token inválido: {e}")
             return Response(
@@ -447,7 +449,10 @@ class MeView(APIView):
             serializer.save()
         except models.IntegrityError as exc:
             return Response(
-                {"error": "Erro de integridade ao atualizar o perfil.", "details": str(exc)},
+                {
+                    "error": "Erro de integridade ao atualizar o perfil.",
+                    "details": str(exc),
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -481,7 +486,10 @@ class AddressDetailView(APIView):
     def patch(self, request, pk):
         address = self.get_object(request, pk)
         if not address:
-            return Response({"message": "Endereço não encontrado."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"message": "Endereço não encontrado."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
 
         serializer = AddressSerializer(address, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
@@ -495,7 +503,10 @@ class AddressDetailView(APIView):
     def delete(self, request, pk):
         address = self.get_object(request, pk)
         if not address:
-            return Response({"message": "Endereço não encontrado."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"message": "Endereço não encontrado."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
         address.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 

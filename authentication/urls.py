@@ -8,9 +8,9 @@ from .views import (
     GoogleLoginView,
     LogoutView,
     MeView,
-    TokenRefreshView,
-    RegisterView,
     PasswordLoginView,
+    RegisterView,
+    TokenRefreshView,
 )
 
 app_name = "authentication"
