@@ -114,6 +114,15 @@ class OrderItem(models.Model):
     sku_snapshot = models.CharField(max_length=100, null=True, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            old = type(self).objects.get(pk=self.pk)
+            if old.unit_price != self.unit_price:
+                from django.core.exceptions import ValidationError
+
+                raise ValidationError("Preço contratado é imutável.")
+        super().save(*args, **kwargs)
+
 
 class Payment(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

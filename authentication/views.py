@@ -28,6 +28,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from authentication.signals import google_login_completed
 from orders.models import CustomerOrder, OrderStatus, PaymentStatus
 
+from .models import NewsletterSubscriber
 from .permissions import IsStaffOrSuperUser
 from .serializers import (
     AddressSerializer,
@@ -35,6 +36,7 @@ from .serializers import (
     CustomerCRMSerializer,
     GoogleAuthSerializer,
     LogoutInputSerializer,
+    NewsletterSubscribeSerializer,
     PasswordLoginSerializer,
     RegisterSerializer,
     TokenRefreshInputSerializer,
@@ -250,7 +252,9 @@ class PasswordLoginView(APIView):
     authentication_classes = []
 
     def post(self, request):
-        serializer = PasswordLoginSerializer(data=request.data, context={"request": request})
+        serializer = PasswordLoginSerializer(
+            data=request.data, context={"request": request}
+        )
         if serializer.is_valid():
             user = serializer.validated_data["user"]
             tokens = get_tokens_for_user(user)
@@ -319,10 +323,10 @@ class TokenRefreshView(APIView):
             token.blacklist()
             user = User.objects.get(id=token["user_id"])
             new_token = RefreshToken.for_user(user)
-            return Response({
-                "access": str(new_token.access_token),
-                "refresh": str(new_token)
-            }, status=status.HTTP_200_OK)
+            return Response(
+                {"access": str(new_token.access_token), "refresh": str(new_token)},
+                status=status.HTTP_200_OK,
+            )
         except Exception as e:
             logger.warning(f"Refresh token inválido: {e}")
             return Response(
@@ -457,7 +461,10 @@ class MeView(APIView):
             serializer.save()
         except models.IntegrityError as exc:
             return Response(
-                {"error": "Erro de integridade ao atualizar o perfil.", "details": str(exc)},
+                {
+                    "error": "Erro de integridade ao atualizar o perfil.",
+                    "details": str(exc),
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -491,7 +498,10 @@ class AddressDetailView(APIView):
     def patch(self, request, pk):
         address = self.get_object(request, pk)
         if not address:
-            return Response({"message": "Endereço não encontrado."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"message": "Endereço não encontrado."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
 
         serializer = AddressSerializer(address, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
@@ -505,7 +515,10 @@ class AddressDetailView(APIView):
     def delete(self, request, pk):
         address = self.get_object(request, pk)
         if not address:
-            return Response({"message": "Endereço não encontrado."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"message": "Endereço não encontrado."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
         address.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -567,3 +580,42 @@ class CustomerCRMViewSet(viewsets.ReadOnlyModelViewSet):
         if self.action == "retrieve":
             return CustomerCRMDetailSerializer
         return CustomerCRMSerializer
+
+
+class NewsletterSubscribeView(APIView):
+    """Inscrição pública na newsletter, com consentimento LGPD obrigatório."""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+    serializer_class = NewsletterSubscribeSerializer
+
+    def post(self, request):
+        serializer = NewsletterSubscribeSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        email = serializer.validated_data["email"]
+        # get_or_create em vez de filter().first() + create(): duas requisições
+        # concorrentes com o mesmo e-mail novo passariam ambas pela checagem e a
+        # segunda estouraria IntegrityError (500) na coluna única `email`.
+        subscriber, created = NewsletterSubscriber.objects.get_or_create(
+            email=email, defaults={"consent_lgpd": True}
+        )
+
+        if not created:
+            # Ao reenviar o formulário o usuário reconsente explicitamente:
+            # reativa a inscrição independentemente do consent_lgpd atual.
+            changed = (
+                not subscriber.consent_lgpd or subscriber.unsubscribed_at is not None
+            )
+            if changed:
+                subscriber.consent_lgpd = True
+                subscriber.unsubscribed_at = None
+                subscriber.save(update_fields=["consent_lgpd", "unsubscribed_at"])
+            return Response(
+                {"message": "E-mail já inscrito."}, status=status.HTTP_200_OK
+            )
+
+        return Response(
+            {"message": "Inscrito com sucesso!"}, status=status.HTTP_201_CREATED
+        )

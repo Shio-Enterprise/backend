@@ -34,13 +34,13 @@ class UserSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = [
-            "id", 
-            "email", 
-            "is_staff", 
+            "id",
+            "email",
+            "is_staff",
             "is_superuser",
             "is_admin",
-            "created_at", 
-            "updated_at"
+            "created_at",
+            "updated_at",
         ]
 
     def update(self, instance, validated_data):
@@ -85,18 +85,26 @@ class PasswordLoginSerializer(serializers.Serializer):
         password = attrs.get("password")
 
         if email and password:
-            user = authenticate(request=self.context.get("request"), email=email, password=password)
+            user = authenticate(
+                request=self.context.get("request"), email=email, password=password
+            )
             if not user:
-                raise serializers.ValidationError("Credenciais inválidas.", code="authorization")
+                raise serializers.ValidationError(
+                    "Credenciais inválidas.", code="authorization"
+                )
         else:
-            raise serializers.ValidationError("Email e password são obrigatórios.", code="authorization")
+            raise serializers.ValidationError(
+                "Email e password são obrigatórios.", code="authorization"
+            )
 
         attrs["user"] = user
         return attrs
 
 
 class RegisterSerializer(serializers.ModelSerializer):
-    password = serializers.CharField(write_only=True, required=True, validators=[validate_password])
+    password = serializers.CharField(
+        write_only=True, required=True, validators=[validate_password]
+    )
     name = serializers.CharField(required=True)
 
     class Meta:
@@ -108,7 +116,7 @@ class RegisterSerializer(serializers.ModelSerializer):
             email=validated_data["email"],
             name=validated_data["name"],
             password=validated_data["password"],
-            is_new_user=True
+            is_new_user=True,
         )
         return user
 
@@ -220,3 +228,15 @@ class CustomerCRMDetailSerializer(CustomerCRMSerializer):
     def get_order_history(self, obj) -> list:
         orders = obj.orders.select_related("payment").all().order_by("-created_at")
         return CustomerOrderHistorySerializer(orders, many=True).data
+
+
+class NewsletterSubscribeSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+    consent_lgpd = serializers.BooleanField()
+
+    def validate_consent_lgpd(self, value):
+        if not value:
+            raise serializers.ValidationError(
+                "É necessário aceitar o consentimento para se inscrever."
+            )
+        return value

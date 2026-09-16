@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
+from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from rest_framework import status
 from rest_framework.test import APITestCase
@@ -19,7 +20,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from orders.models import CustomerOrder, OrderStatus, Payment, PaymentStatus
 
-from .models import UserProfile, UserRole
+from .models import NewsletterSubscriber, UserProfile, UserRole
 from .services import GoogleAuthService, InvalidGoogleTokenException
 
 User = get_user_model()
@@ -448,3 +449,111 @@ class LogoutViewTests(APITestCase):
         self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.access}")
         response = self.client.post(self.url, {}, format="json")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class NewsletterSubscriberModelTests(TestCase):
+    def test_cria_assinante_com_consentimento(self):
+        subscriber = NewsletterSubscriber.objects.create(
+            email="fan@shio.com", consent_lgpd=True
+        )
+        self.assertTrue(subscriber.consent_lgpd)
+        self.assertIsNotNone(subscriber.subscribed_at)
+
+    def test_email_e_unico(self):
+        NewsletterSubscriber.objects.create(email="dup@shio.com", consent_lgpd=True)
+        with self.assertRaises(Exception):
+            NewsletterSubscriber.objects.create(email="dup@shio.com", consent_lgpd=True)
+
+
+class NewsletterSubscribeAPITests(APITestCase):
+    def setUp(self):
+        self.url = "/api/auth/newsletter/subscribe/"
+
+    def test_inscricao_com_consentimento_retorna_201(self):
+        response = self.client.post(
+            self.url, {"email": "novo@shio.com", "consent_lgpd": True}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(
+            NewsletterSubscriber.objects.filter(email="novo@shio.com").exists()
+        )
+
+    def test_inscricao_sem_consentimento_retorna_400(self):
+        response = self.client.post(
+            self.url,
+            {"email": "semconsentimento@shio.com", "consent_lgpd": False},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(
+            NewsletterSubscriber.objects.filter(
+                email="semconsentimento@shio.com"
+            ).exists()
+        )
+
+    def test_email_invalido_retorna_400(self):
+        response = self.client.post(
+            self.url, {"email": "nao-e-email", "consent_lgpd": True}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_reinscricao_de_email_existente_retorna_200_sem_duplicar(self):
+        NewsletterSubscriber.objects.create(email="ja@shio.com", consent_lgpd=True)
+        response = self.client.post(
+            self.url, {"email": "ja@shio.com", "consent_lgpd": True}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            NewsletterSubscriber.objects.filter(email="ja@shio.com").count(), 1
+        )
+
+    def test_reinscricao_reativa_quem_havia_cancelado_mantendo_consentimento(self):
+        """Quem cancelou a inscrição (unsubscribed_at preenchido) mas manteve
+        consent_lgpd=True deve ser reativado ao se inscrever de novo."""
+        subscriber = NewsletterSubscriber.objects.create(
+            email="voltou@shio.com", consent_lgpd=True
+        )
+        subscriber.unsubscribed_at = timezone.now()
+        subscriber.save()
+
+        response = self.client.post(
+            self.url, {"email": "voltou@shio.com", "consent_lgpd": True}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        subscriber.refresh_from_db()
+        self.assertIsNone(subscriber.unsubscribed_at)
+        self.assertTrue(subscriber.consent_lgpd)
+
+    def test_reinscricao_de_quem_havia_revogado_consentimento_reativa(self):
+        subscriber = NewsletterSubscriber.objects.create(
+            email="revogou@shio.com", consent_lgpd=False
+        )
+        subscriber.unsubscribed_at = timezone.now()
+        subscriber.save()
+
+        response = self.client.post(
+            self.url, {"email": "revogou@shio.com", "consent_lgpd": True}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        subscriber.refresh_from_db()
+        self.assertTrue(subscriber.consent_lgpd)
+        self.assertIsNone(subscriber.unsubscribed_at)
+
+    def test_reinscricao_de_assinante_ativo_nao_faz_escrita_desnecessaria(self):
+        subscriber = NewsletterSubscriber.objects.create(
+            email="ativo@shio.com", consent_lgpd=True
+        )
+
+        with patch.object(NewsletterSubscriber, "save") as mock_save:
+            response = self.client.post(
+                self.url,
+                {"email": "ativo@shio.com", "consent_lgpd": True},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        mock_save.assert_not_called()
+        subscriber.refresh_from_db()
+        self.assertTrue(subscriber.consent_lgpd)

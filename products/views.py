@@ -1,12 +1,16 @@
 import logging
+import uuid
 
+from django.core.files.base import ContentFile
 from django.db import transaction
-from django.db.models import Max, Q, Sum
+from django.db.models import Exists, Max, OuterRef, Q, Sum
+from django.db.models.deletion import ProtectedError
 from django.http import JsonResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from drf_spectacular.utils import OpenApiResponse, extend_schema
 from rest_framework import status
+from rest_framework.exceptions import ValidationError
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import AllowAny
@@ -15,20 +19,30 @@ from rest_framework.views import APIView
 
 from authentication.permissions import IsStaffOrSuperUser
 
+from .catalog import (
+    CatalogPagination,
+    RecommendationPagination,
+    catalog_filter_options,
+    filter_catalog,
+    recommend_products,
+)
 from .models import (
     Category,
     DropCampaign,
     Product,
     ProductImage,
     ProductVariation,
-    StockMovementKind,
 )
 from .serializers import (
+    CatalogFilterOptionsSerializer,
+    CatalogPageQuerySerializer,
     CategorySerializer,
     DropCampaignDetailSerializer,
     DropCampaignSerializer,
     ProductDetailSerializer,
+    ProductDuplicateSerializer,
     ProductImageSerializer,
+    ProductListQuerySerializer,
     ProductListSerializer,
     ProductVariationSerializer,
     ProductWriteSerializer,
@@ -396,8 +410,23 @@ class DropProductManageView(APIView):
 # ─── Products ─────────────────────────────────────────────────────────────────
 
 
+class CatalogFilterOptionsView(APIView):
+    permission_classes = [AllowAny]
+
+    @extend_schema(
+        tags=["Products"],
+        summary="Opções de filtros do catálogo público",
+        description="Preços, tamanhos e cores de todos os produtos ativos, independentemente da página ou dos filtros selecionados.",
+        responses={200: CatalogFilterOptionsSerializer},
+    )
+    def get(self, request):
+        return Response(CatalogFilterOptionsSerializer(catalog_filter_options()).data)
+
+
 class ProductListCreateView(APIView):
     """Listar produtos (público, com filtros) e criar (admin)."""
+
+    pagination_class = CatalogPagination
 
     def get_permissions(self):
         if self.request.method == "POST":
@@ -416,39 +445,53 @@ class ProductListCreateView(APIView):
         summary="Listar produtos",
         description=(
             "Lista paginada do catálogo. Endpoint público — só retorna produtos "
-            "com `is_active=True` para chamadas não autenticadas e clientes.\n\n"
-            "Filtros via query: `category={uuid}`, `drop={uuid}`, `search={text}` "
-            "(busca em name/description), `is_active=true|false` (só admin pode passar false).\n\n"
-            "Ordenação padrão: `-created_at`."
+            "com `is_active=True` e ao menos uma variação com `stock_quantity > 0` "
+            "para chamadas não autenticadas e clientes.\n\n"
+            "Categoria por slug; valores reconhecidos como UUID são sempre IDs legados. "
+            "Drop por UUID. Busca sem distinção de maiúsculas em name/description. "
+            "Cores exatas repetidas: `color=Preto&color=Azul`; tamanho e cor na mesma "
+            "variação. Preços inclusivos, não negativos, com até duas casas decimais. "
+            "Página inicial 1, tamanho padrão 20 e máximo 50 (valores maiores são limitados). "
+            "Parâmetros inválidos retornam 400; página inexistente retorna 404. "
+            "Para clientes e visitantes, tamanho e cor devem corresponder a uma mesma "
+            "variação com estoque positivo. Nomes de cores conhecidos são normalizados. "
+            "Ordenação padrão -created_at, com id como desempate; preços e vendas "
+            "desempatam por -created_at e id. Vendas somam quantidades de pedidos PAID, "
+            "PREPARING, SHIPPED e DELIVERED. "
+            "`is_active=true|false` mantém o comportamento administrativo existente."
         ),
-        responses={200: ProductListSerializer(many=True)},
+        parameters=[ProductListQuerySerializer],
+        responses={
+            200: ProductListSerializer(many=True),
+            400: OpenApiResponse(description="Parâmetros de consulta inválidos."),
+            404: OpenApiResponse(description="Página inexistente."),
+        },
     )
     def get(self, request):
+        # Evita tratar booleano ausente como checkbox HTML desmarcado.
+        params = request.query_params.dict()
+        if "color" in params:
+            params["color"] = request.query_params.getlist("color")
+        query = ProductListQuerySerializer(data=params)
+        query.is_valid(raise_exception=True)
         qs = Product.objects.select_related("category", "drop").prefetch_related(
             "variations", "images"
         )
 
-        is_admin = request.user.is_authenticated and getattr(request.user, "is_admin", False)
-        is_active_param = request.query_params.get("is_active")
+        is_admin = request.user.is_authenticated and getattr(
+            request.user, "is_admin", False
+        )
+        is_active_param = query.validated_data.get("is_active")
         if is_admin and is_active_param is not None:
-            qs = qs.filter(is_active=is_active_param.lower() == "true")
+            qs = qs.filter(is_active=is_active_param)
         elif not is_admin:
-            qs = qs.filter(is_active=True)
+            available = ProductVariation.objects.filter(
+                product_id=OuterRef("pk"), stock_quantity__gt=0
+            )
+            qs = qs.filter(Exists(available), is_active=True)
 
-        category = request.query_params.get("category")
-        if category:
-            qs = qs.filter(category_id=category)
-
-        drop = request.query_params.get("drop")
-        if drop:
-            qs = qs.filter(drop_id=drop)
-
-        search = request.query_params.get("search")
-        if search:
-            qs = qs.filter(Q(name__icontains=search) | Q(description__icontains=search))
-
-        qs = qs.order_by("-created_at")
-        paginator = PageNumberPagination()
+        qs = filter_catalog(qs, query.validated_data, require_stock=not is_admin)
+        paginator = self.pagination_class()
         page = paginator.paginate_queryset(qs, request, view=self)
         serializer = ProductListSerializer(
             page, many=True, context={"request": request}
@@ -474,7 +517,9 @@ class ProductListCreateView(APIView):
         },
     )
     def post(self, request):
-        serializer = ProductWriteSerializer(data=request.data)
+        serializer = ProductWriteSerializer(
+            data=request.data, context={"request": request}
+        )
         if not serializer.is_valid():
             return Response(
                 {"error": "Dados inválidos.", "details": serializer.errors},
@@ -486,6 +531,44 @@ class ProductListCreateView(APIView):
             ProductDetailSerializer(product, context={"request": request}).data,
             status=status.HTTP_201_CREATED,
         )
+
+
+class ProductRecommendationsView(APIView):
+    permission_classes = [AllowAny]
+    pagination_class = RecommendationPagination
+    serializer_class = ProductListSerializer
+
+    @extend_schema(
+        tags=["Products"],
+        summary="Recomendações para um produto",
+        description=(
+            "Produtos ativos com pelo menos uma variação em estoque, excluindo o atual. "
+            "Prioriza mesma categoria, depois mesmo drop (quando presentes), vendas "
+            "válidas, recência decrescente e ID crescente. Completa os resultados com "
+            "outros produtos disponíveis do catálogo. Vendas consideram quantidades "
+            "de pedidos PAID, PREPARING, SHIPPED e DELIVERED. "
+            "Página inicial 1, tamanho padrão 4 e máximo 50; valores maiores são limitados. "
+            "Produto de origem inativo ou inexistente retorna 404, inclusive para admin."
+        ),
+        parameters=[CatalogPageQuerySerializer],
+        responses={
+            200: ProductListSerializer(many=True),
+            400: OpenApiResponse(description="Parâmetros de paginação inválidos."),
+            404: OpenApiResponse(description="Produto ou página não encontrado."),
+        },
+    )
+    def get(self, request, pk):
+        query = CatalogPageQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        product = get_object_or_404(Product, pk=pk, is_active=True)
+        paginator = self.pagination_class()
+        page = paginator.paginate_queryset(
+            recommend_products(product), request, view=self
+        )
+        serializer = self.serializer_class(
+            page, many=True, context={"request": request}
+        )
+        return paginator.get_paginated_response(serializer.data)
 
 
 class ProductDetailView(APIView):
@@ -510,7 +593,9 @@ class ProductDetailView(APIView):
             ),
             pk=pk,
         )
-        is_admin = request.user.is_authenticated and getattr(request.user, "is_admin", False)
+        is_admin = request.user.is_authenticated and getattr(
+            request.user, "is_admin", False
+        )
         if not product.is_active and not (is_admin and allow_inactive_for_admin):
             raise Product.DoesNotExist
         return product
@@ -557,7 +642,12 @@ class ProductDetailView(APIView):
     )
     def put(self, request, pk):
         product = get_object_or_404(Product, pk=pk)
-        serializer = ProductWriteSerializer(product, data=request.data)
+        serializer = ProductWriteSerializer(
+            product,
+            data=request.data,
+            partial=request.method == "PATCH",
+            context={"request": request},
+        )
         if not serializer.is_valid():
             return Response(
                 {"error": "Dados inválidos.", "details": serializer.errors},
@@ -579,10 +669,27 @@ class ProductDetailView(APIView):
             404: OpenApiResponse(description="Produto não encontrado."),
         },
     )
+    @extend_schema(
+        request=ProductWriteSerializer, responses={200: ProductDetailSerializer}
+    )
+    def patch(self, request, pk):
+        return self.put(request, pk)
+
     def delete(self, request, pk):
         product = get_object_or_404(Product, pk=pk)
+        if (
+            product.variations.filter(stock_movements__isnull=False).exists()
+            or product.variations.filter(orderitem__isnull=False).exists()
+            or product.variations.filter(opening_balance__isnull=False).exists()
+        ):
+            raise ValidationError("Produto com histórico deve ser desativado.")
         logger.info(f"Produto removido: {product.name} ({product.id})")
-        product.delete()
+        try:
+            product.delete()
+        except ProtectedError:
+            raise ValidationError(
+                "Produto com histórico deve ser desativado."
+            ) from None
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -610,7 +717,9 @@ class ProductVariationCreateView(APIView):
     )
     def post(self, request, pk):
         product = get_object_or_404(Product, pk=pk)
-        serializer = ProductVariationSerializer(data=request.data)
+        serializer = ProductVariationSerializer(
+            data=request.data, context={"request": request}
+        )
         if not serializer.is_valid():
             return Response(
                 {"error": "Dados inválidos.", "details": serializer.errors},
@@ -670,7 +779,20 @@ class ProductVariationDetailView(APIView):
     def delete(self, request, pk):
         variation = get_object_or_404(ProductVariation, pk=pk)
         logger.info(f"Variação removida: {variation.sku} ({variation.id})")
-        variation.delete()
+        with transaction.atomic():
+            Product.objects.select_for_update().get(pk=variation.product_id)
+            if (
+                variation.product.variations.count() <= 1
+                or variation.stock_movements.exists()
+                or variation.orderitem_set.exists()
+            ):
+                raise ValidationError(
+                    "Não é possível excluir a última variação ou uma variação com histórico."
+                )
+            try:
+                variation.delete()
+            except ProtectedError:
+                raise ValidationError("Variação possui histórico de estoque.") from None
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -821,7 +943,14 @@ class StockMovementListCreateView(APIView):
         paginator = PageNumberPagination()
         page = paginator.paginate_queryset(qs, request, view=self)
         serializer = StockMovementSerializer(page, many=True)
-        return paginator.get_paginated_response(serializer.data)
+        response = paginator.get_paginated_response(serializer.data)
+        opening = getattr(variation, "opening_balance", None)
+        response.data["opening_balance"] = (
+            {"balance": opening.balance, "created_at": opening.created_at}
+            if opening
+            else None
+        )
+        return response
 
     @extend_schema(
         tags=["Stock"],
@@ -855,11 +984,6 @@ class StockMovementListCreateView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
             movement = serializer.save(variation=variation, created_by=request.user)
-            if movement.kind == StockMovementKind.ENTRADA:
-                variation.stock_quantity += movement.quantity
-            else:
-                variation.stock_quantity -= movement.quantity
-            variation.save(update_fields=["stock_quantity", "updated_at"])
 
         logger.info(
             f"StockMovement {movement.kind} {movement.quantity} na variação {variation.id}"
@@ -867,4 +991,94 @@ class StockMovementListCreateView(APIView):
         return Response(
             StockMovementSerializer(movement).data,
             status=status.HTTP_201_CREATED,
+        )
+
+
+class ProductDuplicateView(APIView):
+    permission_classes = [IsStaffOrSuperUser]
+
+    @extend_schema(
+        request=ProductDuplicateSerializer,
+        responses={201: ProductDetailSerializer},
+        summary="Duplicar produto como rascunho",
+        description="Informe nome, custo e variações com source_id, novo SKU e novo estoque. Copia imagens independentemente; limpa promoção.",
+    )
+    @transaction.atomic
+    def post(self, request, pk):
+        input_serializer = ProductDuplicateSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+        request_data = input_serializer.validated_data
+        original = get_object_or_404(Product.objects.select_for_update(), pk=pk)
+        unknown = set(request_data) - {"name", "cost_price", "variations"}
+        if unknown:
+            raise ValidationError({k: "Campo desconhecido." for k in unknown})
+        originals = list(original.variations.order_by("id"))
+        rows = request_data.get("variations", [])
+        if not isinstance(rows, list) or len(rows) != len(originals):
+            raise ValidationError(
+                {"variations": "Informe todas as variações da origem."}
+            )
+        by_id = {str(v.pk): v for v in originals}
+        seen = set()
+        variations = []
+        for row in rows:
+            if not isinstance(row, dict) or set(row) - {
+                "source_id",
+                "sku",
+                "stock_quantity",
+            }:
+                raise ValidationError(
+                    {"variations": "Campos permitidos: source_id, sku, stock_quantity."}
+                )
+            source = str(row.get("source_id"))
+            if source not in by_id or source in seen:
+                raise ValidationError(
+                    {"variations": "Variação de origem inválida ou repetida."}
+                )
+            seen.add(source)
+            v = by_id[source]
+            variations.append(
+                {
+                    "size": v.size,
+                    "color": v.color,
+                    "sku": row.get("sku", ""),
+                    "stock_quantity": row.get("stock_quantity", 0),
+                }
+            )
+        data = {
+            "name": request_data.get("name") or f"{original.name} (cópia)",
+            "description": original.description,
+            "category": original.category_id,
+            "drop": original.drop_id,
+            "base_price": original.base_price,
+            "cost_price": request_data.get("cost_price", original.cost_price),
+            "is_active": False,
+            "variations": variations,
+        }
+        serializer = ProductWriteSerializer(data=data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        product = serializer.save()
+        copied = []
+        try:
+            for source_image in original.images.order_by("display_order", "created_at"):
+                image = ProductImage(
+                    product=product, display_order=source_image.display_order
+                )
+                with source_image.image.open("rb") as source:
+                    image.image.save(
+                        f"{uuid.uuid4().hex}.{source_image.image.name.rsplit('.', 1)[-1]}",
+                        ContentFile(source.read()),
+                        save=False,
+                    )
+                copied.append(image.image)
+                image.save()
+        except Exception:
+            for file in copied:
+                file.delete(save=False)
+            raise ValidationError(
+                "Não foi possível copiar as imagens; nenhum produto foi criado."
+            ) from None
+        return Response(
+            ProductDetailSerializer(product, context={"request": request}).data,
+            status=201,
         )

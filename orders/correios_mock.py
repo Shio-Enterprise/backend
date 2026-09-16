@@ -6,7 +6,7 @@ credenciais reais. As estruturas imitam o JSON cru retornado pelos Correios,
 para que as funções de formatação em ``correios.py`` continuem sendo exercidas.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 MOCK_TRACKING_CODE = "AA123456785BR"
 
@@ -27,7 +27,7 @@ def mock_cep_response(cep: str) -> dict:
 
 
 def mock_prazo_response() -> dict:
-    data_maxima = (datetime.now(tz=timezone.utc) + timedelta(days=5)).strftime("%d/%m/%Y")
+    data_maxima = (datetime.now(tz=UTC) + timedelta(days=5)).strftime("%d/%m/%Y")
     return {
         "prazoEntrega": 5,
         "dataMaxima": data_maxima,
@@ -59,7 +59,7 @@ def mock_prepostagem_details_response() -> dict:
 
 
 def mock_tracking_response(tracking_code: str) -> dict:
-    now = datetime.now(tz=timezone.utc)
+    now = datetime.now(tz=UTC)
     return {
         "objetos": [
             {

@@ -7,6 +7,7 @@ from django.db import transaction
 from django.db.models import Count, DecimalField, ExpressionWrapper, F, Q, Sum
 from django.db.models.functions import TruncDay, TruncMonth
 from django.http import Http404
+from django.utils import timezone
 from drf_spectacular.utils import (
     OpenApiParameter,
     OpenApiTypes,
@@ -20,7 +21,8 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from authentication.permissions import IsStaffOrSuperUser
-from products.models import ProductVariation
+from products.models import Product, ProductVariation
+from products.services import move_stock
 
 from .correios import (
     CorreiosAuthenticationError,
@@ -42,7 +44,6 @@ from .models import (
     CustomerOrder,
     OrderItem,
     OrderStatus,
-    OrderStatusLog,
     PaymentStatus,
 )
 from .serializers import (
@@ -60,9 +61,12 @@ from .services import (
     clear_cart,
     create_infinitepay_checkout,
     get_cart_data,
+    get_welcome_discount,
     remove_item_from_cart,
+    restore_order_stock,
     update_item_quantity,
     update_status,
+    update_tracking_code,
 )
 
 User = get_user_model()
@@ -395,9 +399,10 @@ class AdminOrderDetailView(APIView):
             404: OpenApiTypes.OBJECT,
         },
     )
+    @transaction.atomic
     def patch(self, request, order_id):
         try:
-            order = CustomerOrder.objects.select_related("payment").get(id=order_id)
+            order = CustomerOrder.objects.select_for_update().get(id=order_id)
         except CustomerOrder.DoesNotExist:
             return Response({"message": "Pedido não encontrado."}, status=404)
 
@@ -422,17 +427,38 @@ class AdminOrderDetailView(APIView):
                 )
 
         # If shipping, require tracking code
-        if status_value == OrderStatus.SHIPPED and not tracking_code:
+        if status_value == OrderStatus.SHIPPED and not (
+            tracking_code or order.tracking_code
+        ):
             return Response(
                 {"message": "Tracking code obrigatório ao enviar pedido."}, status=400
             )
 
-        previous_status = order.status
-        order.status = status_value
-        if tracking_code:
-            order.tracking_code = tracking_code
+        if serializer.validated_data.get("physical_return_confirmed") and not (
+            order.status in (OrderStatus.SHIPPED, OrderStatus.DELIVERED)
+            or order.status_logs.filter(
+                new_status__in=[OrderStatus.SHIPPED, OrderStatus.DELIVERED]
+            ).exists()
+        ):
+            return Response(
+                {"message": "Retorno físico exige expedição anterior."}, status=400
+            )
 
-        order.save()
+        if (order.status == OrderStatus.SHIPPED and status_value == OrderStatus.SHIPPED):
+            update_tracking_code(
+                order=order,
+                tracking_code=tracking_code,
+                changed_by=request.user,
+                comment=comment,
+            )
+        else:
+            update_status(
+                order=order,
+                new_status=status_value,
+                tracking_code=tracking_code,
+                changed_by=request.user,
+                comment=comment,
+            )
 
         if (
             status_value == OrderStatus.CANCELED
@@ -443,14 +469,8 @@ class AdminOrderDetailView(APIView):
                 order.payment.status = PaymentStatus.FAILED
                 order.payment.save()
 
-        OrderStatusLog.objects.create(
-            order=order,
-            changed_by=request.user,
-            previous_status=previous_status,
-            new_status=status_value,
-            tracking_code=tracking_code,
-            comment=comment,
-        )
+        if serializer.validated_data.get("physical_return_confirmed"):
+            restore_order_stock(order, changed_by=request.user, physical_return=True)
 
         return Response(OrderDetailSerializer(order).data, status=status.HTTP_200_OK)
 
@@ -478,17 +498,22 @@ class CheckoutAPIView(APIView):
                         "format": "uuid",
                         "description": "UUID do endereço de entrega salvo no perfil",
                     },
+                    "confirmed_subtotal": {
+                        "type": "string",
+                        "description": "Subtotal de produtos confirmado pelo usuário; divergência retorna 409 price_changed.",
+                    },
                     "shipping_cost": {
                         "type": "number",
                         "format": "float",
                         "description": "Valor calculado do frete (em Reais)",
                     },
                 },
-                "required": ["address_id"],
+                "required": ["address_id", "confirmed_subtotal"],
             }
         },
         responses={
             201: OpenApiTypes.OBJECT,
+            409: OpenApiTypes.OBJECT,
             400: OpenApiTypes.OBJECT,
             500: OpenApiTypes.OBJECT,
         },
@@ -497,7 +522,8 @@ class CheckoutAPIView(APIView):
     def post(self, request):
         user = request.user
         cart = (
-            Cart.objects.filter(user=user, status="ACTIVE")
+            Cart.objects.select_for_update()
+            .filter(user=user, status="ACTIVE")
             .prefetch_related("items__variation__product")
             .first()
         )
@@ -522,15 +548,79 @@ class CheckoutAPIView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        subtotal = sum(item.quantity * item.unit_price for item in cart.items.all())
-        shipping_cost = request.data.get("shipping_cost", 0.00)
-        total_amount = float(subtotal) + float(shipping_cost)
+        items = list(
+            cart.items.select_related("variation__product").order_by("variation_id")
+        )
+        products = {
+            p.pk: p
+            for p in Product.objects.select_for_update()
+            .filter(pk__in=[i.variation.product_id for i in items])
+            .order_by("pk")
+        }
+        variations = {
+            v.pk: v
+            for v in ProductVariation.objects.select_for_update()
+            .filter(pk__in=[i.variation_id for i in items])
+            .order_by("pk")
+        }
+        at = timezone.now()
+        prices = {i.pk: products[i.variation.product_id].price_at(at) for i in items}
+        subtotal = sum((i.quantity * prices[i.pk] for i in items), Decimal("0.00"))
+        try:
+            confirmed = Decimal(str(request.data["confirmed_subtotal"]))
+            if not confirmed.is_finite():
+                raise ValueError
+        except (KeyError, ValueError, ArithmeticError):
+            return Response({"message": "Informe confirmed_subtotal."}, status=400)
+        if confirmed != subtotal:
+            return Response(
+                {
+                    "code": "price_changed",
+                    "message": "Os preços mudaram. Confira e confirme novamente.",
+                    "subtotal": str(subtotal),
+                    "items": [
+                        {
+                            "variation_id": str(i.variation_id),
+                            "quantity": i.quantity,
+                            "unit_price": str(prices[i.pk]),
+                            "base_price": str(
+                                products[i.variation.product_id].base_price
+                            ),
+                            "is_promotion_active": products[
+                                i.variation.product_id
+                            ].promotion_active_at(at),
+                            "total_price": str(prices[i.pk] * i.quantity),
+                        }
+                        for i in items
+                    ],
+                },
+                status=409,
+            )
+        for item in items:
+            if (
+                not products[item.variation.product_id].is_active
+                or variations[item.variation_id].stock_quantity < item.quantity
+            ):
+                return Response(
+                    {"message": "Produto indisponível ou estoque insuficiente."},
+                    status=400,
+                )
+        try:
+            shipping_cost = Decimal(str(request.data.get("shipping_cost", "0.00")))
+        except ArithmeticError:
+            return Response({"message": "Frete inválido."}, status=400)
+        if not shipping_cost.is_finite() or shipping_cost < 0:
+            return Response({"message": "Frete inválido."}, status=400)
+        welcome_coupon, discount_amount = get_welcome_discount(user, subtotal)
+        total_amount = subtotal - discount_amount + shipping_cost
 
         order = CustomerOrder.objects.create(
             user=user,
             address=address,
+            coupon=welcome_coupon,
             subtotal=subtotal,
             shipping_cost=shipping_cost,
+            discount_amount=discount_amount,
             total_amount=total_amount,
             shipping_zip_code=address.zip_code,
             shipping_street=address.street,
@@ -541,27 +631,25 @@ class CheckoutAPIView(APIView):
             shipping_state=address.state,
         )
 
-        for item in cart.items.all():
-            if item.variation.stock_quantity < item.quantity:
-                transaction.set_rollback(True)
-                return Response(
-                    {
-                        "success": False,
-                        "message": f"Estoque insuficiente para {item.variation.product.name}.",
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            item.variation.stock_quantity -= item.quantity
-            item.variation.save()
-
-            OrderItem.objects.create(
+        for item in items:
+            order_item = OrderItem.objects.create(
                 order=order,
                 variation=item.variation,
                 quantity=item.quantity,
-                unit_price=item.unit_price,
-                product_name=f"{item.variation.product.name} - {item.variation.size}",
+                unit_price=prices[item.pk],
+                product_name=f"{item.variation.product.name} - {item.variation.size} / {item.variation.color}",
                 sku_snapshot=item.variation.sku,
+            )
+            move_stock(
+                variation=item.variation,
+                kind="SAIDA",
+                reason="VENDA",
+                quantity=item.quantity,
+                origin_type="ORDER",
+                origin_id=order.pk,
+                order_item=order_item,
+                idempotency_key=f"sale:{order_item.pk}",
+                created_by=user,
             )
 
         cart.status = "FINISHED"
@@ -646,8 +734,8 @@ class PaymentSuccessRedirectView(APIView):
                 order.payment.gateway_transaction_id = transaction_nsu
                 order.payment.status = PaymentStatus.PAID
                 order.payment.save()
-                order.status = OrderStatus.PAID
-                order.save()
+
+                update_status(order=order, new_status=OrderStatus.PAID)
 
         if order.status == OrderStatus.PAID:
             return Response(
@@ -741,6 +829,7 @@ class OrderTrackingView(APIView):
             404: OpenApiTypes.OBJECT,
         },
     )
+    @transaction.atomic
     def patch(self, request, order_id):
         order = CustomerOrder.objects.filter(id=order_id).first()
         if order is None:
@@ -765,13 +854,20 @@ class OrderTrackingView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        update_status(
-            order=order,
-            new_status=OrderStatus.SHIPPED,
-            changed_by=request.user,
-            tracking_code=tracking_code,
-            comment="Código de rastreio registado.",
-        )
+        if order.status == OrderStatus.PREPARING:
+            update_status(
+                order=order,
+                new_status=OrderStatus.SHIPPED,
+                tracking_code=tracking_code,
+                changed_by=request.user,
+            )
+
+        elif order.status == OrderStatus.SHIPPED:
+            update_tracking_code(
+                order=order,
+                tracking_code=tracking_code,
+                changed_by=request.user,
+            )
 
         return Response(
             {
@@ -801,7 +897,7 @@ class OrderDispatchView(APIView):
             "Restrito a administradores. Use este endpoint em vez do PATCH de rastreio manual "
             "quando quiser que o sistema gere o código automaticamente."
         ),
-        request=None, 
+        request=None,
         responses={
             200: OpenApiTypes.OBJECT,
             400: OpenApiTypes.OBJECT,
@@ -812,7 +908,7 @@ class OrderDispatchView(APIView):
     )
     def post(self, request, order_id):
         order = (
-            CustomerOrder.objects.select_related("user", "user__profile")
+            CustomerOrder.objects.select_related("user", "user__profile", "payment")
             .filter(id=order_id)
             .first()
         )
@@ -822,15 +918,24 @@ class OrderDispatchView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        undispatchable_statuses = [
-            OrderStatus.DELIVERED,
-            OrderStatus.CANCELED,
-            OrderStatus.SHIPPED,
-        ]
-        if order.status in undispatchable_statuses:
+        if order.status != OrderStatus.PREPARING:
             return Response(
                 {
                     "message": f"Pedido com status '{order.status}' não pode ser despachado."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if (
+            not hasattr(order, "payment")
+            or order.payment.status != PaymentStatus.PAID
+        ):
+            return Response(
+                {
+                    "message": (
+                        "Pedido sem pagamento confirmado "
+                        "não pode ser despachado."
+                    )
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
@@ -872,13 +977,6 @@ class OrderDispatchView(APIView):
             new_status=OrderStatus.SHIPPED,
             changed_by=request.user,
             tracking_code=tracking_code,
-            comment="Despacho automático via pré-postagem Correios.",
-        )
-
-        OrderStatusLog.objects.create(
-            order=order,
-            changed_by=request.user,
-            new_status=OrderStatus.SHIPPED,
             comment=f"Pedido despachado automaticamente via Correios. Código de rastreio: {tracking_code}",
         )
 
