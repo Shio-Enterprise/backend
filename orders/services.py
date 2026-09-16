@@ -423,6 +423,19 @@ def merge_session_cart_to_db(request, user):
             pass
 
 
+def release_if_expired(order):
+    if order.status != OrderStatus.AWAITING_PAYMENT:
+        return
+
+    if not order.reservation_expires_at:
+        return
+
+    if order.reservation_expires_at >= timezone.now():
+        return
+
+    update_status(order, OrderStatus.CANCELED, comment="Reserva de estoque expirada.")
+
+
 @transaction.atomic
 def update_status(order, new_status, changed_by=None, tracking_code=None, comment=None):
     """Centraliza a atualização de status de pedidos e cria um log histórico.

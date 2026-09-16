@@ -2,6 +2,7 @@ import datetime
 import logging
 from decimal import Decimal
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.db.models import Sum
@@ -53,6 +54,7 @@ from .services import (
     create_infinitepay_checkout,
     get_cart_data,
     get_welcome_discount,
+    release_if_expired,
     remove_item_from_cart,
     restore_order_stock,
     update_item_quantity,
@@ -202,6 +204,7 @@ class UserOrderDetailView(APIView):
             )
         except CustomerOrder.DoesNotExist:
             return Response({"message": "Pedido não encontrado."}, status=404)
+        release_if_expired(order)
         return Response(OrderDetailSerializer(order).data, status=status.HTTP_200_OK)
 
 
@@ -255,6 +258,7 @@ class AdminOrderDetailView(APIView):
         except CustomerOrder.DoesNotExist:
             return Response({"message": "Pedido não encontrado."}, status=404)
 
+        release_if_expired(order)
         return Response(OrderDetailSerializer(order).data, status=status.HTTP_200_OK)
 
     @extend_schema(
@@ -495,6 +499,8 @@ class CheckoutAPIView(APIView):
             shipping_neighborhood=address.neighborhood,
             shipping_city=address.city,
             shipping_state=address.state,
+            reservation_expires_at=timezone.now()
+            + datetime.timedelta(minutes=settings.STOCK_RESERVATION_TTL_MINUTES),
         )
 
         for item in items:

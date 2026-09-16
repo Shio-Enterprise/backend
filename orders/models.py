@@ -86,6 +86,7 @@ class CustomerOrder(models.Model):
     discount_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     total_amount = models.DecimalField(max_digits=10, decimal_places=2)
     tracking_code = models.CharField(max_length=100, null=True, blank=True)
+    reservation_expires_at = models.DateTimeField(null=True, blank=True)
 
     shipping_zip_code = models.CharField(max_length=9)
     shipping_street = models.CharField(max_length=255)

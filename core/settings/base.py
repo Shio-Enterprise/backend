@@ -185,6 +185,10 @@ GOOGLE_CLIENT_ID = config("GOOGLE_CLIENT_ID")
 
 INFINITEPAY_HANDLE = config("INFINITEPAY_HANDLE", default="")
 
+STOCK_RESERVATION_TTL_MINUTES = config(
+    "STOCK_RESERVATION_TTL_MINUTES", default=30, cast=int
+)
+
 CORREIOS_API_BASE_URL = config(
     "CORREIOS_API_BASE_URL", default="https://api.correios.com.br"
 )
