@@ -37,6 +37,7 @@ services:
     env_file: ./.env
     environment:
       - DB_HOSTNAME=db
+    entrypoint: ["sh", "-c", "tr -d '\\r' < /app/entrypoint.sh > /tmp/entrypoint.sh && chmod +x /tmp/entrypoint.sh && exec /tmp/entrypoint.sh"]
     depends_on:
       db:
         condition: service_healthy

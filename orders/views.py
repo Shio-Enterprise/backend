@@ -1,10 +1,11 @@
 import datetime
 import logging
+from collections import defaultdict
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.db import transaction
-from django.db.models import Sum
+from django.db.models import F, Sum
 from django.http import Http404
 from django.utils import timezone
 from drf_spectacular.utils import (
@@ -19,7 +20,9 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from authentication.permissions import IsStaffOrSuperUser
-from products.models import Product, ProductVariation
+from products.availability import get_drop_sold_quantity, is_product_open_for_sale
+from products.models import DropCampaign, ProductVariation
+from products.models import Product
 from products.services import move_stock
 
 from .correios import (
@@ -381,6 +384,7 @@ class CheckoutAPIView(APIView):
             201: OpenApiTypes.OBJECT,
             409: OpenApiTypes.OBJECT,
             400: OpenApiTypes.OBJECT,
+            409: OpenApiTypes.OBJECT,
             500: OpenApiTypes.OBJECT,
         },
     )
@@ -415,8 +419,15 @@ class CheckoutAPIView(APIView):
             )
 
         items = list(
-            cart.items.select_related("variation__product").order_by("variation_id")
+            cart.items.select_related(
+                "variation__product", "variation__product__drop"
+            ).order_by("variation_id")
         )
+
+        # Trava produtos, variações (estoque) e drops (max_quantity) envolvidos
+        # antes de revalidar e decrementar, para impedir overselling entre
+        # requisições concorrentes. Ordenadas por pk para evitar deadlock entre
+        # checkouts concorrentes que compartilham produtos/variações/drops.
         products = {
             p.pk: p
             for p in Product.objects.select_for_update()
@@ -429,6 +440,14 @@ class CheckoutAPIView(APIView):
             .filter(pk__in=[i.variation_id for i in items])
             .order_by("pk")
         }
+        drop_ids = sorted({p.drop_id for p in products.values() if p.drop_id})
+        drops = {
+            d.id: d
+            for d in DropCampaign.objects.select_for_update()
+            .filter(id__in=drop_ids)
+            .order_by("id")
+        }
+
         at = timezone.now()
         prices = {i.pk: products[i.variation.product_id].price_at(at) for i in items}
         subtotal = sum((i.quantity * prices[i.pk] for i in items), Decimal("0.00"))
@@ -462,15 +481,47 @@ class CheckoutAPIView(APIView):
                 },
                 status=409,
             )
+
+        # "Aberto para venda" (is_active + dentro da janela do drop), não
+        # apenas "visível" (que só depende de is_public) — um drop
+        # Rascunho/Programado/Encerrado é visível na loja mas não pode ser
+        # comprado. O limite de max_quantity é decidido separadamente, logo
+        # abaixo, com os drops já travados — responde 409, não 400.
         for item in items:
+            product = products[item.variation.product_id]
             if (
-                not products[item.variation.product_id].is_active
+                not is_product_open_for_sale(product)
                 or variations[item.variation_id].stock_quantity < item.quantity
             ):
                 return Response(
                     {"message": "Produto indisponível ou estoque insuficiente."},
                     status=400,
                 )
+
+        requested_quantity_by_drop = defaultdict(int)
+        for item in items:
+            drop_id = products[item.variation.product_id].drop_id
+            if drop_id:
+                requested_quantity_by_drop[drop_id] += item.quantity
+
+        for drop_id, requested_quantity in requested_quantity_by_drop.items():
+            drop = drops[drop_id]
+            if drop.max_quantity is None:
+                continue
+            sold_quantity = get_drop_sold_quantity(drop)
+            if sold_quantity + requested_quantity > drop.max_quantity:
+                remaining = max(drop.max_quantity - sold_quantity, 0)
+                return Response(
+                    {
+                        "success": False,
+                        "message": (
+                            f"Quantidade solicitada do drop '{drop.name}' excede o "
+                            f"limite disponível. Restam {remaining} unidade(s)."
+                        ),
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+
         try:
             shipping_cost = Decimal(str(request.data.get("shipping_cost", "0.00")))
         except ArithmeticError:

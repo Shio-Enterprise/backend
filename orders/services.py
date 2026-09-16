@@ -21,7 +21,9 @@ from orders.models import (
     Payment,
     PaymentStatus,
 )
-from products.models import ProductVariation, StockMovement
+from products.availability import is_product_sellable
+from products.models import ProductVariation
+from products.models import StockMovement
 from products.services import move_stock
 
 ALLOWED_TRANSITIONS = {
@@ -171,8 +173,12 @@ def get_cart_data(request):
 
         items = []
         subtotal = Decimal("0.00")
-        for item in cart.items.select_related("variation", "variation__product").all():
+        cart_items = cart.items.select_related(
+            "variation", "variation__product", "variation__product__drop"
+        ).all()
+        for item in cart_items:
             item.unit_price = item.variation.product.price_at(price_at)
+
             total_price = item.quantity * item.unit_price
             subtotal += total_price
             items.append(
@@ -190,6 +196,7 @@ def get_cart_data(request):
                     ),
                     "total_price": total_price,
                     "stock_quantity": item.variation.stock_quantity,
+                    "is_sellable": is_product_sellable(item.variation.product),
                 }
             )
         welcome_coupon, welcome_discount_amount = get_welcome_discount_preview(
@@ -211,7 +218,7 @@ def get_cart_data(request):
         variation_ids = list(session_cart.keys())
         variations = ProductVariation.objects.filter(
             id__in=variation_ids
-        ).select_related("product")
+        ).select_related("product", "product__drop")
         variations_by_id = {str(v.id): v for v in variations}
 
         for var_id_str, item_data in session_cart.items():
@@ -241,6 +248,7 @@ def get_cart_data(request):
                     ),
                     "total_price": total_price,
                     "stock_quantity": variation.stock_quantity,
+                    "is_sellable": is_product_sellable(variation.product),
                 }
             )
 
@@ -263,9 +271,16 @@ def add_item_to_cart(request, variation_id, quantity):
     if request.user.is_authenticated:
         with transaction.atomic():
             variation = get_object_or_404(
-                ProductVariation.objects.select_for_update().select_related("product"),
+                ProductVariation.objects.select_for_update().select_related(
+                    "product", "product__drop"
+                ),
                 id=variation_id,
             )
+
+            if not is_product_sellable(variation.product):
+                raise ValueError(
+                    f"{variation.product.name} não está disponível para compra no momento."
+                )
 
             cart = get_or_create_user_cart(request.user)
             cart_item, _ = CartItem.objects.get_or_create(
@@ -288,8 +303,15 @@ def add_item_to_cart(request, variation_id, quantity):
             cart_item.save()
     else:
         variation = get_object_or_404(
-            ProductVariation.objects.select_related("product"), id=variation_id
+            ProductVariation.objects.select_related("product", "product__drop"),
+            id=variation_id,
         )
+
+        if not is_product_sellable(variation.product):
+            raise ValueError(
+                f"{variation.product.name} não está disponível para compra no momento."
+            )
+
         session_cart = request.session.get("cart", {})
         var_id_str = str(variation.id)
 
@@ -312,8 +334,14 @@ def add_item_to_cart(request, variation_id, quantity):
 
 def update_item_quantity(request, variation_id, quantity):
     variation = get_object_or_404(
-        ProductVariation.objects.select_related("product"), id=variation_id
+        ProductVariation.objects.select_related("product", "product__drop"),
+        id=variation_id,
     )
+
+    if not is_product_sellable(variation.product):
+        raise ValueError(
+            f"{variation.product.name} não está disponível para compra no momento."
+        )
 
     if quantity > variation.stock_quantity:
         raise ValueError(

@@ -216,5 +216,6 @@ selenium_tests/chrome_profile_teste/
 testandoAPIS.md
 .DS_STORE
 
+.dockerignore
 # Mediafiles
 core/mediafiles
