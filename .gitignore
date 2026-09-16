@@ -217,3 +217,5 @@ testandoAPIS.md
 .DS_STORE
 
 .dockerignore
+# Mediafiles
+core/mediafiles

@@ -182,7 +182,9 @@ class GoogleAuthService:
         try:
             UserProfile.objects.get_or_create(user=user)
         except Exception:
-            logger.exception("Falha ao criar/obter UserProfile para novo utilizador Google")
+            logger.exception(
+                "Falha ao criar/obter UserProfile para novo utilizador Google"
+            )
 
         logger.info(f"Novo utilizador criado via Google: {email}")
         return user, True

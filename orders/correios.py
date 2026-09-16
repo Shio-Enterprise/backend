@@ -5,19 +5,32 @@ from datetime import datetime
 import requests
 from django.conf import settings
 from django.core.cache import cache
+from django.core.exceptions import ObjectDoesNotExist
 
 from . import correios_mock
 
 logger = logging.getLogger(__name__)
 
 CORREIOS_TOKEN_CACHE_KEY = "correios_access_token"
-CORREIOS_TOKEN_ENDPOINT = "https://api.correios.com.br/token/v1/autentica/cartaopostagem"
-CORREIOS_TRACKING_ENDPOINT = "https://api.correios.com.br/srorastro/v1/objetos/{codigo_objeto}"
-CORREIOS_PREPOSTAGEM_ENDPOINT = "https://api.correios.com.br/prepostagem/v1/prepostagens"
-CORREIOS_PREPOSTAGEM_DETAILS_ENDPOINT = "https://api.correios.com.br/prepostagem/v1/prepostagens/{id}"
+CORREIOS_TOKEN_ENDPOINT = (
+    "https://api.correios.com.br/token/v1/autentica/cartaopostagem"
+)
+CORREIOS_TRACKING_ENDPOINT = (
+    "https://api.correios.com.br/srorastro/v1/objetos/{codigo_objeto}"
+)
+CORREIOS_PREPOSTAGEM_ENDPOINT = (
+    "https://api.correios.com.br/prepostagem/v1/prepostagens"
+)
+CORREIOS_PREPOSTAGEM_DETAILS_ENDPOINT = (
+    "https://api.correios.com.br/prepostagem/v1/prepostagens/{id}"
+)
 CORREIOS_CEP_ENDPOINT = "https://api.correios.com.br/cep/v1/enderecos/{cep}"
-CORREIOS_PRAZO_ENDPOINT = "https://api.correios.com.br/prazo/v1/nacional/{codigo_servico}"
-CORREIOS_PRECO_ENDPOINT = "https://api.correios.com.br/preco/v1/nacional/{codigo_servico}"
+CORREIOS_PRAZO_ENDPOINT = (
+    "https://api.correios.com.br/prazo/v1/nacional/{codigo_servico}"
+)
+CORREIOS_PRECO_ENDPOINT = (
+    "https://api.correios.com.br/preco/v1/nacional/{codigo_servico}"
+)
 CORREIOS_AGENCIA_ENDPOINT = "https://api.correios.com.br/agencia/v1/unidades"
 
 
@@ -426,13 +439,17 @@ def fetch_agencies_by_city_and_state(
         "size": size,
     }
 
-    response = requests.get(CORREIOS_AGENCIA_ENDPOINT, headers=headers, params=params, timeout=10)
+    response = requests.get(
+        CORREIOS_AGENCIA_ENDPOINT, headers=headers, params=params, timeout=10
+    )
 
     if response.status_code == 401:
         cache.delete(CORREIOS_TOKEN_CACHE_KEY)
         token = request_new_correios_access_token()
         headers["Authorization"] = f"Bearer {token}"
-        response = requests.get(CORREIOS_AGENCIA_ENDPOINT, headers=headers, params=params, timeout=10)
+        response = requests.get(
+            CORREIOS_AGENCIA_ENDPOINT, headers=headers, params=params, timeout=10
+        )
 
     response.raise_for_status()
     return response.json()

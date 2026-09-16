@@ -93,7 +93,15 @@ class OrderDetailSerializer(serializers.ModelSerializer):
     items = SimpleOrderItemSerializer(many=True)
     payment = PaymentSerializer(read_only=True)
     user = AdminUserSerializer(read_only=True)
-    status_logs = OrderStatusLogSerializer(many=True, read_only=True)
+    status_logs = serializers.SerializerMethodField()
+
+    def get_status_logs(self, obj):
+        logs = obj.status_logs.order_by("created_at")
+
+        return OrderStatusLogSerializer(
+            logs,
+            many=True,
+        ).data
 
     class Meta:
         model = CustomerOrder
@@ -122,6 +130,7 @@ class OrderDetailSerializer(serializers.ModelSerializer):
 
 
 class OrderStatusUpdateSerializer(serializers.Serializer):
+    physical_return_confirmed = serializers.BooleanField(required=False, default=False)
     status = serializers.ChoiceField(
         choices=CustomerOrder._meta.get_field("status").choices
     )
@@ -130,6 +139,8 @@ class OrderStatusUpdateSerializer(serializers.Serializer):
 
 
 class CartItemRepresentationSerializer(serializers.Serializer):
+    base_price = serializers.DecimalField(max_digits=10, decimal_places=2)
+    is_promotion_active = serializers.BooleanField()
     variation_id = serializers.UUIDField()
     product_id = serializers.UUIDField()
     product_name = serializers.CharField()
@@ -146,6 +157,8 @@ class CartRepresentationSerializer(serializers.Serializer):
     id = serializers.UUIDField(allow_null=True)
     items = CartItemRepresentationSerializer(many=True)
     subtotal = serializers.DecimalField(max_digits=10, decimal_places=2)
+    eligible_for_welcome_discount = serializers.BooleanField()
+    welcome_discount_amount = serializers.DecimalField(max_digits=10, decimal_places=2)
 
 
 class CartItemAddSerializer(serializers.Serializer):
