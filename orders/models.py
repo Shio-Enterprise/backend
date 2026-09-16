@@ -68,6 +68,45 @@ class CartItem(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
 
+class ShippingQuote(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="shipping_quotes",
+    )
+    cart = models.ForeignKey(
+        Cart, on_delete=models.CASCADE, related_name="shipping_quotes"
+    )
+    address = models.ForeignKey(
+        "authentication.Address",
+        on_delete=models.CASCADE,
+        related_name="shipping_quotes",
+    )
+    snapshot = models.JSONField()
+    subtotal = models.DecimalField(max_digits=10, decimal_places=2)
+    shipping_cost = models.DecimalField(max_digits=10, decimal_places=2)
+    discount_amount = models.DecimalField(max_digits=10, decimal_places=2)
+    total_amount = models.DecimalField(max_digits=10, decimal_places=2)
+    prazo_dias = models.PositiveIntegerField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    invalidated_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(
+                    subtotal__gte=0,
+                    shipping_cost__gte=0,
+                    discount_amount__gte=0,
+                    total_amount__gte=0,
+                ),
+                name="shipping_quote_nonnegative_amounts",
+            ),
+        ]
+
+
 class CustomerOrder(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(
@@ -97,6 +136,42 @@ class CustomerOrder(models.Model):
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+
+class CheckoutAttemptStatus(models.TextChoices):
+    PROCESSING = "PROCESSING", "Processing"
+    SUCCEEDED = "SUCCEEDED", "Succeeded"
+    UNCERTAIN = "UNCERTAIN", "Uncertain"
+
+
+class CheckoutAttempt(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT)
+    idempotency_key = models.UUIDField()
+    cart = models.OneToOneField(
+        Cart, on_delete=models.PROTECT, related_name="checkout_attempt"
+    )
+    shipping_quote = models.ForeignKey(ShippingQuote, on_delete=models.PROTECT)
+    address_id = models.UUIDField()
+    order = models.OneToOneField(
+        CustomerOrder, on_delete=models.PROTECT, related_name="checkout_attempt"
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=CheckoutAttemptStatus.choices,
+        default=CheckoutAttemptStatus.PROCESSING,
+    )
+    checkout_url = models.URLField(max_length=2048, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "idempotency_key"],
+                name="checkout_attempt_user_key_unique",
+            ),
+        ]
 
 
 class OrderItem(models.Model):

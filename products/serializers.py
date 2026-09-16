@@ -413,7 +413,7 @@ class ProductPricingSerializer(serializers.ModelSerializer):
                 )
             )
         return data
-      
+
 
 class ProductListSerializer(ProductPricingSerializer):
     """Versão enxuta de Product para listagem pública.

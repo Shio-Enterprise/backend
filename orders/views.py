@@ -1,13 +1,12 @@
 import datetime
 import logging
-from collections import defaultdict
-from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.db import transaction
-from django.db.models import F, Sum
+from django.db.models import Sum
 from django.http import Http404
 from django.utils import timezone
+from django.utils.decorators import method_decorator
 from drf_spectacular.utils import (
     OpenApiParameter,
     OpenApiTypes,
@@ -20,10 +19,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from authentication.permissions import IsStaffOrSuperUser
-from products.availability import get_drop_sold_quantity, is_product_open_for_sale
-from products.models import DropCampaign, ProductVariation
-from products.models import Product
-from products.services import move_stock
+from products.models import ProductVariation
 
 from .correios import (
     CorreiosAuthenticationError,
@@ -33,17 +29,17 @@ from .correios import (
     get_order_tracking_data,
 )
 from .models import (
-    Cart,
     CustomerOrder,
-    OrderItem,
     OrderStatus,
-    OrderStatusLog,
     PaymentStatus,
 )
 from .serializers import (
     CartItemAddSerializer,
     CartItemUpdateSerializer,
     CartRepresentationSerializer,
+    CheckoutCalculationInputSerializer,
+    CheckoutCalculationSerializer,
+    CheckoutInputSerializer,
     DashboardLowStockSerializer,
     DashboardRecentOrderSerializer,
     OrderDetailSerializer,
@@ -53,9 +49,10 @@ from .services import (
     add_item_to_cart,
     check_payment_status,
     clear_cart,
-    create_infinitepay_checkout,
+    complete_checkout_attempt,
+    create_shipping_quote,
     get_cart_data,
-    get_welcome_discount,
+    prepare_checkout_attempt,
     remove_item_from_cart,
     restore_order_stock,
     update_item_quantity,
@@ -268,10 +265,9 @@ class AdminOrderDetailView(APIView):
             404: OpenApiTypes.OBJECT,
         },
     )
-    @transaction.atomic
     def patch(self, request, order_id):
         try:
-            order = CustomerOrder.objects.select_for_update().get(id=order_id)
+            order = CustomerOrder.objects.select_related("payment").get(id=order_id)
         except CustomerOrder.DoesNotExist:
             return Response({"message": "Pedido não encontrado."}, status=404)
 
@@ -312,8 +308,8 @@ class AdminOrderDetailView(APIView):
             return Response(
                 {"message": "Retorno físico exige expedição anterior."}, status=400
             )
-        
-        if (order.status == OrderStatus.SHIPPED and status_value == OrderStatus.SHIPPED):
+
+        if order.status == OrderStatus.SHIPPED and status_value == OrderStatus.SHIPPED:
             update_tracking_code(
                 order=order,
                 tracking_code=tracking_code,
@@ -344,6 +340,29 @@ class AdminOrderDetailView(APIView):
         return Response(OrderDetailSerializer(order).data, status=status.HTTP_200_OK)
 
 
+class CheckoutCalculationView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        summary="Calcular valores atuais da compra",
+        description="Cria uma cotação com preços, frete e validade, sem criar pedido ou reservar estoque.",
+        request=CheckoutCalculationInputSerializer,
+        responses={
+            200: CheckoutCalculationSerializer,
+            400: OpenApiTypes.OBJECT,
+            503: OpenApiTypes.OBJECT,
+        },
+    )
+    def post(self, request):
+        serializer = CheckoutCalculationInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        calculation = create_shipping_quote(
+            request.user, serializer.validated_data["address_id"]
+        )
+        return Response(CheckoutCalculationSerializer(calculation).data)
+
+
+@method_decorator(transaction.non_atomic_requests, name="dispatch")
 class CheckoutAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -354,239 +373,40 @@ class CheckoutAPIView(APIView):
             "Gera o pedido (CustomerOrder), faz o snapshot do endereço de entrega e debita o estoque. "
             "Por fim, comunica-se com a API da InfinitePay para gerar o link de checkout.\n\n"
             "**Fluxo:**\n"
-            "1. Envie o `address_id` (UUID do endereço do perfil) e o `shipping_cost`.\n"
-            "2. O backend valida os itens e gera a cobrança.\n"
+            "1. Envie `address_id`, `shipping_quote_id` e `idempotency_key` (UUID da tentativa).\n"
+            "2. O backend valida a cotação e gera a cobrança com os valores confirmados.\n"
             "3. O utilizador é redirecionado para a `checkout_url` retornada."
         ),
-        request={
-            "application/json": {
-                "type": "object",
-                "properties": {
-                    "address_id": {
-                        "type": "string",
-                        "format": "uuid",
-                        "description": "UUID do endereço de entrega salvo no perfil",
-                    },
-                    "confirmed_subtotal": {
-                        "type": "string",
-                        "description": "Subtotal de produtos confirmado pelo usuário; divergência retorna 409 price_changed.",
-                    },
-                    "shipping_cost": {
-                        "type": "number",
-                        "format": "float",
-                        "description": "Valor calculado do frete (em Reais)",
-                    },
-                },
-                "required": ["address_id", "confirmed_subtotal"],
-            }
-        },
+        request=CheckoutInputSerializer,
         responses={
             201: OpenApiTypes.OBJECT,
-            409: OpenApiTypes.OBJECT,
+            202: OpenApiTypes.OBJECT,
             400: OpenApiTypes.OBJECT,
             409: OpenApiTypes.OBJECT,
             500: OpenApiTypes.OBJECT,
+            503: OpenApiTypes.OBJECT,
         },
     )
-    @transaction.atomic
     def post(self, request):
-        user = request.user
-        cart = (
-            Cart.objects.select_for_update()
-            .filter(user=user, status="ACTIVE")
-            .prefetch_related("items__variation__product")
-            .first()
-        )
-
-        if not cart or not cart.items.exists():
-            return Response(
-                {"success": False, "message": "Carrinho vazio."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        address_id = request.data.get("address_id")
-        if not address_id:
-            return Response(
-                {"success": False, "message": "Endereço não informado."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        address = user.addresses.filter(id=address_id).first()
-        if not address:
-            return Response(
-                {"success": False, "message": "Endereço inválido."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        items = list(
-            cart.items.select_related(
-                "variation__product", "variation__product__drop"
-            ).order_by("variation_id")
-        )
-
-        # Trava produtos, variações (estoque) e drops (max_quantity) envolvidos
-        # antes de revalidar e decrementar, para impedir overselling entre
-        # requisições concorrentes. Ordenadas por pk para evitar deadlock entre
-        # checkouts concorrentes que compartilham produtos/variações/drops.
-        products = {
-            p.pk: p
-            for p in Product.objects.select_for_update()
-            .filter(pk__in=[i.variation.product_id for i in items])
-            .order_by("pk")
-        }
-        variations = {
-            v.pk: v
-            for v in ProductVariation.objects.select_for_update()
-            .filter(pk__in=[i.variation_id for i in items])
-            .order_by("pk")
-        }
-        drop_ids = sorted({p.drop_id for p in products.values() if p.drop_id})
-        drops = {
-            d.id: d
-            for d in DropCampaign.objects.select_for_update()
-            .filter(id__in=drop_ids)
-            .order_by("id")
-        }
-
-        at = timezone.now()
-        prices = {i.pk: products[i.variation.product_id].price_at(at) for i in items}
-        subtotal = sum((i.quantity * prices[i.pk] for i in items), Decimal("0.00"))
+        serializer = CheckoutInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
         try:
-            confirmed = Decimal(str(request.data["confirmed_subtotal"]))
-            if not confirmed.is_finite():
-                raise ValueError
-        except (KeyError, ValueError, ArithmeticError):
-            return Response({"message": "Informe confirmed_subtotal."}, status=400)
-        if confirmed != subtotal:
-            return Response(
-                {
-                    "code": "price_changed",
-                    "message": "Os preços mudaram. Confira e confirme novamente.",
-                    "subtotal": str(subtotal),
-                    "items": [
-                        {
-                            "variation_id": str(i.variation_id),
-                            "quantity": i.quantity,
-                            "unit_price": str(prices[i.pk]),
-                            "base_price": str(
-                                products[i.variation.product_id].base_price
-                            ),
-                            "is_promotion_active": products[
-                                i.variation.product_id
-                            ].promotion_active_at(at),
-                            "total_price": str(prices[i.pk] * i.quantity),
-                        }
-                        for i in items
-                    ],
-                },
-                status=409,
-            )
-
-        # "Aberto para venda" (is_active + dentro da janela do drop), não
-        # apenas "visível" (que só depende de is_public) — um drop
-        # Rascunho/Programado/Encerrado é visível na loja mas não pode ser
-        # comprado. O limite de max_quantity é decidido separadamente, logo
-        # abaixo, com os drops já travados — responde 409, não 400.
-        for item in items:
-            product = products[item.variation.product_id]
-            if (
-                not is_product_open_for_sale(product)
-                or variations[item.variation_id].stock_quantity < item.quantity
-            ):
-                return Response(
-                    {"message": "Produto indisponível ou estoque insuficiente."},
-                    status=400,
-                )
-
-        requested_quantity_by_drop = defaultdict(int)
-        for item in items:
-            drop_id = products[item.variation.product_id].drop_id
-            if drop_id:
-                requested_quantity_by_drop[drop_id] += item.quantity
-
-        for drop_id, requested_quantity in requested_quantity_by_drop.items():
-            drop = drops[drop_id]
-            if drop.max_quantity is None:
-                continue
-            sold_quantity = get_drop_sold_quantity(drop)
-            if sold_quantity + requested_quantity > drop.max_quantity:
-                remaining = max(drop.max_quantity - sold_quantity, 0)
-                return Response(
-                    {
-                        "success": False,
-                        "message": (
-                            f"Quantidade solicitada do drop '{drop.name}' excede o "
-                            f"limite disponível. Restam {remaining} unidade(s)."
-                        ),
-                    },
-                    status=status.HTTP_409_CONFLICT,
-                )
-
-        try:
-            shipping_cost = Decimal(str(request.data.get("shipping_cost", "0.00")))
-        except ArithmeticError:
-            return Response({"message": "Frete inválido."}, status=400)
-        if not shipping_cost.is_finite() or shipping_cost < 0:
-            return Response({"message": "Frete inválido."}, status=400)
-        welcome_coupon, discount_amount = get_welcome_discount(user, subtotal)
-        total_amount = subtotal - discount_amount + shipping_cost
-
-        order = CustomerOrder.objects.create(
-            user=user,
-            address=address,
-            coupon=welcome_coupon,
-            subtotal=subtotal,
-            shipping_cost=shipping_cost,
-            discount_amount=discount_amount,
-            total_amount=total_amount,
-            shipping_zip_code=address.zip_code,
-            shipping_street=address.street,
-            shipping_number=address.address_number,
-            shipping_complement=address.complement,
-            shipping_neighborhood=address.neighborhood,
-            shipping_city=address.city,
-            shipping_state=address.state,
-        )
-
-        for item in items:
-            order_item = OrderItem.objects.create(
-                order=order,
-                variation=item.variation,
-                quantity=item.quantity,
-                unit_price=prices[item.pk],
-                product_name=f"{item.variation.product.name} - {item.variation.size} / {item.variation.color}",
-                sku_snapshot=item.variation.sku,
-            )
-            move_stock(
-                variation=item.variation,
-                kind="SAIDA",
-                reason="VENDA",
-                quantity=item.quantity,
-                origin_type="ORDER",
-                origin_id=order.pk,
-                order_item=order_item,
-                idempotency_key=f"sale:{order_item.pk}",
-                created_by=user,
-            )
-
-        cart.status = "FINISHED"
-        cart.save()
-
-        try:
-            checkout_url = create_infinitepay_checkout(order, request)
-            return Response(
-                {"success": True, "checkout_url": checkout_url},
-                status=status.HTTP_201_CREATED,
+            attempt, result = prepare_checkout_attempt(
+                request.user, **serializer.validated_data
             )
         except Exception:
-            transaction.set_rollback(True)
             return Response(
                 {
                     "success": False,
-                    "message": "Não foi possível iniciar o checkout da InfinitePay.",
+                    "message": "Não foi possível preparar o pedido. Reenvie a mesma tentativa.",
                 },
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
+        if attempt is not None:
+            result = complete_checkout_attempt(attempt, request)
+        body, response_status = result
+        headers = {"Retry-After": "3"} if response_status == 202 else {}
+        return Response(body, status=response_status, headers=headers)
 
 
 class PaymentSuccessRedirectView(APIView):
@@ -651,8 +471,8 @@ class PaymentSuccessRedirectView(APIView):
                 order.payment.gateway_transaction_id = transaction_nsu
                 order.payment.status = PaymentStatus.PAID
                 order.payment.save()
-
-                update_status(order=order, new_status=OrderStatus.PAID)
+                order.status = OrderStatus.PAID
+                order.save()
 
         if order.status == OrderStatus.PAID:
             return Response(
@@ -843,15 +663,11 @@ class OrderDispatchView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if (
-            not hasattr(order, "payment")
-            or order.payment.status != PaymentStatus.PAID
-        ):
+        if not hasattr(order, "payment") or order.payment.status != PaymentStatus.PAID:
             return Response(
                 {
                     "message": (
-                        "Pedido sem pagamento confirmado "
-                        "não pode ser despachado."
+                        "Pedido sem pagamento confirmado não pode ser despachado."
                     )
                 },
                 status=status.HTTP_400_BAD_REQUEST,

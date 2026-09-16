@@ -73,6 +73,11 @@ def migrate_catalog(apps, schema_editor):
             idempotency_key=f"legacy:{m.pk}",
         )
 
+    if schema_editor.connection.vendor == "postgresql":
+        # Conclui os eventos de FK gerados pelos dados antes de criar índices.
+        schema_editor.execute("SET CONSTRAINTS ALL IMMEDIATE")
+        schema_editor.execute("SET CONSTRAINTS ALL DEFERRED")
+
 
 class Migration(migrations.Migration):
     dependencies = [

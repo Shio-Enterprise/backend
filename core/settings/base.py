@@ -185,6 +185,11 @@ GOOGLE_CLIENT_ID = config("GOOGLE_CLIENT_ID")
 
 INFINITEPAY_HANDLE = config("INFINITEPAY_HANDLE", default="")
 
+SHIPPING_QUOTE_TTL_SECONDS = config("SHIPPING_QUOTE_TTL_SECONDS", default=900, cast=int)
+CHECKOUT_PROCESSING_TIMEOUT_SECONDS = config(
+    "CHECKOUT_PROCESSING_TIMEOUT_SECONDS", default=60, cast=int
+)
+
 CORREIOS_API_BASE_URL = config(
     "CORREIOS_API_BASE_URL", default="https://api.correios.com.br"
 )
