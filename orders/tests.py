@@ -1,3 +1,4 @@
+import threading
 import uuid
 from datetime import timedelta
 from decimal import Decimal
@@ -5,12 +6,13 @@ from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.db import connection, transaction
-from django.test import RequestFactory
+from django.db.models import Sum
+from django.test import RequestFactory, TransactionTestCase
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.exceptions import ValidationError
-from rest_framework.test import APITestCase
+from rest_framework.test import APIClient, APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from authentication.models import Address, UserProfile, UserRole
@@ -2089,6 +2091,397 @@ class MergeSessionCartTests(APITestCase):
         self.assertEqual(cart_item.quantity, 3)
 
 
+# ─── Disponibilidade de drops no carrinho e checkout ───────────────
+
+
+def make_address(user, **kwargs):
+    defaults = {
+        "zip_code": "71000000",
+        "street": "Rua Teste",
+        "address_number": "1",
+        "neighborhood": "Centro",
+        "city": "Brasília",
+        "state": "DF",
+    }
+    defaults.update(kwargs)
+    return Address.objects.create(user=user, **defaults)
+
+
+class CartSellabilityTests(APITestCase):
+    """Itens de drops indisponíveis (ocultos ou esgotados) não podem ser
+    adicionados/atualizados no carrinho."""
+
+    cart_items_url = "/api/orders/cart/items/"
+
+    def setUp(self):
+        self.category = Category.objects.create(name="CartSellCat", slug="cart-sell-cat")
+
+    def test_nao_pode_adicionar_produto_de_drop_privado_ao_carrinho(self):
+        hidden_drop = DropCampaign.objects.create(
+            name="DropOcultoCart", slug="drop-oculto-cart", is_public=False, is_active=True
+        )
+        product = Product.objects.create(
+            category=self.category, drop=hidden_drop, name="ProdutoOculto",
+            description="x", base_price=30,
+        )
+        variation = ProductVariation.objects.create(
+            product=product, size="U", sku="OCULTO-1", stock_quantity=10
+        )
+
+        response = self.client.post(
+            self.cart_items_url,
+            {"variation_id": str(variation.id), "quantity": 1},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_nao_pode_adicionar_produto_de_drop_esgotado_ao_carrinho(self):
+        sold_out_drop = DropCampaign.objects.create(
+            name="DropEsgotadoCart",
+            slug="drop-esgotado-cart",
+            is_public=True,
+            is_active=True,
+            max_quantity=1,
+        )
+        product = Product.objects.create(
+            category=self.category, drop=sold_out_drop, name="ProdutoEsgotado",
+            description="x", base_price=20,
+        )
+        variation = ProductVariation.objects.create(
+            product=product, size="U", sku="ESGOT-1", stock_quantity=10
+        )
+
+        buyer = User.objects.create_user(email="esgotbuyer@shio.com", name="EsgotBuyer")
+        make_address(buyer)
+        order = CustomerOrder.objects.create(
+            user=buyer,
+            subtotal=20,
+            total_amount=20,
+            status=OrderStatus.PAID,
+            shipping_zip_code="71000000",
+            shipping_street="R",
+            shipping_number="1",
+            shipping_neighborhood="B",
+            shipping_city="C",
+            shipping_state="DF",
+        )
+        OrderItem.objects.create(
+            order=order, variation=variation, quantity=1, unit_price=20,
+            product_name="ProdutoEsgotado - U",
+        )
+
+        response = self.client.post(
+            self.cart_items_url,
+            {"variation_id": str(variation.id), "quantity": 1},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_produto_sem_drop_pode_ser_adicionado_normalmente(self):
+        product = Product.objects.create(
+            category=self.category, name="ProdutoLivre", description="x", base_price=15,
+        )
+        variation = ProductVariation.objects.create(
+            product=product, size="U", sku="LIVRE-1", stock_quantity=10
+        )
+
+        response = self.client.post(
+            self.cart_items_url,
+            {"variation_id": str(variation.id), "quantity": 1},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # O frontend usa este campo para decidir se bloqueia/remove o item do
+        # carrinho, em vez de recalcular a política de disponibilidade em JS.
+        self.assertTrue(response.json()["items"][0]["is_sellable"])
+
+
+class CheckoutRevalidationTests(APITestCase):
+    """O checkout deve revalidar is_active/drop imediatamente antes de criar o
+    pedido — mesmo que o item já estivesse no carrinho quando ainda era vendável."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="reval@shio.com", name="Reval", password="senha_forte_123"
+        )
+        self.address = make_address(self.user)
+        self.drop = DropCampaign.objects.create(
+            name="DropReval", slug="drop-reval", is_public=True, is_active=True
+        )
+        self.category = Category.objects.create(name="RevalCat", slug="reval-cat")
+        self.product = Product.objects.create(
+            category=self.category, drop=self.drop, name="ProdutoReval",
+            description="x", base_price=80,
+        )
+        self.variation = ProductVariation.objects.create(
+            product=self.product, size="M", sku="REVAL-M", stock_quantity=5
+        )
+        self.cart = Cart.objects.create(user=self.user, status="ACTIVE")
+        self.cart_item = CartItem.objects.create(
+            cart=self.cart, variation=self.variation, quantity=2, unit_price=80
+        )
+        self.client.force_authenticate(user=self.user)
+        self.url = "/api/orders/checkout/"
+
+    def test_checkout_bloqueado_quando_drop_fica_inativo_apos_adicionar_ao_carrinho(self):
+        self.drop.is_active = False
+        self.drop.save()
+
+        response = self.client.post(
+            self.url, {"address_id": str(self.address.id), "shipping_cost": 10}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.cart.refresh_from_db()
+        self.assertEqual(self.cart.status, "ACTIVE")
+        self.variation.refresh_from_db()
+        self.assertEqual(self.variation.stock_quantity, 5)
+        self.assertEqual(CustomerOrder.objects.count(), 0)
+
+    def test_checkout_bloqueado_quando_produto_fica_inativo_apos_adicionar_ao_carrinho(self):
+        self.product.is_active = False
+        self.product.save()
+
+        response = self.client.post(
+            self.url, {"address_id": str(self.address.id), "shipping_cost": 10}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.variation.refresh_from_db()
+        self.assertEqual(self.variation.stock_quantity, 5)
+        self.assertEqual(CustomerOrder.objects.count(), 0)
+
+
+class CheckoutDropLimitTests(APITestCase):
+    """Checkout deve recusar (409) quando a compra ultrapassaria o max_quantity
+    do drop, contabilizado pela soma de unidades de pedidos não cancelados."""
+
+    def setUp(self):
+        self.drop = DropCampaign.objects.create(
+            name="DropLimite", slug="drop-limite", is_public=True, is_active=True,
+            max_quantity=3,
+        )
+        self.category = Category.objects.create(name="LimiteCat", slug="limite-cat")
+        self.product = Product.objects.create(
+            category=self.category, drop=self.drop, name="ProdutoLimite",
+            description="x", base_price=40,
+        )
+        self.variation = ProductVariation.objects.create(
+            product=self.product, size="U", sku="LIMITE-1", stock_quantity=100
+        )
+
+        existing_buyer = User.objects.create_user(email="buyer1@shio.com", name="Buyer1")
+        make_address(existing_buyer)
+        existing_order = CustomerOrder.objects.create(
+            user=existing_buyer,
+            subtotal=120,
+            total_amount=120,
+            status=OrderStatus.PAID,
+            shipping_zip_code="71000000",
+            shipping_street="R",
+            shipping_number="1",
+            shipping_neighborhood="B",
+            shipping_city="C",
+            shipping_state="DF",
+        )
+        OrderItem.objects.create(
+            order=existing_order, variation=self.variation, quantity=3, unit_price=40,
+            product_name="ProdutoLimite - U",
+        )
+
+        self.buyer = User.objects.create_user(
+            email="buyer2@shio.com", name="Buyer2", password="senha_forte_123"
+        )
+        self.address = make_address(self.buyer)
+        self.cart = Cart.objects.create(user=self.buyer, status="ACTIVE")
+        CartItem.objects.create(
+            cart=self.cart, variation=self.variation, quantity=1, unit_price=40
+        )
+
+        self.client.force_authenticate(user=self.buyer)
+        self.url = "/api/orders/checkout/"
+
+    def test_checkout_bloqueado_quando_excede_max_quantity_do_drop(self):
+        response = self.client.post(
+            self.url, {"address_id": str(self.address.id), "shipping_cost": 0}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.cart.refresh_from_db()
+        self.assertEqual(self.cart.status, "ACTIVE")
+        self.variation.refresh_from_db()
+        self.assertEqual(self.variation.stock_quantity, 100)
+
+    @patch("orders.views.create_infinitepay_checkout")
+    def test_cancelar_pedido_existente_libera_quantidade_para_novo_checkout(
+        self, mock_checkout
+    ):
+        """Sem reservas: cancelar o pedido que ocupava o limite libera a
+        quantidade automaticamente, pois deixa de ser contada (exclude CANCELED)."""
+        mock_checkout.return_value = "https://pay.example.com/mock"
+
+        existing_order = CustomerOrder.objects.filter(status=OrderStatus.PAID).first()
+        existing_order.status = OrderStatus.CANCELED
+        existing_order.save()
+
+        response = self.client.post(
+            self.url, {"address_id": str(self.address.id), "shipping_cost": 0}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.cart.refresh_from_db()
+        self.assertEqual(self.cart.status, "FINISHED")
+        self.variation.refresh_from_db()
+        self.assertEqual(self.variation.stock_quantity, 99)
+
+
+class ConcurrentCheckoutStockTests(TransactionTestCase):
+    """Comprova que dois checkouts concorrentes para a última unidade em
+    estoque não resultam em overselling: só um é confirmado."""
+
+    def setUp(self):
+        self.category = Category.objects.create(name="ConcCat", slug="conc-cat")
+        self.product = Product.objects.create(
+            category=self.category, name="ProdutoConcorrente", description="x",
+            base_price=100,
+        )
+        self.variation = ProductVariation.objects.create(
+            product=self.product, size="U", sku="CONC-STOCK-1", stock_quantity=1
+        )
+
+        self.user1 = User.objects.create_user(email="conc_stock1@shio.com", name="ConcStock1")
+        self.user2 = User.objects.create_user(email="conc_stock2@shio.com", name="ConcStock2")
+
+        self.address1 = make_address(self.user1)
+        self.address2 = make_address(self.user2)
+
+        for user in (self.user1, self.user2):
+            cart = Cart.objects.create(user=user, status="ACTIVE")
+            CartItem.objects.create(cart=cart, variation=self.variation, quantity=1, unit_price=100)
+
+    @patch("orders.views.create_infinitepay_checkout")
+    def test_checkout_concorrente_nao_ultrapassa_estoque(self, mock_checkout):
+        mock_checkout.return_value = "https://pay.example.com/mock"
+        results = {}
+
+        # Tokens gerados fora das threads: RefreshToken.for_user() também
+        # escreve no banco (OutstandingToken), e no SQLite ':memory:' dos
+        # testes (dev/prod usam Postgres, com locking real de linha) qualquer
+        # escrita concorrente enquanto a outra thread está em transação pode
+        # ser recusada com "database table is locked" em vez de bloquear.
+        token1 = str(RefreshToken.for_user(self.user1).access_token)
+        token2 = str(RefreshToken.for_user(self.user2).access_token)
+
+        def do_checkout(key, token, address_id):
+            client = APIClient(raise_request_exception=False)
+            client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+            try:
+                response = client.post(
+                    "/api/orders/checkout/",
+                    {"address_id": str(address_id), "shipping_cost": 0},
+                    format="json",
+                )
+                results[key] = response.status_code
+            except Exception:
+                # Ver nota acima sobre SQLITE_LOCKED — tratado como "não
+                # confirmado", igual a uma resposta de erro graciosa.
+                results[key] = "error"
+            finally:
+                connection.close()
+
+        t1 = threading.Thread(target=do_checkout, args=("t1", token1, self.address1.id))
+        t2 = threading.Thread(target=do_checkout, args=("t2", token2, self.address2.id))
+        t1.start()
+        t2.start()
+        t1.join(timeout=30)
+        t2.join(timeout=30)
+
+        statuses = list(results.values())
+        self.assertEqual(len(statuses), 2)
+        self.assertEqual(statuses.count(201), 1, f"esperado exatamente 1 sucesso, obtido {statuses}")
+
+        self.variation.refresh_from_db()
+        self.assertEqual(self.variation.stock_quantity, 0)
+        self.assertEqual(
+            CustomerOrder.objects.filter(status=OrderStatus.AWAITING_PAYMENT).count(), 1
+        )
+
+
+class ConcurrentCheckoutDropLimitTests(TransactionTestCase):
+    """Comprova que dois checkouts concorrentes para a última unidade do
+    max_quantity de um drop não resultam em overselling: só um é confirmado.
+
+    Nota: a exclusão mútua real depende de select_for_update() no DropCampaign,
+    que é aplicado de fato em Postgres (usado em dev/prod). No SQLite dos
+    testes, select_for_update() é um no-op — este teste valida o comportamento
+    fim-a-fim mas não substitui uma verificação de locking real em Postgres."""
+
+    def setUp(self):
+        self.drop = DropCampaign.objects.create(
+            name="DropConcorrente", slug="drop-concorrente", is_public=True,
+            is_active=True, max_quantity=1,
+        )
+        self.category = Category.objects.create(name="ConcDropCat", slug="conc-drop-cat")
+        self.product = Product.objects.create(
+            category=self.category, drop=self.drop, name="ProdutoDropConcorrente",
+            description="x", base_price=50,
+        )
+        self.variation = ProductVariation.objects.create(
+            product=self.product, size="U", sku="CONC-DROP-1", stock_quantity=10
+        )
+
+        self.user1 = User.objects.create_user(email="conc_drop1@shio.com", name="ConcDrop1")
+        self.user2 = User.objects.create_user(email="conc_drop2@shio.com", name="ConcDrop2")
+
+        self.address1 = make_address(self.user1)
+        self.address2 = make_address(self.user2)
+
+        for user in (self.user1, self.user2):
+            cart = Cart.objects.create(user=user, status="ACTIVE")
+            CartItem.objects.create(cart=cart, variation=self.variation, quantity=1, unit_price=50)
+
+    @patch("orders.views.create_infinitepay_checkout")
+    def test_checkout_concorrente_nao_ultrapassa_max_quantity(self, mock_checkout):
+        mock_checkout.return_value = "https://pay.example.com/mock"
+        results = {}
+
+        # Ver comentário equivalente em ConcurrentCheckoutStockTests sobre
+        # tokens gerados fora das threads e SQLITE_LOCKED do shared-cache.
+        token1 = str(RefreshToken.for_user(self.user1).access_token)
+        token2 = str(RefreshToken.for_user(self.user2).access_token)
+
+        def do_checkout(key, token, address_id):
+            client = APIClient(raise_request_exception=False)
+            client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+            try:
+                response = client.post(
+                    "/api/orders/checkout/",
+                    {"address_id": str(address_id), "shipping_cost": 0},
+                    format="json",
+                )
+                results[key] = response.status_code
+            except Exception:
+                results[key] = "error"
+            finally:
+                connection.close()
+
+        t1 = threading.Thread(target=do_checkout, args=("t1", token1, self.address1.id))
+        t2 = threading.Thread(target=do_checkout, args=("t2", token2, self.address2.id))
+        t1.start()
+        t2.start()
+        t1.join(timeout=30)
+        t2.join(timeout=30)
+
+        statuses = list(results.values())
+        self.assertEqual(len(statuses), 2)
+        self.assertEqual(statuses.count(201), 1, f"esperado exatamente 1 sucesso, obtido {statuses}")
+
+        total_sold = (
+            OrderItem.objects.filter(variation__product__drop=self.drop)
+            .exclude(order__status=OrderStatus.CANCELED)
+            .aggregate(total=Sum("quantity"))["total"]
+        )
+        self.assertEqual(total_sold, 1)
 class WelcomeCouponSeedTests(APITestCase):
     def test_seed_cria_cupom_bemvindo10(self):
         from orders.models import Coupon

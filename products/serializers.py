@@ -6,6 +6,7 @@ from django.utils import timezone
 from django.utils.text import slugify
 from rest_framework import serializers
 
+from .availability import is_drop_sellable, is_drop_visible, is_product_sellable
 from .models import (
     Category,
     DropCampaign,
@@ -122,7 +123,15 @@ class ProductNestedSerializer(serializers.ModelSerializer):
 
 
 class DropCampaignSerializer(serializers.ModelSerializer):
-    """Serializer de DropCampaign — list, create e update (PUT)."""
+    """Serializer de DropCampaign — list, create e update (PUT).
+
+    `is_visible` e `is_sellable` são computados pela política única da issue
+    #6 (products.availability) — o frontend deve ler esses campos em vez de
+    reimplementar a lógica de datas/limite em JS.
+    """
+
+    is_visible = serializers.SerializerMethodField()
+    is_sellable = serializers.SerializerMethodField()
 
     class Meta:
         model = DropCampaign
@@ -137,6 +146,8 @@ class DropCampaignSerializer(serializers.ModelSerializer):
             "end_date",
             "max_quantity",
             "is_active",
+            "is_visible",
+            "is_sellable",
             "created_at",
             "updated_at",
         ]
@@ -145,15 +156,35 @@ class DropCampaignSerializer(serializers.ModelSerializer):
             "slug": {"required": False, "allow_blank": True},
         }
 
+    def get_is_visible(self, obj) -> bool:
+        return is_drop_visible(obj)
+
+    def get_is_sellable(self, obj) -> bool:
+        return is_drop_sellable(obj)
+
     def validate_banner(self, value):
         max_mb = 5
         if value and value.size > max_mb * 1024 * 1024:
             raise serializers.ValidationError(f"Banner não pode passar de {max_mb}MB.")
         return value
 
+    def validate_max_quantity(self, value):
+        if value is not None and value <= 0:
+            raise serializers.ValidationError(
+                "max_quantity deve ser um inteiro maior que zero, ou nulo (sem limite)."
+            )
+        return value
+
     def validate(self, attrs):
-        launch = attrs.get("launch_date")
-        end = attrs.get("end_date")
+        # Em atualizações parciais, um campo de data ausente no payload deve
+        # cair para o valor já persistido (não para None) antes de comparar.
+        if self.instance is not None:
+            launch = attrs.get("launch_date", self.instance.launch_date)
+            end = attrs.get("end_date", self.instance.end_date)
+        else:
+            launch = attrs.get("launch_date")
+            end = attrs.get("end_date")
+
         if launch and end and end <= launch:
             raise serializers.ValidationError(
                 {"end_date": "end_date deve ser posterior a launch_date."}
@@ -333,7 +364,6 @@ class DropNestedSerializer(serializers.ModelSerializer):
         fields = ["id", "name", "slug"]
         read_only_fields = fields
 
-
 PRICE_FIELDS = [
     "promotional_price",
     "promo_start",
@@ -383,15 +413,22 @@ class ProductPricingSerializer(serializers.ModelSerializer):
                 )
             )
         return data
-
+      
 
 class ProductListSerializer(ProductPricingSerializer):
-    """Versão enxuta de Product para listagem pública."""
+    """Versão enxuta de Product para listagem pública.
+
+    `is_sellable` reflete a política da issue #6: um produto pode aparecer
+    aqui (o backend já só lista produtos visíveis) e ainda assim não ser
+    vendável — drop Rascunho, Programado, Encerrado ou Esgotado. O frontend
+    deve usar este campo para desabilitar o botão de compra, não `is_active`.
+    """
 
     variations = ProductVariationSerializer(many=True, read_only=True)
     images = ProductImageSerializer(many=True, read_only=True)
     category_details = CategoryNestedSerializer(source="category", read_only=True)
     drop_details = DropNestedSerializer(source="drop", read_only=True)
+    is_sellable = serializers.SerializerMethodField()
 
     class Meta:
         model = Product
@@ -401,6 +438,7 @@ class ProductListSerializer(ProductPricingSerializer):
             "base_price",
             *PRICE_FIELDS,
             "is_active",
+            "is_sellable",
             "category",
             "drop",
             "category_details",
@@ -411,6 +449,9 @@ class ProductListSerializer(ProductPricingSerializer):
         ]
         read_only_fields = fields
 
+    def get_is_sellable(self, obj) -> bool:
+        return is_product_sellable(obj)
+
 
 class ProductDetailSerializer(ProductPricingSerializer):
     """Detalhe completo com variations, images e relações expandidas."""
@@ -419,6 +460,7 @@ class ProductDetailSerializer(ProductPricingSerializer):
     images = ProductImageSerializer(many=True, read_only=True)
     category = CategoryNestedSerializer(read_only=True)
     drop = DropNestedSerializer(read_only=True)
+    is_sellable = serializers.SerializerMethodField()
 
     class Meta:
         model = Product
@@ -429,6 +471,7 @@ class ProductDetailSerializer(ProductPricingSerializer):
             "base_price",
             *PRICE_FIELDS,
             "is_active",
+            "is_sellable",
             "category",
             "drop",
             "variations",
@@ -437,6 +480,9 @@ class ProductDetailSerializer(ProductPricingSerializer):
             "updated_at",
         ]
         read_only_fields = fields
+
+    def get_is_sellable(self, obj) -> bool:
+        return is_product_sellable(obj)
 
 
 class ProductWriteSerializer(StrictSerializer):

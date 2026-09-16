@@ -7,8 +7,12 @@ from django.db.models import Exists, Max, OuterRef, Q, Sum
 from django.db.models.deletion import ProtectedError
 from django.http import JsonResponse
 from django.shortcuts import get_object_or_404
-from django.utils import timezone
-from drf_spectacular.utils import OpenApiResponse, extend_schema
+from drf_spectacular.utils import (
+    OpenApiParameter,
+    OpenApiResponse,
+    OpenApiTypes,
+    extend_schema,
+)
 from rest_framework import status
 from rest_framework.exceptions import ValidationError
 from rest_framework.pagination import PageNumberPagination
@@ -19,6 +23,12 @@ from rest_framework.views import APIView
 
 from authentication.permissions import IsStaffOrSuperUser
 
+from .availability import (
+    is_drop_visible,
+    is_product_visible,
+    visible_drops_queryset,
+    visible_products_queryset,
+)
 from .catalog import (
     CatalogPagination,
     RecommendationPagination,
@@ -193,7 +203,7 @@ class CategoryDetailView(APIView):
 
 
 class DropCampaignListCreateView(APIView):
-    """Listar drops (público, com filtro ?active=true) e criar (admin)."""
+    """Listar drops (público, visibilidade automática) e criar (admin)."""
 
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
@@ -207,20 +217,44 @@ class DropCampaignListCreateView(APIView):
         summary="Listar drops",
         description=(
             "Lista paginada de campanhas de drop.\n\n"
-            "Parâmetro opcional `?active=true` retorna apenas drops com "
-            "`is_active=True` dentro do período `[launch_date, end_date]`."
+            "**Público** (não autenticado ou não-admin): aplica automaticamente a "
+            "política de visibilidade da issue #6 — retorna apenas drops com "
+            "`is_public=True`. Não é necessário (nem possível) desativar esse "
+            "filtro. Note que um drop Rascunho (`is_active=False`), Programado "
+            "(`launch_date` futuro), Encerrado (`end_date` passado) ou Esgotado "
+            "(`max_quantity` atingido) continua aparecendo aqui — esses estados "
+            "só afetam `is_sellable` (se dá para comprar), não a visibilidade. "
+            "Só `is_public=False` (Privado) é ocultado.\n\n"
+            "**Admin**: por padrão vê todos os drops (incluindo privados). Use "
+            "`?visible=true` para pré-visualizar exatamente o que o público vê."
         ),
+        parameters=[
+            OpenApiParameter(
+                name="visible",
+                type=OpenApiTypes.BOOL,
+                required=False,
+                description=(
+                    "Somente para admin. Quando `true`, aplica o mesmo filtro de "
+                    "visibilidade pública usado para utilizadores não-admin."
+                ),
+            ),
+        ],
         responses={200: DropCampaignSerializer(many=True)},
     )
     def get(self, request):
+        is_admin = request.user.is_authenticated and getattr(
+            request.user, "is_admin", False
+        )
         queryset = DropCampaign.objects.all().order_by("-created_at")
-        if request.query_params.get("active", "").lower() == "true":
-            now = timezone.now()
-            queryset = (
-                queryset.filter(is_active=True)
-                .filter(Q(launch_date__isnull=True) | Q(launch_date__lte=now))
-                .filter(Q(end_date__isnull=True) | Q(end_date__gte=now))
-            )
+
+        if is_admin:
+            if request.query_params.get("visible", "").lower() == "true":
+                queryset = visible_drops_queryset(queryset)
+        else:
+            # Política da issue #6 aplicada automaticamente — sempre, sem
+            # depender de um parâmetro de query.
+            queryset = visible_drops_queryset(queryset)
+
         paginator = PageNumberPagination()
         page = paginator.paginate_queryset(queryset, request, view=self)
         serializer = DropCampaignSerializer(
@@ -278,13 +312,29 @@ class DropCampaignDetailView(APIView):
     @extend_schema(
         tags=["Drops"],
         summary="Detalhe do drop com produtos",
+        description=(
+            "Retorna o drop com os produtos aninhados.\n\n"
+            "Retorna 404 para utilizadores não-admin apenas quando `is_public=False` "
+            "(política da issue #6). Rascunho, Programado, Encerrado e Esgotado "
+            "continuam retornando 200 — esses estados só afetam `is_sellable`. "
+            "Admin sempre vê o drop, independente da visibilidade."
+        ),
         responses={
             200: DropCampaignDetailSerializer,
-            404: OpenApiResponse(description="Drop não encontrado."),
+            404: OpenApiResponse(
+                description="Drop não encontrado ou não visível ao público."
+            ),
         },
     )
     def get(self, request, pk):
         drop = self._get_object(pk)
+        is_admin = request.user.is_authenticated and getattr(
+            request.user, "is_admin", False
+        )
+        if not is_admin and not is_drop_visible(drop):
+            return Response(
+                {"error": "Drop não encontrado."}, status=status.HTTP_404_NOT_FOUND
+            )
         return Response(
             DropCampaignDetailSerializer(drop, context={"request": request}).data
         )
@@ -444,23 +494,39 @@ class ProductListCreateView(APIView):
         tags=["Products"],
         summary="Listar produtos",
         description=(
-            "Lista paginada do catálogo. Endpoint público — só retorna produtos "
-            "com `is_active=True` e ao menos uma variação com `stock_quantity > 0` "
-            "para chamadas não autenticadas e clientes.\n\n"
+            "Lista paginada do catálogo. Endpoint público — aplica automaticamente "
+            "a política de visibilidade da issue #6 (oculta produtos inativos e "
+            "vinculados a um drop privado, `is_public=False`; produtos de um drop "
+            "Rascunho, Programado, Encerrado ou Esgotado continuam aparecendo — "
+            "veja `is_sellable` para saber se dá pra comprar) e também exige ao "
+            "menos uma variação com `stock_quantity > 0` para chamadas não "
+            "autenticadas e clientes.\n\n"
             "Categoria por slug; valores reconhecidos como UUID são sempre IDs legados. "
             "Drop por UUID. Busca sem distinção de maiúsculas em name/description. "
             "Cores exatas repetidas: `color=Preto&color=Azul`; tamanho e cor na mesma "
             "variação. Preços inclusivos, não negativos, com até duas casas decimais. "
             "Página inicial 1, tamanho padrão 20 e máximo 50 (valores maiores são limitados). "
             "Parâmetros inválidos retornam 400; página inexistente retorna 404. "
-            "Para clientes e visitantes, tamanho e cor devem corresponder a uma mesma "
-            "variação com estoque positivo. Nomes de cores conhecidos são normalizados. "
+            "Nomes de cores conhecidos são normalizados. "
             "Ordenação padrão -created_at, com id como desempate; preços e vendas "
             "desempatam por -created_at e id. Vendas somam quantidades de pedidos PAID, "
-            "PREPARING, SHIPPED e DELIVERED. "
-            "`is_active=true|false` mantém o comportamento administrativo existente."
+            "PREPARING, SHIPPED e DELIVERED.\n\n"
+            "**Admin**: por padrão vê todos os produtos, incluindo inativos e "
+            "vinculados a drops privados. `is_active=true|false` filtra por "
+            "atividade; `?visible=true` pré-visualiza exatamente o que o público vê."
         ),
-        parameters=[ProductListQuerySerializer],
+        parameters=[
+            ProductListQuerySerializer,
+            OpenApiParameter(
+                name="visible",
+                type=OpenApiTypes.BOOL,
+                required=False,
+                description=(
+                    "Somente admin. Quando `true`, aplica o mesmo filtro de "
+                    "visibilidade pública usado para utilizadores não-admin."
+                ),
+            ),
+        ],
         responses={
             200: ProductListSerializer(many=True),
             400: OpenApiResponse(description="Parâmetros de consulta inválidos."),
@@ -482,13 +548,16 @@ class ProductListCreateView(APIView):
             request.user, "is_admin", False
         )
         is_active_param = query.validated_data.get("is_active")
-        if is_admin and is_active_param is not None:
-            qs = qs.filter(is_active=is_active_param)
-        elif not is_admin:
+        if is_admin:
+            if is_active_param is not None:
+                qs = qs.filter(is_active=is_active_param)
+            if request.query_params.get("visible", "").lower() == "true":
+                qs = visible_products_queryset(qs)
+        else:
             available = ProductVariation.objects.filter(
                 product_id=OuterRef("pk"), stock_quantity__gt=0
             )
-            qs = qs.filter(Exists(available), is_active=True)
+            qs = visible_products_queryset(qs).filter(Exists(available))
 
         qs = filter_catalog(qs, query.validated_data, require_stock=not is_admin)
         paginator = self.pagination_class()
@@ -596,7 +665,10 @@ class ProductDetailView(APIView):
         is_admin = request.user.is_authenticated and getattr(
             request.user, "is_admin", False
         )
-        if not product.is_active and not (is_admin and allow_inactive_for_admin):
+        if is_admin and allow_inactive_for_admin:
+            return product
+        if not is_product_visible(product):
+
             raise Product.DoesNotExist
         return product
 
@@ -605,7 +677,9 @@ class ProductDetailView(APIView):
         summary="Detalhe do produto",
         description=(
             "Retorna o produto com variations, images, category e drop expandidos.\n\n"
-            "Retorna 404 se `is_active=False` para chamadas não autenticadas ou de clientes."
+            "Retorna 404 para não-admin quando `is_active=False` ou quando o "
+            "produto está vinculado a um drop privado (`is_public=False`, política "
+            "da issue #6). Admin sempre vê o produto."
         ),
         responses={
             200: ProductDetailSerializer,
