@@ -34,13 +34,13 @@ class UserSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = [
-            "id", 
-            "email", 
-            "is_staff", 
+            "id",
+            "email",
+            "is_staff",
             "is_superuser",
             "is_admin",
-            "created_at", 
-            "updated_at"
+            "created_at",
+            "updated_at",
         ]
 
     def update(self, instance, validated_data):
@@ -85,18 +85,26 @@ class PasswordLoginSerializer(serializers.Serializer):
         password = attrs.get("password")
 
         if email and password:
-            user = authenticate(request=self.context.get("request"), email=email, password=password)
+            user = authenticate(
+                request=self.context.get("request"), email=email, password=password
+            )
             if not user:
-                raise serializers.ValidationError("Credenciais inválidas.", code="authorization")
+                raise serializers.ValidationError(
+                    "Credenciais inválidas.", code="authorization"
+                )
         else:
-            raise serializers.ValidationError("Email e password são obrigatórios.", code="authorization")
+            raise serializers.ValidationError(
+                "Email e password são obrigatórios.", code="authorization"
+            )
 
         attrs["user"] = user
         return attrs
 
 
 class RegisterSerializer(serializers.ModelSerializer):
-    password = serializers.CharField(write_only=True, required=True, validators=[validate_password])
+    password = serializers.CharField(
+        write_only=True, required=True, validators=[validate_password]
+    )
     name = serializers.CharField(required=True)
 
     class Meta:
@@ -108,7 +116,7 @@ class RegisterSerializer(serializers.ModelSerializer):
             email=validated_data["email"],
             name=validated_data["name"],
             password=validated_data["password"],
-            is_new_user=True
+            is_new_user=True,
         )
         return user
 
