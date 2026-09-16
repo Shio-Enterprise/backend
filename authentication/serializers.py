@@ -1,10 +1,10 @@
+from django.contrib.auth import authenticate
+from django.contrib.auth.password_validation import validate_password
 from rest_framework import serializers
 
 from orders.models import CustomerOrder
 
 from .models import Address, User, UserProfile
-from django.contrib.auth.password_validation import validate_password
-from django.contrib.auth import authenticate
 
 
 class UserSerializer(serializers.ModelSerializer):

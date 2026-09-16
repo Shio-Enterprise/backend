@@ -5,6 +5,7 @@ from datetime import datetime
 import requests
 from django.conf import settings
 from django.core.cache import cache
+from django.core.exceptions import ObjectDoesNotExist
 
 from . import correios_mock
 

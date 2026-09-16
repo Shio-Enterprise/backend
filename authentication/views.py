@@ -25,10 +25,10 @@ from .serializers import (
     CustomerCRMSerializer,
     GoogleAuthSerializer,
     LogoutInputSerializer,
+    PasswordLoginSerializer,
+    RegisterSerializer,
     TokenRefreshInputSerializer,
     UserSerializer,
-    RegisterSerializer,
-    PasswordLoginSerializer,
 )
 from .services import GoogleAuthService, InvalidGoogleTokenException
 

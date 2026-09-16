@@ -1,5 +1,4 @@
 import logging
-import warnings
 
 from whitenoise.storage import CompressedManifestStaticFilesStorage, MissingFileError
 
