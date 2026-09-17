@@ -1,6 +1,7 @@
 import datetime
 import logging
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.db.models import Count, DecimalField, ExpressionWrapper, F, Q, Sum
@@ -65,6 +66,8 @@ from .services import (
     complete_checkout_attempt,
     create_shipping_quote,
     get_cart_data,
+    get_welcome_discount,
+    release_if_expired,
     prepare_checkout_attempt,
     remove_item_from_cart,
     restore_order_stock,
@@ -340,6 +343,7 @@ class UserOrderDetailView(APIView):
             )
         except CustomerOrder.DoesNotExist:
             return Response({"message": "Pedido não encontrado."}, status=404)
+        release_if_expired(order)
         return Response(OrderDetailSerializer(order).data, status=status.HTTP_200_OK)
 
 
@@ -393,6 +397,7 @@ class AdminOrderDetailView(APIView):
         except CustomerOrder.DoesNotExist:
             return Response({"message": "Pedido não encontrado."}, status=404)
 
+        release_if_expired(order)
         return Response(OrderDetailSerializer(order).data, status=status.HTTP_200_OK)
 
     @extend_schema(

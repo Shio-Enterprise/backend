@@ -600,7 +600,10 @@ def prepare_checkout_attempt(user, address_id, shipping_quote_id, idempotency_ke
             shipping_neighborhood=address.neighborhood,
             shipping_city=address.city,
             shipping_state=address.state,
+            reservation_expires_at=timezone.now()
+            + timedelta(minutes=settings.STOCK_RESERVATION_TTL_MINUTES),
         )
+        
         for item in calculation["items"]:
             variation = item["variation"]
             order_item = OrderItem.objects.create(
@@ -996,6 +999,19 @@ def merge_session_cart_to_db(request, user):
             # In some contexts session backend may not support save here;
             # ensure modified flag is set so caller can persist if needed.
             pass
+
+
+def release_if_expired(order):
+    if order.status != OrderStatus.AWAITING_PAYMENT:
+        return
+
+    if not order.reservation_expires_at:
+        return
+
+    if order.reservation_expires_at >= timezone.now():
+        return
+
+    update_status(order, OrderStatus.CANCELED, comment="Reserva de estoque expirada.")
 
 
 @transaction.atomic
