@@ -364,6 +364,7 @@ class DropNestedSerializer(serializers.ModelSerializer):
         fields = ["id", "name", "slug"]
         read_only_fields = fields
 
+
 PRICE_FIELDS = [
     "promotional_price",
     "promo_start",

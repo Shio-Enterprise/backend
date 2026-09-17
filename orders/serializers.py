@@ -17,8 +17,14 @@ class DashboardRecentOrderSerializer(serializers.ModelSerializer):
     class Meta:
         model = CustomerOrder
         fields = [
-            "id", "customer_name", "total_amount", "status", "payment_status",
-            "paid_at", "created_at", "revenue_value",
+            "id",
+            "customer_name",
+            "total_amount",
+            "status",
+            "payment_status",
+            "paid_at",
+            "created_at",
+            "revenue_value",
         ]
 
     def get_customer_name(self, obj) -> str:

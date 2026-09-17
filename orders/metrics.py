@@ -29,7 +29,11 @@ def resolve_period(params):
 
     raw_start = params.get("start_date")
     raw_end = params.get("end_date")
-    start_date = parse_date(raw_start) if raw_start else today - datetime.timedelta(days=default_days - 1)
+    start_date = (
+        parse_date(raw_start)
+        if raw_start
+        else today - datetime.timedelta(days=default_days - 1)
+    )
     end_date = parse_date(raw_end) if raw_end else today
     if (raw_start and start_date is None) or (raw_end and end_date is None):
         raise ValidationError("start_date e end_date devem usar o formato YYYY-MM-DD.")
@@ -37,7 +41,11 @@ def resolve_period(params):
         raise ValidationError("start_date não pode ser posterior a end_date.")
 
     granularity = "month" if preset == "annual" else "day"
-    return _local_midnight(start_date), _local_midnight(end_date + datetime.timedelta(days=1)), granularity
+    return (
+        _local_midnight(start_date),
+        _local_midnight(end_date + datetime.timedelta(days=1)),
+        granularity,
+    )
 
 
 def apply_dimensions(queryset: QuerySet, params) -> QuerySet:
@@ -105,9 +113,9 @@ def is_recurring_customer(user, params=None) -> bool:
     else:
         orders = positive_sales(metric_orders(params)).filter(user=user)
     purchased = set(
-        orders
-        .values_list("items__variation__product__drop_id", flat=True)
-        .exclude(items__variation__product__drop_id__isnull=True)
+        orders.values_list("items__variation__product__drop_id", flat=True).exclude(
+            items__variation__product__drop_id__isnull=True
+        )
     )
     if len(purchased) < 2:
         return False
@@ -115,7 +123,13 @@ def is_recurring_customer(user, params=None) -> bool:
     from products.models import DropCampaign
 
     all_ids = list(
-        DropCampaign.objects.order_by("launch_date", "created_at", "id").values_list("id", flat=True)
+        DropCampaign.objects.order_by("launch_date", "created_at", "id").values_list(
+            "id", flat=True
+        )
     )
-    positions = sorted(all_ids.index(drop_id) for drop_id in purchased if drop_id in all_ids)
-    return any(current == previous + 1 for previous, current in zip(positions, positions[1:]))
+    positions = sorted(
+        all_ids.index(drop_id) for drop_id in purchased if drop_id in all_ids
+    )
+    return any(
+        current == previous + 1 for previous, current in zip(positions, positions[1:])
+    )

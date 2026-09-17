@@ -34,7 +34,9 @@ class O7MetricsTestCase(APITestCase):
     crm_url = "/api/auth/crm/customers/"
 
     def setUp(self):
-        self.admin = self.create_user("admin-o7@example.com", "Admin O7", UserRole.ADMIN)
+        self.admin = self.create_user(
+            "admin-o7@example.com", "Admin O7", UserRole.ADMIN
+        )
         self.admin.is_staff = True
         self.admin.save(update_fields=["is_staff"])
         self.customer = self.create_user(
@@ -156,9 +158,16 @@ class O7MetricsTestCase(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         payload = response.json()
         self.assertEqual(payload["period"]["granularity"], "month")
-        points = {point["period"]: Decimal(point["total_revenue"]) for point in payload["series"]}
-        self.assertEqual(points[current.date().replace(day=1).isoformat()], Decimal("80.00"))
-        self.assertEqual(points[previous.date().replace(day=1).isoformat()], Decimal("20.00"))
+        points = {
+            point["period"]: Decimal(point["total_revenue"])
+            for point in payload["series"]
+        }
+        self.assertEqual(
+            points[current.date().replace(day=1).isoformat()], Decimal("80.00")
+        )
+        self.assertEqual(
+            points[previous.date().replace(day=1).isoformat()], Decimal("20.00")
+        )
 
     def test_fronteira_diaria_usa_timezone_de_sao_paulo(self):
         inside_local_day = datetime.datetime(2026, 1, 2, 2, 30, tzinfo=UTC)
@@ -173,13 +182,17 @@ class O7MetricsTestCase(APITestCase):
 
         payload = response.json()
         self.assertEqual(payload["sales_summary"]["total_orders"], 1)
-        self.assertEqual(Decimal(payload["sales_summary"]["total_revenue"]), Decimal("45.00"))
+        self.assertEqual(
+            Decimal(payload["sales_summary"]["total_revenue"]), Decimal("45.00")
+        )
         self.assertEqual(payload["series"][0]["period"], "2026-01-01")
 
     def test_drill_down_e_paginado_e_ordenado_por_paid_at(self):
         base = timezone.now().astimezone(SAO_PAULO) - datetime.timedelta(days=1)
         for index in range(21):
-            self.create_order(total="10.00", paid_at=base + datetime.timedelta(minutes=index))
+            self.create_order(
+                total="10.00", paid_at=base + datetime.timedelta(minutes=index)
+            )
 
         first_page = self.client.get(self.drill_down_url)
 
@@ -235,7 +248,9 @@ class O7MetricsTestCase(APITestCase):
         consecutive = self.create_user(
             "consecutivo@example.com", "Cliente Consecutivo", UserRole.CUSTOMER
         )
-        gap = self.create_user("intervalo@example.com", "Cliente Intervalo", UserRole.CUSTOMER)
+        gap = self.create_user(
+            "intervalo@example.com", "Cliente Intervalo", UserRole.CUSTOMER
+        )
 
         for user, indexes in [(consecutive, [0, 1]), (gap, [0, 2])]:
             for index in indexes:
@@ -249,10 +264,19 @@ class O7MetricsTestCase(APITestCase):
         self.assertFalse(by_email["intervalo@example.com"]["is_recurring"])
 
     def test_historico_exibe_todos_os_pedidos_e_status_comercial(self):
-        self.create_order(order_status=OrderStatus.AWAITING_PAYMENT, payment_status=PaymentStatus.PENDING)
-        self.create_order(order_status=OrderStatus.SHIPPED, payment_status=PaymentStatus.PAID)
-        self.create_order(order_status=OrderStatus.DELIVERED, payment_status=PaymentStatus.PAID)
-        self.create_order(order_status=OrderStatus.CANCELED, payment_status=PaymentStatus.REFUNDED)
+        self.create_order(
+            order_status=OrderStatus.AWAITING_PAYMENT,
+            payment_status=PaymentStatus.PENDING,
+        )
+        self.create_order(
+            order_status=OrderStatus.SHIPPED, payment_status=PaymentStatus.PAID
+        )
+        self.create_order(
+            order_status=OrderStatus.DELIVERED, payment_status=PaymentStatus.PAID
+        )
+        self.create_order(
+            order_status=OrderStatus.CANCELED, payment_status=PaymentStatus.REFUNDED
+        )
 
         response = self.client.get(f"{self.crm_url}{self.customer.id}/")
 
@@ -272,8 +296,12 @@ class O7MetricsTestCase(APITestCase):
         category = Category.objects.create(name="Drops mistos", slug="drops-mistos-o7")
         drop_a = DropCampaign.objects.create(name="Drop A", slug="drop-a-o7")
         drop_b = DropCampaign.objects.create(name="Drop B", slug="drop-b-o7")
-        variation_a = self.create_product(name="Produto A", drop=drop_a, category=category)
-        variation_b = self.create_product(name="Produto B", drop=drop_b, category=category)
+        variation_a = self.create_product(
+            name="Produto A", drop=drop_a, category=category
+        )
+        variation_b = self.create_product(
+            name="Produto B", drop=drop_b, category=category
+        )
         order = self.create_order(
             subtotal="100.00", shipping="20.00", discount="10.00", total="110.00"
         )
@@ -282,7 +310,9 @@ class O7MetricsTestCase(APITestCase):
 
         response = self.client.get(self.drop_revenue_url)
 
-        revenue = {item["drop_id"]: Decimal(item["revenue"]) for item in response.json()}
+        revenue = {
+            item["drop_id"]: Decimal(item["revenue"]) for item in response.json()
+        }
         self.assertEqual(revenue[str(drop_a.id)], Decimal("60.00"))
         self.assertEqual(revenue[str(drop_b.id)], Decimal("40.00"))
         summary = self.client.get(self.dashboard_url).json()["sales_summary"]
@@ -291,11 +321,17 @@ class O7MetricsTestCase(APITestCase):
     def test_reembolso_afeta_serie_temporal_e_total_gasto_do_crm(self):
         paid_at = timezone.now().astimezone(SAO_PAULO) - datetime.timedelta(hours=1)
         self.create_order(total="100.00", paid_at=paid_at)
-        self.create_order(total="30.00", payment_status=PaymentStatus.REFUNDED, paid_at=paid_at)
+        self.create_order(
+            total="30.00", payment_status=PaymentStatus.REFUNDED, paid_at=paid_at
+        )
 
         dashboard = self.client.get(self.dashboard_url).json()
-        self.assertEqual(Decimal(dashboard["sales_summary"]["total_revenue"]), Decimal("70.00"))
-        self.assertEqual(Decimal(dashboard["series"][0]["total_revenue"]), Decimal("70.00"))
+        self.assertEqual(
+            Decimal(dashboard["sales_summary"]["total_revenue"]), Decimal("70.00")
+        )
+        self.assertEqual(
+            Decimal(dashboard["series"][0]["total_revenue"]), Decimal("70.00")
+        )
 
         crm = self.client.get(self.crm_url, {"search": self.customer.email}).json()
         customers = crm.get("results", crm)
