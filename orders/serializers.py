@@ -180,3 +180,40 @@ class CartItemAddSerializer(serializers.Serializer):
 
 class CartItemUpdateSerializer(serializers.Serializer):
     quantity = serializers.IntegerField(min_value=1)
+
+
+class CheckoutCalculationInputSerializer(serializers.Serializer):
+    address_id = serializers.UUIDField()
+
+    def to_internal_value(self, data):
+        if isinstance(data, dict):
+            unexpected = set(data) - set(self.fields)
+            if unexpected:
+                raise serializers.ValidationError(
+                    {
+                        field: "Campo não aceito. Os valores são calculados pelo servidor."
+                        for field in sorted(unexpected)
+                    }
+                )
+        return super().to_internal_value(data)
+
+
+class CheckoutInputSerializer(CheckoutCalculationInputSerializer):
+    shipping_quote_id = serializers.UUIDField()
+    idempotency_key = serializers.UUIDField()
+
+
+class CheckoutQuoteItemSerializer(CartItemRepresentationSerializer):
+    stock_quantity = serializers.IntegerField(required=False)
+
+
+class CheckoutCalculationSerializer(serializers.Serializer):
+    shipping_quote_id = serializers.UUIDField(source="id")
+    expires_at = serializers.DateTimeField()
+    address = serializers.DictField(source="snapshot.address")
+    items = CheckoutQuoteItemSerializer(source="snapshot.items", many=True)
+    prazo_dias = serializers.IntegerField(allow_null=True)
+    subtotal = serializers.DecimalField(max_digits=10, decimal_places=2)
+    shipping_cost = serializers.DecimalField(max_digits=10, decimal_places=2)
+    discount_amount = serializers.DecimalField(max_digits=10, decimal_places=2)
+    total_amount = serializers.DecimalField(max_digits=10, decimal_places=2)

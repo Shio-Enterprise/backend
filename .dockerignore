@@ -1,0 +1,16 @@
+.git
+.env
+.env.*
+secret.json
+.venv
+venv
+env
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+.coverage
+.coverage.*
+htmlcov
+selenium_tests/chrome_profile_teste

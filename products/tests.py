@@ -750,6 +750,12 @@ class ProductListTests(APITestCase):
 
     def test_ordering_por_created_at_desc(self):
         """Mais recente primeiro."""
+        # Datas explícitas evitam empates quando a criação ocorre no mesmo instante.
+        now = timezone.now()
+        Product.objects.filter(pk=self.ativo.pk).update(
+            created_at=now - timedelta(seconds=1)
+        )
+        Product.objects.filter(name="Camisa Preta").update(created_at=now)
         response = self.client.get(self.url)
         results = response.json()["results"]
         ids_returned = [r["id"] for r in results]
@@ -2626,9 +2632,10 @@ class CatalogDecisionTests(APITestCase):
 
 class CheckoutDecisionTests(APITestCase):
     setUp = order_fixtures.CheckoutAPITests.setUp
+    checkout_payload = order_fixtures.CheckoutAPITests.checkout_payload
 
     @patch(
-        "orders.views.create_infinitepay_checkout",
+        "orders.services.create_infinitepay_checkout",
         return_value="https://example.test/pay",
     )
     def test_expiry_reconfirmation_snapshot_and_cancel_once(self, gateway):
@@ -2637,20 +2644,18 @@ class CheckoutDecisionTests(APITestCase):
             cost_price=60,
             promotional_price=80,
             promo_start=now - timedelta(hours=2),
-            promo_end=now - timedelta(hours=1),
+            promo_end=now + timedelta(hours=1),
         )
-        payload = {
-            "address_id": str(self.address.pk),
-            "confirmed_subtotal": "160.00",
-        }
+        payload = self.checkout_payload()
+        Product.objects.filter(pk=self.product.pk).update(promo_end=now - timedelta(hours=1))
         response = self.client.post(
             self.url,
             payload,
             format="json",
         )
 
-        self.assertEqual(response.status_code, 409, response.data)
-        self.assertEqual(response.data["subtotal"], "200.00")
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertIn("shipping_quote_id", response.data)
         self.assertFalse(CustomerOrder.objects.exists())
         self.assertFalse(StockMovement.objects.exists())
 
@@ -2658,10 +2663,7 @@ class CheckoutDecisionTests(APITestCase):
 
         response = self.client.post(
             self.url,
-            {
-                **payload,
-                "confirmed_subtotal": "200.00",
-            },
+            self.checkout_payload(),
             format="json",
         )
 
@@ -2699,16 +2701,13 @@ class CheckoutDecisionTests(APITestCase):
         )
 
     @patch(
-        "orders.views.create_infinitepay_checkout",
+        "orders.services.create_infinitepay_checkout",
         return_value="https://example.test/pay",
     )
     def test_shipped_cancel_waits_for_physical_return(self, gateway):
         response = self.client.post(
             self.url,
-            {
-                "address_id": str(self.address.pk),
-                "confirmed_subtotal": "200.00",
-            },
+            self.checkout_payload(),
             format="json",
         )
 
@@ -2750,20 +2749,20 @@ class CheckoutDecisionTests(APITestCase):
         )
 
     @patch(
-        "orders.views.create_infinitepay_checkout",
+        "orders.services.create_infinitepay_checkout",
         side_effect=RuntimeError("Gateway offline"),
     )
-    def test_gateway_failure_rolls_back_the_ledger(self, gateway):
+    def test_gateway_failure_preserves_order_and_ledger_for_reconciliation(self, gateway):
         response = self.client.post(
             self.url,
-            {"address_id": str(self.address.pk), "confirmed_subtotal": "200.00"},
+            self.checkout_payload(),
             format="json",
         )
-        self.assertEqual(response.status_code, 500)
-        self.assertFalse(StockMovement.objects.exists())
-        self.assertFalse(CustomerOrder.objects.exists())
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(StockMovement.objects.filter(reason="VENDA").count(), 1)
+        self.assertEqual(CustomerOrder.objects.count(), 1)
         self.variation.refresh_from_db()
-        self.assertEqual(self.variation.stock_quantity, 10)
+        self.assertEqual(self.variation.stock_quantity, 8)
 
 
 class CatalogMigrationTests(TransactionTestCase):
@@ -2782,7 +2781,7 @@ class CatalogMigrationTests(TransactionTestCase):
 
     def tearDown(self):
         executor = MigrationExecutor(connection)
-        executor.migrate(self.migrate_to)
+        executor.migrate(executor.loader.graph.leaf_nodes())
         super().tearDown()
 
     def test_migration_preserves_unknown_history_and_records_opening(self):
