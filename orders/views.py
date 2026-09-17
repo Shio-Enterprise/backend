@@ -1,14 +1,14 @@
 import datetime
 import logging
-from collections import defaultdict
-from decimal import Decimal
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import transaction
-from django.db.models import F, Sum
+from django.db.models import Count, DecimalField, ExpressionWrapper, F, Q, Sum
+from django.db.models.functions import TruncDay, TruncMonth
 from django.http import Http404
 from django.utils import timezone
+from django.utils.decorators import method_decorator
 from drf_spectacular.utils import (
     OpenApiParameter,
     OpenApiTypes,
@@ -16,14 +16,15 @@ from drf_spectacular.utils import (
     inline_serializer,
 )
 from rest_framework import serializers, status
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from authentication.permissions import IsStaffOrSuperUser
+
 from products.availability import get_drop_sold_quantity, is_product_open_for_sale
-from products.models import DropCampaign, ProductVariation
-from products.models import Product
+from products.models import DropCampaign, Product, ProductVariation
 from products.services import move_stock
 
 from .correios import (
@@ -33,18 +34,26 @@ from .correios import (
     dispatch_order_and_get_tracking_code,
     get_order_tracking_data,
 )
+from .metrics import (
+    METRICS_TIMEZONE,
+    is_recurring_customer,
+    metric_orders,
+    positive_sales,
+    refunds,
+    resolve_period,
+)
 from .models import (
-    Cart,
     CustomerOrder,
-    OrderItem,
     OrderStatus,
-    OrderStatusLog,
     PaymentStatus,
 )
 from .serializers import (
     CartItemAddSerializer,
     CartItemUpdateSerializer,
     CartRepresentationSerializer,
+    CheckoutCalculationInputSerializer,
+    CheckoutCalculationSerializer,
+    CheckoutInputSerializer,
     DashboardLowStockSerializer,
     DashboardRecentOrderSerializer,
     OrderDetailSerializer,
@@ -54,10 +63,12 @@ from .services import (
     add_item_to_cart,
     check_payment_status,
     clear_cart,
-    create_infinitepay_checkout,
+    complete_checkout_attempt,
+    create_shipping_quote,
     get_cart_data,
     get_welcome_discount,
     release_if_expired,
+    prepare_checkout_attempt,
     remove_item_from_cart,
     restore_order_stock,
     update_item_quantity,
@@ -67,6 +78,20 @@ from .services import (
 
 User = get_user_model()
 logger = logging.getLogger(__name__)
+
+METRIC_PARAMETERS = [
+    OpenApiParameter("period", OpenApiTypes.STR, description="monthly (30 dias, padrão) ou annual"),
+    OpenApiParameter("start_date", OpenApiTypes.DATE, description="Início inclusivo em America/Sao_Paulo"),
+    OpenApiParameter("end_date", OpenApiTypes.DATE, description="Fim inclusivo em America/Sao_Paulo"),
+    OpenApiParameter("drop", OpenApiTypes.UUID, description="ID do drop"),
+    OpenApiParameter("category", OpenApiTypes.UUID, description="ID da categoria"),
+    OpenApiParameter("customer", OpenApiTypes.UUID, description="ID do cliente"),
+    OpenApiParameter(
+        "search",
+        OpenApiTypes.STR,
+        description="Busca única por cliente/e-mail, produto, drop ou categoria",
+    ),
+]
 
 
 class AdminDashboardView(APIView):
@@ -79,7 +104,12 @@ class AdminDashboardView(APIView):
     permission_classes = [IsStaffOrSuperUser]
 
     @extend_schema(
-        description="Endpoint consolidado para o Dashboard Administrativo (UC05).",
+        description=(
+            "Dashboard comercial. Venda positiva exige pagamento PAID e pedido "
+            "DELIVERED; reembolsos subtraem CustomerOrder.total_amount. A competência "
+            "é payment.paid_at em America/Sao_Paulo."
+        ),
+        parameters=METRIC_PARAMETERS,
         responses={
             200: inline_serializer(
                 name="DashboardSummaryResponse",
@@ -89,6 +119,12 @@ class AdminDashboardView(APIView):
                         fields={
                             "period_days": serializers.IntegerField(),
                             "total_revenue": serializers.DecimalField(
+                                max_digits=10, decimal_places=2
+                            ),
+                            "gross_revenue": serializers.DecimalField(
+                                max_digits=10, decimal_places=2
+                            ),
+                            "refunds": serializers.DecimalField(
                                 max_digits=10, decimal_places=2
                             ),
                             "total_orders": serializers.IntegerField(),
@@ -102,8 +138,11 @@ class AdminDashboardView(APIView):
                         fields={
                             "total_registered": serializers.IntegerField(),
                             "new_in_period": serializers.IntegerField(),
+                            "recurring_customers": serializers.IntegerField(),
                         },
                     ),
+                    "period": serializers.DictField(),
+                    "series": serializers.ListField(child=serializers.DictField()),
                     "recent_orders": DashboardRecentOrderSerializer(many=True),
                     "low_stock_alerts": DashboardLowStockSerializer(many=True),
                 },
@@ -111,65 +150,162 @@ class AdminDashboardView(APIView):
         },
     )
     def get(self, request):
-        thirty_days_ago = timezone.now() - datetime.timedelta(days=30)
+        start, end, granularity = resolve_period(request.query_params)
+        orders = metric_orders(request.query_params, start, end)
+        sales = positive_sales(orders)
+        refunded = refunds(orders)
 
-        active_statuses = [
-            OrderStatus.PAID,
-            OrderStatus.PREPARING,
-            OrderStatus.SHIPPED,
-            OrderStatus.DELIVERED,
-        ]
-
-        valid_orders_period = CustomerOrder.objects.filter(
-            created_at__gte=thirty_days_ago,
-            status__in=active_statuses,
-        )
-        total_revenue = (
-            valid_orders_period.aggregate(total=Sum("total_amount"))["total"] or 0
-        )
-        total_orders = valid_orders_period.count()
-        average_ticket = (
-            round(total_revenue / total_orders, 2) if total_orders > 0 else 0
-        )
+        gross_revenue = sales.aggregate(total=Sum("total_amount"))["total"] or Decimal("0")
+        refunded_revenue = refunded.aggregate(total=Sum("total_amount"))["total"] or Decimal("0")
+        total_revenue = gross_revenue - refunded_revenue
+        total_orders = sales.count()
+        average_ticket = total_revenue / total_orders if total_orders else Decimal("0")
 
         customer_filter = {"is_staff": False, "is_superuser": False}
-        total_clientes = User.objects.filter(**customer_filter).count()
-        novos_clientes = User.objects.filter(
-            **customer_filter,
-            created_at__gte=thirty_days_ago,
-        ).count()
+        customers = User.objects.filter(**customer_filter)
+        if request.query_params.get("search"):
+            customers = customers.filter(id__in=orders.values("user_id"))
+        if request.query_params.get("customer"):
+            customers = customers.filter(id=request.query_params["customer"])
+        total_clientes = customers.count()
+        novos_clientes = customers.filter(created_at__gte=start, created_at__lt=end).count()
 
-        recent_orders_qs = (
-            CustomerOrder.objects.filter(status__in=active_statuses)
-            .select_related("user")
-            .order_by("-created_at")[:10]
+        recurring_clientes = sum(
+            1
+            for customer in customers
+            if is_recurring_customer(customer, request.query_params)
         )
+
+        recent_orders_qs = orders.select_related("user", "payment").order_by("-payment__paid_at")[:10]
         recent_orders = DashboardRecentOrderSerializer(recent_orders_qs, many=True).data
+
+        trunc = TruncMonth("payment__paid_at", tzinfo=METRICS_TIMEZONE) if granularity == "month" else TruncDay("payment__paid_at", tzinfo=METRICS_TIMEZONE)
+        positive_points = {
+            row["bucket"]: row
+            for row in sales.annotate(bucket=trunc).values("bucket").annotate(
+                total_orders=Count("id", distinct=True), revenue=Sum("total_amount")
+            )
+        }
+        refund_points = {
+            row["bucket"]: row["revenue"]
+            for row in refunded.annotate(bucket=trunc).values("bucket").annotate(revenue=Sum("total_amount"))
+        }
+        series = []
+        for bucket in sorted(set(positive_points) | set(refund_points)):
+            positive = positive_points.get(bucket, {})
+            net = (positive.get("revenue") or Decimal("0")) - (refund_points.get(bucket) or Decimal("0"))
+            series.append({
+                "period": bucket.date().isoformat(),
+                "total_orders": positive.get("total_orders", 0),
+                "total_revenue": f"{net:.2f}",
+            })
 
         low_stock_qs = (
             ProductVariation.objects.filter(stock_quantity__lt=10)
             .select_related("product")
-            .order_by("stock_quantity")[:50]
+            .order_by("stock_quantity")
         )
+        search = request.query_params.get("search", "").strip()
+        if search:
+            low_stock_qs = low_stock_qs.filter(
+                Q(product__name__icontains=search)
+                | Q(product__drop__name__icontains=search)
+                | Q(product__category__name__icontains=search)
+            )
+        low_stock_qs = low_stock_qs[:50]
         low_stock_alerts = DashboardLowStockSerializer(low_stock_qs, many=True).data
 
         return Response(
             {
                 "sales_summary": {
-                    "period_days": 30,
-                    "total_revenue": total_revenue,
+                    "period_days": (end.date() - start.date()).days,
+                    "gross_revenue": gross_revenue,
+                    "refunds": refunded_revenue,
+                    "total_revenue": round(total_revenue, 2),
                     "total_orders": total_orders,
-                    "average_ticket": average_ticket,
+                    "average_ticket": round(average_ticket, 2),
                 },
                 "customers_summary": {
                     "total_registered": total_clientes,
                     "new_in_period": novos_clientes,
+                    "recurring_customers": recurring_clientes,
                 },
+                "period": {
+                    "start_date": start.date(),
+                    "end_date": (end - datetime.timedelta(microseconds=1)).date(),
+                    "granularity": granularity,
+                    "timezone": "America/Sao_Paulo",
+                },
+                "series": series,
                 "recent_orders": recent_orders,
                 "low_stock_alerts": low_stock_alerts,
             },
             status=status.HTTP_200_OK,
         )
+
+
+class DashboardDrillDownView(APIView):
+    """Pedidos que compõem cards e pontos do gráfico, usando a consulta das métricas."""
+
+    permission_classes = [IsStaffOrSuperUser]
+
+    @extend_schema(
+        description=(
+            "Lista paginada dos pedidos das métricas. Aceita period, start_date, "
+            "end_date e busca textual. Ordena por paid_at decrescente."
+        ),
+        parameters=METRIC_PARAMETERS,
+        responses={200: DashboardRecentOrderSerializer(many=True)},
+    )
+    def get(self, request):
+        queryset = metric_orders(request.query_params).select_related("user", "payment").order_by("-payment__paid_at")
+        paginator = PageNumberPagination()
+        page = paginator.paginate_queryset(queryset, request, view=self)
+        return paginator.get_paginated_response(DashboardRecentOrderSerializer(page, many=True).data)
+
+
+class DashboardDropRevenueView(APIView):
+    """Receita de itens por drop, deliberadamente sem frete e desconto."""
+
+    permission_classes = [IsStaffOrSuperUser]
+
+    @extend_schema(
+        description=(
+            "Soma quantity × unit_price dos OrderItem de vendas válidas. Frete e "
+            "desconto pertencem apenas à receita total e não são rateados por drop."
+        ),
+        parameters=METRIC_PARAMETERS,
+        responses={
+            200: inline_serializer(
+                name="DashboardDropRevenue",
+                many=True,
+                fields={
+                    "drop_id": serializers.UUIDField(),
+                    "drop_name": serializers.CharField(),
+                    "revenue": serializers.DecimalField(max_digits=14, decimal_places=2),
+                },
+            )
+        },
+    )
+    def get(self, request):
+        start, end, _ = resolve_period(request.query_params)
+        sales = positive_sales(metric_orders(request.query_params, start, end))
+        item_total = ExpressionWrapper(
+            F("items__quantity") * F("items__unit_price"),
+            output_field=DecimalField(max_digits=14, decimal_places=2),
+        )
+        rows = (
+            sales.exclude(items__variation__product__drop__isnull=True)
+            .values("items__variation__product__drop_id", "items__variation__product__drop__name")
+            .annotate(revenue=Sum(item_total))
+            .order_by("items__variation__product__drop__name")
+        )
+        return Response([
+            {"drop_id": row["items__variation__product__drop_id"],
+             "drop_name": row["items__variation__product__drop__name"],
+             "revenue": row["revenue"]}
+            for row in rows
+        ])
 
 
 class UserOrderListView(APIView):
@@ -272,10 +408,9 @@ class AdminOrderDetailView(APIView):
             404: OpenApiTypes.OBJECT,
         },
     )
-    @transaction.atomic
     def patch(self, request, order_id):
         try:
-            order = CustomerOrder.objects.select_for_update().get(id=order_id)
+            order = CustomerOrder.objects.select_related("payment").get(id=order_id)
         except CustomerOrder.DoesNotExist:
             return Response({"message": "Pedido não encontrado."}, status=404)
 
@@ -316,7 +451,7 @@ class AdminOrderDetailView(APIView):
             return Response(
                 {"message": "Retorno físico exige expedição anterior."}, status=400
             )
-        
+
         if (order.status == OrderStatus.SHIPPED and status_value == OrderStatus.SHIPPED):
             update_tracking_code(
                 order=order,
@@ -348,6 +483,29 @@ class AdminOrderDetailView(APIView):
         return Response(OrderDetailSerializer(order).data, status=status.HTTP_200_OK)
 
 
+class CheckoutCalculationView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        summary="Calcular valores atuais da compra",
+        description="Cria uma cotação com preços, frete e validade, sem criar pedido ou reservar estoque.",
+        request=CheckoutCalculationInputSerializer,
+        responses={
+            200: CheckoutCalculationSerializer,
+            400: OpenApiTypes.OBJECT,
+            503: OpenApiTypes.OBJECT,
+        },
+    )
+    def post(self, request):
+        serializer = CheckoutCalculationInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        calculation = create_shipping_quote(
+            request.user, serializer.validated_data["address_id"]
+        )
+        return Response(CheckoutCalculationSerializer(calculation).data)
+
+
+@method_decorator(transaction.non_atomic_requests, name="dispatch")
 class CheckoutAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -358,241 +516,40 @@ class CheckoutAPIView(APIView):
             "Gera o pedido (CustomerOrder), faz o snapshot do endereço de entrega e debita o estoque. "
             "Por fim, comunica-se com a API da InfinitePay para gerar o link de checkout.\n\n"
             "**Fluxo:**\n"
-            "1. Envie o `address_id` (UUID do endereço do perfil) e o `shipping_cost`.\n"
-            "2. O backend valida os itens e gera a cobrança.\n"
+            "1. Envie `address_id`, `shipping_quote_id` e `idempotency_key` (UUID da tentativa).\n"
+            "2. O backend valida a cotação e gera a cobrança com os valores confirmados.\n"
             "3. O utilizador é redirecionado para a `checkout_url` retornada."
         ),
-        request={
-            "application/json": {
-                "type": "object",
-                "properties": {
-                    "address_id": {
-                        "type": "string",
-                        "format": "uuid",
-                        "description": "UUID do endereço de entrega salvo no perfil",
-                    },
-                    "confirmed_subtotal": {
-                        "type": "string",
-                        "description": "Subtotal de produtos confirmado pelo usuário; divergência retorna 409 price_changed.",
-                    },
-                    "shipping_cost": {
-                        "type": "number",
-                        "format": "float",
-                        "description": "Valor calculado do frete (em Reais)",
-                    },
-                },
-                "required": ["address_id", "confirmed_subtotal"],
-            }
-        },
+        request=CheckoutInputSerializer,
         responses={
             201: OpenApiTypes.OBJECT,
-            409: OpenApiTypes.OBJECT,
+            202: OpenApiTypes.OBJECT,
             400: OpenApiTypes.OBJECT,
             409: OpenApiTypes.OBJECT,
             500: OpenApiTypes.OBJECT,
+            503: OpenApiTypes.OBJECT,
         },
     )
-    @transaction.atomic
     def post(self, request):
-        user = request.user
-        cart = (
-            Cart.objects.select_for_update()
-            .filter(user=user, status="ACTIVE")
-            .prefetch_related("items__variation__product")
-            .first()
-        )
-
-        if not cart or not cart.items.exists():
-            return Response(
-                {"success": False, "message": "Carrinho vazio."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        address_id = request.data.get("address_id")
-        if not address_id:
-            return Response(
-                {"success": False, "message": "Endereço não informado."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        address = user.addresses.filter(id=address_id).first()
-        if not address:
-            return Response(
-                {"success": False, "message": "Endereço inválido."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        items = list(
-            cart.items.select_related(
-                "variation__product", "variation__product__drop"
-            ).order_by("variation_id")
-        )
-
-        # Trava produtos, variações (estoque) e drops (max_quantity) envolvidos
-        # antes de revalidar e decrementar, para impedir overselling entre
-        # requisições concorrentes. Ordenadas por pk para evitar deadlock entre
-        # checkouts concorrentes que compartilham produtos/variações/drops.
-        products = {
-            p.pk: p
-            for p in Product.objects.select_for_update()
-            .filter(pk__in=[i.variation.product_id for i in items])
-            .order_by("pk")
-        }
-        variations = {
-            v.pk: v
-            for v in ProductVariation.objects.select_for_update()
-            .filter(pk__in=[i.variation_id for i in items])
-            .order_by("pk")
-        }
-        drop_ids = sorted({p.drop_id for p in products.values() if p.drop_id})
-        drops = {
-            d.id: d
-            for d in DropCampaign.objects.select_for_update()
-            .filter(id__in=drop_ids)
-            .order_by("id")
-        }
-
-        at = timezone.now()
-        prices = {i.pk: products[i.variation.product_id].price_at(at) for i in items}
-        subtotal = sum((i.quantity * prices[i.pk] for i in items), Decimal("0.00"))
+        serializer = CheckoutInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
         try:
-            confirmed = Decimal(str(request.data["confirmed_subtotal"]))
-            if not confirmed.is_finite():
-                raise ValueError
-        except (KeyError, ValueError, ArithmeticError):
-            return Response({"message": "Informe confirmed_subtotal."}, status=400)
-        if confirmed != subtotal:
-            return Response(
-                {
-                    "code": "price_changed",
-                    "message": "Os preços mudaram. Confira e confirme novamente.",
-                    "subtotal": str(subtotal),
-                    "items": [
-                        {
-                            "variation_id": str(i.variation_id),
-                            "quantity": i.quantity,
-                            "unit_price": str(prices[i.pk]),
-                            "base_price": str(
-                                products[i.variation.product_id].base_price
-                            ),
-                            "is_promotion_active": products[
-                                i.variation.product_id
-                            ].promotion_active_at(at),
-                            "total_price": str(prices[i.pk] * i.quantity),
-                        }
-                        for i in items
-                    ],
-                },
-                status=409,
-            )
-
-        # "Aberto para venda" (is_active + dentro da janela do drop), não
-        # apenas "visível" (que só depende de is_public) — um drop
-        # Rascunho/Programado/Encerrado é visível na loja mas não pode ser
-        # comprado. O limite de max_quantity é decidido separadamente, logo
-        # abaixo, com os drops já travados — responde 409, não 400.
-        for item in items:
-            product = products[item.variation.product_id]
-            if (
-                not is_product_open_for_sale(product)
-                or variations[item.variation_id].stock_quantity < item.quantity
-            ):
-                return Response(
-                    {"message": "Produto indisponível ou estoque insuficiente."},
-                    status=400,
-                )
-
-        requested_quantity_by_drop = defaultdict(int)
-        for item in items:
-            drop_id = products[item.variation.product_id].drop_id
-            if drop_id:
-                requested_quantity_by_drop[drop_id] += item.quantity
-
-        for drop_id, requested_quantity in requested_quantity_by_drop.items():
-            drop = drops[drop_id]
-            if drop.max_quantity is None:
-                continue
-            sold_quantity = get_drop_sold_quantity(drop)
-            if sold_quantity + requested_quantity > drop.max_quantity:
-                remaining = max(drop.max_quantity - sold_quantity, 0)
-                return Response(
-                    {
-                        "success": False,
-                        "message": (
-                            f"Quantidade solicitada do drop '{drop.name}' excede o "
-                            f"limite disponível. Restam {remaining} unidade(s)."
-                        ),
-                    },
-                    status=status.HTTP_409_CONFLICT,
-                )
-
-        try:
-            shipping_cost = Decimal(str(request.data.get("shipping_cost", "0.00")))
-        except ArithmeticError:
-            return Response({"message": "Frete inválido."}, status=400)
-        if not shipping_cost.is_finite() or shipping_cost < 0:
-            return Response({"message": "Frete inválido."}, status=400)
-        welcome_coupon, discount_amount = get_welcome_discount(user, subtotal)
-        total_amount = subtotal - discount_amount + shipping_cost
-
-        order = CustomerOrder.objects.create(
-            user=user,
-            address=address,
-            coupon=welcome_coupon,
-            subtotal=subtotal,
-            shipping_cost=shipping_cost,
-            discount_amount=discount_amount,
-            total_amount=total_amount,
-            shipping_zip_code=address.zip_code,
-            shipping_street=address.street,
-            shipping_number=address.address_number,
-            shipping_complement=address.complement,
-            shipping_neighborhood=address.neighborhood,
-            shipping_city=address.city,
-            shipping_state=address.state,
-            reservation_expires_at=timezone.now()
-            + datetime.timedelta(minutes=settings.STOCK_RESERVATION_TTL_MINUTES),
-        )
-
-        for item in items:
-            order_item = OrderItem.objects.create(
-                order=order,
-                variation=item.variation,
-                quantity=item.quantity,
-                unit_price=prices[item.pk],
-                product_name=f"{item.variation.product.name} - {item.variation.size} / {item.variation.color}",
-                sku_snapshot=item.variation.sku,
-            )
-            move_stock(
-                variation=item.variation,
-                kind="SAIDA",
-                reason="VENDA",
-                quantity=item.quantity,
-                origin_type="ORDER",
-                origin_id=order.pk,
-                order_item=order_item,
-                idempotency_key=f"sale:{order_item.pk}",
-                created_by=user,
-            )
-
-        cart.status = "FINISHED"
-        cart.save()
-
-        try:
-            checkout_url = create_infinitepay_checkout(order, request)
-            return Response(
-                {"success": True, "checkout_url": checkout_url},
-                status=status.HTTP_201_CREATED,
+            attempt, result = prepare_checkout_attempt(
+                request.user, **serializer.validated_data
             )
         except Exception:
-            transaction.set_rollback(True)
             return Response(
                 {
                     "success": False,
-                    "message": "Não foi possível iniciar o checkout da InfinitePay.",
+                    "message": "Não foi possível preparar o pedido. Reenvie a mesma tentativa.",
                 },
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
+        if attempt is not None:
+            result = complete_checkout_attempt(attempt, request)
+        body, response_status = result
+        headers = {"Retry-After": "3"} if response_status == 202 else {}
+        return Response(body, status=response_status, headers=headers)
 
 
 class PaymentSuccessRedirectView(APIView):
@@ -657,8 +614,8 @@ class PaymentSuccessRedirectView(APIView):
                 order.payment.gateway_transaction_id = transaction_nsu
                 order.payment.status = PaymentStatus.PAID
                 order.payment.save()
-
-                update_status(order=order, new_status=OrderStatus.PAID)
+                order.status = OrderStatus.PAID
+                order.save()
 
         if order.status == OrderStatus.PAID:
             return Response(
@@ -849,15 +806,11 @@ class OrderDispatchView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if (
-            not hasattr(order, "payment")
-            or order.payment.status != PaymentStatus.PAID
-        ):
+        if not hasattr(order, "payment") or order.payment.status != PaymentStatus.PAID:
             return Response(
                 {
                     "message": (
-                        "Pedido sem pagamento confirmado "
-                        "não pode ser despachado."
+                        "Pedido sem pagamento confirmado não pode ser despachado."
                     )
                 },
                 status=status.HTTP_400_BAD_REQUEST,

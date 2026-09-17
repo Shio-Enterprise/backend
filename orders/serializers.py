@@ -10,13 +10,24 @@ User = get_user_model()
 
 class DashboardRecentOrderSerializer(serializers.ModelSerializer):
     customer_name = serializers.SerializerMethodField()
+    paid_at = serializers.DateTimeField(source="payment.paid_at", read_only=True)
+    payment_status = serializers.CharField(source="payment.status", read_only=True)
+    revenue_value = serializers.SerializerMethodField()
 
     class Meta:
         model = CustomerOrder
-        fields = ["id", "customer_name", "total_amount", "status", "created_at"]
+        fields = [
+            "id", "customer_name", "total_amount", "status", "payment_status",
+            "paid_at", "created_at", "revenue_value",
+        ]
 
     def get_customer_name(self, obj) -> str:
         return getattr(obj.user, "name", None) or obj.user.email
+
+    def get_revenue_value(self, obj) -> str:
+        from .metrics import revenue_value
+
+        return f"{revenue_value(obj):.2f}"
 
 
 class DashboardLowStockSerializer(serializers.ModelSerializer):
@@ -52,6 +63,7 @@ class PaymentSerializer(serializers.ModelSerializer):
             "installment_value",
             "gateway_transaction_id",
             "qrcode_pix",
+            "paid_at",
             "created_at",
         ]
 
@@ -168,3 +180,40 @@ class CartItemAddSerializer(serializers.Serializer):
 
 class CartItemUpdateSerializer(serializers.Serializer):
     quantity = serializers.IntegerField(min_value=1)
+
+
+class CheckoutCalculationInputSerializer(serializers.Serializer):
+    address_id = serializers.UUIDField()
+
+    def to_internal_value(self, data):
+        if isinstance(data, dict):
+            unexpected = set(data) - set(self.fields)
+            if unexpected:
+                raise serializers.ValidationError(
+                    {
+                        field: "Campo não aceito. Os valores são calculados pelo servidor."
+                        for field in sorted(unexpected)
+                    }
+                )
+        return super().to_internal_value(data)
+
+
+class CheckoutInputSerializer(CheckoutCalculationInputSerializer):
+    shipping_quote_id = serializers.UUIDField()
+    idempotency_key = serializers.UUIDField()
+
+
+class CheckoutQuoteItemSerializer(CartItemRepresentationSerializer):
+    stock_quantity = serializers.IntegerField(required=False)
+
+
+class CheckoutCalculationSerializer(serializers.Serializer):
+    shipping_quote_id = serializers.UUIDField(source="id")
+    expires_at = serializers.DateTimeField()
+    address = serializers.DictField(source="snapshot.address")
+    items = CheckoutQuoteItemSerializer(source="snapshot.items", many=True)
+    prazo_dias = serializers.IntegerField(allow_null=True)
+    subtotal = serializers.DecimalField(max_digits=10, decimal_places=2)
+    shipping_cost = serializers.DecimalField(max_digits=10, decimal_places=2)
+    discount_amount = serializers.DecimalField(max_digits=10, decimal_places=2)
+    total_amount = serializers.DecimalField(max_digits=10, decimal_places=2)
