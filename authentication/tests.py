@@ -365,7 +365,9 @@ class CustomerCRMViewSetTests(APITestCase):
         UserProfile.objects.create(user=self.customer, role=UserRole.CUSTOMER)
         self.client.force_authenticate(user=self.admin)
 
-    def create_order(self, status_value, total_amount, payment_status=PaymentStatus.PENDING):
+    def create_order(
+        self, status_value, total_amount, payment_status=PaymentStatus.PENDING
+    ):
         order = CustomerOrder.objects.create(
             user=self.customer,
             status=status_value,

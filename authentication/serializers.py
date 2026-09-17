@@ -170,14 +170,23 @@ class CustomerOrderHistorySerializer(serializers.ModelSerializer):
     class Meta:
         model = CustomerOrder
         fields = [
-            "id", "status", "payment_status", "commercial_status", "total_amount",
-            "paid_at", "created_at", "tracking_code",
+            "id",
+            "status",
+            "payment_status",
+            "commercial_status",
+            "total_amount",
+            "paid_at",
+            "created_at",
+            "tracking_code",
         ]
 
     def get_commercial_status(self, obj) -> str:
         from orders.models import OrderStatus, PaymentStatus
 
-        if getattr(obj, "payment", None) and obj.payment.status == PaymentStatus.REFUNDED:
+        if (
+            getattr(obj, "payment", None)
+            and obj.payment.status == PaymentStatus.REFUNDED
+        ):
             return "REFUNDED"
         if (
             obj.status == OrderStatus.DELIVERED

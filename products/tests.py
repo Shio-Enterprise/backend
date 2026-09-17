@@ -266,7 +266,10 @@ class DropCampaignListCreateTests(APITestCase):
             end_date=now - timedelta(days=10),
         )
         DropCampaign.objects.create(
-            name="Privado", slug="privado-listcreate", is_public=False, is_active=True,
+            name="Privado",
+            slug="privado-listcreate",
+            is_public=False,
+            is_active=True,
         )
 
     def test_listagem_publica_sem_autenticacao(self):
@@ -296,7 +299,9 @@ class DropCampaignListCreateTests(APITestCase):
 
     def test_admin_com_visible_true_pre_visualiza_o_publico(self):
         """?visible=true para admin replica exatamente o que o público vê."""
-        response = self.client.get(f"{self.url}?visible=true", **auth_header(self.admin))
+        response = self.client.get(
+            f"{self.url}?visible=true", **auth_header(self.admin)
+        )
         data = response.json()
         names = [d["name"] for d in data["results"]]
         self.assertEqual(data["count"], 3)
@@ -2125,7 +2130,10 @@ class DropVisibilityPolicyTests(APITestCase):
             shipping_state="DF",
         )
         OrderItem.objects.create(
-            order=order, variation=variation, quantity=1, unit_price=10,
+            order=order,
+            variation=variation,
+            quantity=1,
+            unit_price=10,
             product_name="ProdutoEsgotadoPolicy - U",
         )
 
@@ -2202,7 +2210,10 @@ class ProductVisibilityViaDropTests(APITestCase):
         botão de comprar/adicionar ao carrinho no front deve ficar desabilitado,
         o produto não deve sumir da loja."""
         draft_drop = DropCampaign.objects.create(
-            name="DropRascunhoPV", slug="droprascunho-pv", is_public=True, is_active=False,
+            name="DropRascunhoPV",
+            slug="droprascunho-pv",
+            is_public=True,
+            is_active=False,
         )
         product = make_product(name="ComDropRascunhoPV", drop=draft_drop)
 
@@ -2336,6 +2347,8 @@ class DropMaxQuantityValidationTests(APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.json()["max_quantity"], 50)
+
+
 class CatalogDecisionTests(APITestCase):
     def setUp(self):
         self.admin = make_user(
@@ -2647,7 +2660,9 @@ class CheckoutDecisionTests(APITestCase):
             promo_end=now + timedelta(hours=1),
         )
         payload = self.checkout_payload()
-        Product.objects.filter(pk=self.product.pk).update(promo_end=now - timedelta(hours=1))
+        Product.objects.filter(pk=self.product.pk).update(
+            promo_end=now - timedelta(hours=1)
+        )
         response = self.client.post(
             self.url,
             payload,
@@ -2694,9 +2709,7 @@ class CheckoutDecisionTests(APITestCase):
 
         self.assertEqual(self.variation.stock_quantity, 10)
         self.assertEqual(
-            StockMovement.objects.filter(
-                reason="DEVOLUCAO"
-            ).count(),
+            StockMovement.objects.filter(reason="DEVOLUCAO").count(),
             1,
         )
 
@@ -2742,9 +2755,7 @@ class CheckoutDecisionTests(APITestCase):
 
         self.assertEqual(self.variation.stock_quantity, 10)
         self.assertEqual(
-            StockMovement.objects.filter(
-                reason="DEVOLUCAO"
-            ).count(),
+            StockMovement.objects.filter(reason="DEVOLUCAO").count(),
             1,
         )
 
@@ -2752,7 +2763,9 @@ class CheckoutDecisionTests(APITestCase):
         "orders.services.create_infinitepay_checkout",
         side_effect=RuntimeError("Gateway offline"),
     )
-    def test_gateway_failure_preserves_order_and_ledger_for_reconciliation(self, gateway):
+    def test_gateway_failure_preserves_order_and_ledger_for_reconciliation(
+        self, gateway
+    ):
         response = self.client.post(
             self.url,
             self.checkout_payload(),
