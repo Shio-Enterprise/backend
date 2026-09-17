@@ -3,7 +3,8 @@ import logging
 
 from django.contrib.auth import get_user_model
 from django.db import transaction
-from django.db.models import Sum
+from django.db.models import Count, DecimalField, ExpressionWrapper, F, Q, Sum
+from django.db.models.functions import TruncDay, TruncMonth
 from django.http import Http404
 from django.utils import timezone
 from django.utils.decorators import method_decorator
@@ -14,12 +15,16 @@ from drf_spectacular.utils import (
     inline_serializer,
 )
 from rest_framework import serializers, status
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from authentication.permissions import IsStaffOrSuperUser
-from products.models import ProductVariation
+
+from products.availability import get_drop_sold_quantity, is_product_open_for_sale
+from products.models import DropCampaign, Product, ProductVariation
+from products.services import move_stock
 
 from .correios import (
     CorreiosAuthenticationError,
@@ -27,6 +32,14 @@ from .correios import (
     CorreiosTrackingUnavailableError,
     dispatch_order_and_get_tracking_code,
     get_order_tracking_data,
+)
+from .metrics import (
+    METRICS_TIMEZONE,
+    is_recurring_customer,
+    metric_orders,
+    positive_sales,
+    refunds,
+    resolve_period,
 )
 from .models import (
     CustomerOrder,
@@ -63,6 +76,20 @@ from .services import (
 User = get_user_model()
 logger = logging.getLogger(__name__)
 
+METRIC_PARAMETERS = [
+    OpenApiParameter("period", OpenApiTypes.STR, description="monthly (30 dias, padrão) ou annual"),
+    OpenApiParameter("start_date", OpenApiTypes.DATE, description="Início inclusivo em America/Sao_Paulo"),
+    OpenApiParameter("end_date", OpenApiTypes.DATE, description="Fim inclusivo em America/Sao_Paulo"),
+    OpenApiParameter("drop", OpenApiTypes.UUID, description="ID do drop"),
+    OpenApiParameter("category", OpenApiTypes.UUID, description="ID da categoria"),
+    OpenApiParameter("customer", OpenApiTypes.UUID, description="ID do cliente"),
+    OpenApiParameter(
+        "search",
+        OpenApiTypes.STR,
+        description="Busca única por cliente/e-mail, produto, drop ou categoria",
+    ),
+]
+
 
 class AdminDashboardView(APIView):
     """
@@ -74,7 +101,12 @@ class AdminDashboardView(APIView):
     permission_classes = [IsStaffOrSuperUser]
 
     @extend_schema(
-        description="Endpoint consolidado para o Dashboard Administrativo (UC05).",
+        description=(
+            "Dashboard comercial. Venda positiva exige pagamento PAID e pedido "
+            "DELIVERED; reembolsos subtraem CustomerOrder.total_amount. A competência "
+            "é payment.paid_at em America/Sao_Paulo."
+        ),
+        parameters=METRIC_PARAMETERS,
         responses={
             200: inline_serializer(
                 name="DashboardSummaryResponse",
@@ -84,6 +116,12 @@ class AdminDashboardView(APIView):
                         fields={
                             "period_days": serializers.IntegerField(),
                             "total_revenue": serializers.DecimalField(
+                                max_digits=10, decimal_places=2
+                            ),
+                            "gross_revenue": serializers.DecimalField(
+                                max_digits=10, decimal_places=2
+                            ),
+                            "refunds": serializers.DecimalField(
                                 max_digits=10, decimal_places=2
                             ),
                             "total_orders": serializers.IntegerField(),
@@ -97,8 +135,11 @@ class AdminDashboardView(APIView):
                         fields={
                             "total_registered": serializers.IntegerField(),
                             "new_in_period": serializers.IntegerField(),
+                            "recurring_customers": serializers.IntegerField(),
                         },
                     ),
+                    "period": serializers.DictField(),
+                    "series": serializers.ListField(child=serializers.DictField()),
                     "recent_orders": DashboardRecentOrderSerializer(many=True),
                     "low_stock_alerts": DashboardLowStockSerializer(many=True),
                 },
@@ -106,65 +147,162 @@ class AdminDashboardView(APIView):
         },
     )
     def get(self, request):
-        thirty_days_ago = timezone.now() - datetime.timedelta(days=30)
+        start, end, granularity = resolve_period(request.query_params)
+        orders = metric_orders(request.query_params, start, end)
+        sales = positive_sales(orders)
+        refunded = refunds(orders)
 
-        active_statuses = [
-            OrderStatus.PAID,
-            OrderStatus.PREPARING,
-            OrderStatus.SHIPPED,
-            OrderStatus.DELIVERED,
-        ]
-
-        valid_orders_period = CustomerOrder.objects.filter(
-            created_at__gte=thirty_days_ago,
-            status__in=active_statuses,
-        )
-        total_revenue = (
-            valid_orders_period.aggregate(total=Sum("total_amount"))["total"] or 0
-        )
-        total_orders = valid_orders_period.count()
-        average_ticket = (
-            round(total_revenue / total_orders, 2) if total_orders > 0 else 0
-        )
+        gross_revenue = sales.aggregate(total=Sum("total_amount"))["total"] or Decimal("0")
+        refunded_revenue = refunded.aggregate(total=Sum("total_amount"))["total"] or Decimal("0")
+        total_revenue = gross_revenue - refunded_revenue
+        total_orders = sales.count()
+        average_ticket = total_revenue / total_orders if total_orders else Decimal("0")
 
         customer_filter = {"is_staff": False, "is_superuser": False}
-        total_clientes = User.objects.filter(**customer_filter).count()
-        novos_clientes = User.objects.filter(
-            **customer_filter,
-            created_at__gte=thirty_days_ago,
-        ).count()
+        customers = User.objects.filter(**customer_filter)
+        if request.query_params.get("search"):
+            customers = customers.filter(id__in=orders.values("user_id"))
+        if request.query_params.get("customer"):
+            customers = customers.filter(id=request.query_params["customer"])
+        total_clientes = customers.count()
+        novos_clientes = customers.filter(created_at__gte=start, created_at__lt=end).count()
 
-        recent_orders_qs = (
-            CustomerOrder.objects.filter(status__in=active_statuses)
-            .select_related("user")
-            .order_by("-created_at")[:10]
+        recurring_clientes = sum(
+            1
+            for customer in customers
+            if is_recurring_customer(customer, request.query_params)
         )
+
+        recent_orders_qs = orders.select_related("user", "payment").order_by("-payment__paid_at")[:10]
         recent_orders = DashboardRecentOrderSerializer(recent_orders_qs, many=True).data
+
+        trunc = TruncMonth("payment__paid_at", tzinfo=METRICS_TIMEZONE) if granularity == "month" else TruncDay("payment__paid_at", tzinfo=METRICS_TIMEZONE)
+        positive_points = {
+            row["bucket"]: row
+            for row in sales.annotate(bucket=trunc).values("bucket").annotate(
+                total_orders=Count("id", distinct=True), revenue=Sum("total_amount")
+            )
+        }
+        refund_points = {
+            row["bucket"]: row["revenue"]
+            for row in refunded.annotate(bucket=trunc).values("bucket").annotate(revenue=Sum("total_amount"))
+        }
+        series = []
+        for bucket in sorted(set(positive_points) | set(refund_points)):
+            positive = positive_points.get(bucket, {})
+            net = (positive.get("revenue") or Decimal("0")) - (refund_points.get(bucket) or Decimal("0"))
+            series.append({
+                "period": bucket.date().isoformat(),
+                "total_orders": positive.get("total_orders", 0),
+                "total_revenue": f"{net:.2f}",
+            })
 
         low_stock_qs = (
             ProductVariation.objects.filter(stock_quantity__lt=10)
             .select_related("product")
-            .order_by("stock_quantity")[:50]
+            .order_by("stock_quantity")
         )
+        search = request.query_params.get("search", "").strip()
+        if search:
+            low_stock_qs = low_stock_qs.filter(
+                Q(product__name__icontains=search)
+                | Q(product__drop__name__icontains=search)
+                | Q(product__category__name__icontains=search)
+            )
+        low_stock_qs = low_stock_qs[:50]
         low_stock_alerts = DashboardLowStockSerializer(low_stock_qs, many=True).data
 
         return Response(
             {
                 "sales_summary": {
-                    "period_days": 30,
-                    "total_revenue": total_revenue,
+                    "period_days": (end.date() - start.date()).days,
+                    "gross_revenue": gross_revenue,
+                    "refunds": refunded_revenue,
+                    "total_revenue": round(total_revenue, 2),
                     "total_orders": total_orders,
-                    "average_ticket": average_ticket,
+                    "average_ticket": round(average_ticket, 2),
                 },
                 "customers_summary": {
                     "total_registered": total_clientes,
                     "new_in_period": novos_clientes,
+                    "recurring_customers": recurring_clientes,
                 },
+                "period": {
+                    "start_date": start.date(),
+                    "end_date": (end - datetime.timedelta(microseconds=1)).date(),
+                    "granularity": granularity,
+                    "timezone": "America/Sao_Paulo",
+                },
+                "series": series,
                 "recent_orders": recent_orders,
                 "low_stock_alerts": low_stock_alerts,
             },
             status=status.HTTP_200_OK,
         )
+
+
+class DashboardDrillDownView(APIView):
+    """Pedidos que compõem cards e pontos do gráfico, usando a consulta das métricas."""
+
+    permission_classes = [IsStaffOrSuperUser]
+
+    @extend_schema(
+        description=(
+            "Lista paginada dos pedidos das métricas. Aceita period, start_date, "
+            "end_date e busca textual. Ordena por paid_at decrescente."
+        ),
+        parameters=METRIC_PARAMETERS,
+        responses={200: DashboardRecentOrderSerializer(many=True)},
+    )
+    def get(self, request):
+        queryset = metric_orders(request.query_params).select_related("user", "payment").order_by("-payment__paid_at")
+        paginator = PageNumberPagination()
+        page = paginator.paginate_queryset(queryset, request, view=self)
+        return paginator.get_paginated_response(DashboardRecentOrderSerializer(page, many=True).data)
+
+
+class DashboardDropRevenueView(APIView):
+    """Receita de itens por drop, deliberadamente sem frete e desconto."""
+
+    permission_classes = [IsStaffOrSuperUser]
+
+    @extend_schema(
+        description=(
+            "Soma quantity × unit_price dos OrderItem de vendas válidas. Frete e "
+            "desconto pertencem apenas à receita total e não são rateados por drop."
+        ),
+        parameters=METRIC_PARAMETERS,
+        responses={
+            200: inline_serializer(
+                name="DashboardDropRevenue",
+                many=True,
+                fields={
+                    "drop_id": serializers.UUIDField(),
+                    "drop_name": serializers.CharField(),
+                    "revenue": serializers.DecimalField(max_digits=14, decimal_places=2),
+                },
+            )
+        },
+    )
+    def get(self, request):
+        start, end, _ = resolve_period(request.query_params)
+        sales = positive_sales(metric_orders(request.query_params, start, end))
+        item_total = ExpressionWrapper(
+            F("items__quantity") * F("items__unit_price"),
+            output_field=DecimalField(max_digits=14, decimal_places=2),
+        )
+        rows = (
+            sales.exclude(items__variation__product__drop__isnull=True)
+            .values("items__variation__product__drop_id", "items__variation__product__drop__name")
+            .annotate(revenue=Sum(item_total))
+            .order_by("items__variation__product__drop__name")
+        )
+        return Response([
+            {"drop_id": row["items__variation__product__drop_id"],
+             "drop_name": row["items__variation__product__drop__name"],
+             "revenue": row["revenue"]}
+            for row in rows
+        ])
 
 
 class UserOrderListView(APIView):
@@ -309,7 +447,7 @@ class AdminOrderDetailView(APIView):
                 {"message": "Retorno físico exige expedição anterior."}, status=400
             )
 
-        if order.status == OrderStatus.SHIPPED and status_value == OrderStatus.SHIPPED:
+        if (order.status == OrderStatus.SHIPPED and status_value == OrderStatus.SHIPPED):
             update_tracking_code(
                 order=order,
                 tracking_code=tracking_code,

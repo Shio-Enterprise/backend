@@ -22,6 +22,7 @@ from django.test import (
     override_settings,
     skipUnlessDBFeature,
 )
+
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from rest_framework import status
@@ -41,6 +42,7 @@ from orders.models import (
     OrderStatus,
     OrderStatusLog,
     Payment,
+    PaymentMethod,
     PaymentStatus,
     ShippingQuote,
 )
@@ -1675,6 +1677,94 @@ class AdminDashboardViewTests(APITestCase):
         """Utilizador sem permissão is_staff recebe 403."""
         response = self.client.get(self.url, **self.auth_header(self.customer))
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def create_metric_order(self, order_status, payment_status, total, subtotal=None):
+        order = CustomerOrder.objects.create(
+            user=self.customer,
+            status=order_status,
+            subtotal=subtotal or total,
+            total_amount=total,
+            shipping_zip_code="70000-000",
+            shipping_street="Rua Teste",
+            shipping_number="1",
+            shipping_neighborhood="Centro",
+            shipping_city="Brasília",
+            shipping_state="DF",
+        )
+        payment = Payment.objects.create(
+            order=order,
+            method=PaymentMethod.PIX,
+            status=PaymentStatus.PAID if payment_status == PaymentStatus.REFUNDED else payment_status,
+            total_amount=total,
+        )
+        if payment_status == PaymentStatus.REFUNDED:
+            payment.status = PaymentStatus.REFUNDED
+            payment.save()
+        return order
+
+    def test_receita_exige_pagamento_e_entrega_e_subtrai_reembolso(self):
+        self.create_metric_order(OrderStatus.DELIVERED, PaymentStatus.PAID, "110.00", "100.00")
+        self.create_metric_order(OrderStatus.SHIPPED, PaymentStatus.PAID, "200.00")
+        self.create_metric_order(OrderStatus.DELIVERED, PaymentStatus.PENDING, "300.00")
+        self.create_metric_order(OrderStatus.DELIVERED, PaymentStatus.REFUNDED, "40.00")
+
+        response = self.client.get(self.url, **self.auth_header(self.admin))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        summary = response.json()["sales_summary"]
+        self.assertEqual(summary["total_orders"], 1)
+        self.assertEqual(Decimal(summary["gross_revenue"]), Decimal("110.00"))
+        self.assertEqual(Decimal(summary["refunds"]), Decimal("40.00"))
+        self.assertEqual(Decimal(summary["total_revenue"]), Decimal("70.00"))
+        self.assertEqual(Decimal(summary["average_ticket"]), Decimal("70.00"))
+
+    def test_periodo_padrao_e_serie_sao_definidos_no_backend(self):
+        self.create_metric_order(OrderStatus.DELIVERED, PaymentStatus.PAID, "75.00")
+
+        response = self.client.get(self.url, **self.auth_header(self.admin))
+
+        payload = response.json()
+        self.assertEqual(payload["period"]["timezone"], "America/Sao_Paulo")
+        self.assertEqual(payload["period"]["granularity"], "day")
+        self.assertEqual(payload["sales_summary"]["period_days"], 30)
+        self.assertEqual(payload["series"][0]["total_revenue"], "75.00")
+
+    def test_receita_por_drop_usa_itens_sem_ratear_frete_ou_desconto(self):
+        drop = DropCampaign.objects.create(name="Drop 1", slug="drop-1")
+        category = Category.objects.create(name="Camisetas", slug="camisetas-dashboard")
+        product = Product.objects.create(
+            name="Camiseta", description="Teste", base_price="999.00",
+            category=category, drop=drop,
+        )
+        variation = ProductVariation.objects.create(
+            product=product, size="M", sku="DROP-M", stock_quantity=10
+        )
+        order = self.create_metric_order(OrderStatus.DELIVERED, PaymentStatus.PAID, "105.00", "100.00")
+        order.shipping_cost = Decimal("15.00")
+        order.discount_amount = Decimal("10.00")
+        order.save()
+        OrderItem.objects.create(
+            order=order, variation=variation, quantity=2,
+            unit_price="50.00", product_name="Camiseta",
+        )
+
+        response = self.client.get(
+            "/api/orders/dashboard/drop-revenue/",
+            **self.auth_header(self.admin),
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()[0]["drop_id"], str(drop.id))
+        self.assertEqual(Decimal(response.json()[0]["revenue"]), Decimal("100.00"))
+
+        matched = self.client.get(
+            self.url, {"search": "Drop 1"}, **self.auth_header(self.admin)
+        )
+        unmatched = self.client.get(
+            self.url, {"search": "Nome inexistente"}, **self.auth_header(self.admin)
+        )
+        self.assertEqual(matched.json()["sales_summary"]["total_orders"], 1)
+        self.assertEqual(unmatched.json()["sales_summary"]["total_orders"], 0)
 
 
 class AdminOrderManagementTests(APITestCase):

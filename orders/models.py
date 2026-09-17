@@ -2,6 +2,7 @@ import uuid
 
 from django.conf import settings
 from django.db import models
+from django.utils import timezone
 
 
 class OrderStatus(models.TextChoices):
@@ -216,8 +217,19 @@ class Payment(models.Model):
         max_length=255, unique=True, null=True, blank=True
     )
     qrcode_pix = models.TextField(null=True, blank=True)
+    paid_at = models.DateTimeField(null=True, blank=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    def save(self, *args, **kwargs):
+        # `paid_at` representa a primeira confirmação e não acompanha mudanças
+        # posteriores de status (por exemplo, PAID -> REFUNDED).
+        if self.status == PaymentStatus.PAID and self.paid_at is None:
+            self.paid_at = timezone.now()
+            update_fields = kwargs.get("update_fields")
+            if update_fields is not None:
+                kwargs["update_fields"] = set(update_fields) | {"paid_at"}
+        super().save(*args, **kwargs)
 
 
 class OrderStatusLog(models.Model):
