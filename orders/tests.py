@@ -260,141 +260,6 @@ class CheckoutAPITests(APITestCase):
         payload = self.checkout_payload()
         self.cart.items.all().delete()
 
-class StockReservationExpirationTests(APITestCase):
-    def setUp(self):
-        self.user = User.objects.create_user(
-            email="testador_exp@shio.com",
-            name="Testador Exp",
-            password="senha_forte_123",
-        )
-        self.client.force_authenticate(user=self.user)
-
-        self.address = Address.objects.create(
-            user=self.user,
-            zip_code="71000000",
-            street="Rua Teste",
-            address_number="123",
-            neighborhood="Centro",
-            city="Brasília",
-            state="DF",
-        )
-
-        self.category = Category.objects.create(name="RoupasExp", slug="roupas-exp")
-        self.product = Product.objects.create(
-            category=self.category, name="Jaqueta Exp", base_price=100.00
-        )
-        self.variation = ProductVariation.objects.create(
-            product=self.product, size="M", sku="TESTE-EXP-M", stock_quantity=10
-        )
-
-        self.cart = Cart.objects.create(user=self.user, status="ACTIVE")
-        CartItem.objects.create(
-            cart=self.cart, variation=self.variation, quantity=2, unit_price=100.00
-        )
-
-    @patch("orders.views.create_infinitepay_checkout")
-    def test_checkout_grava_prazo_de_expiracao(self, mock_create_checkout):
-        mock_create_checkout.return_value = "https://pay.infinitepay.io/mock-url"
-
-        response = self.client.post(
-            "/api/orders/checkout/",
-            {
-                "address_id": str(self.address.id),
-                "shipping_cost": 0,
-                "confirmed_subtotal": "200.00",
-            },
-            format="json",
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        order = CustomerOrder.objects.get(user=self.user)
-        self.assertIsNotNone(order.reservation_expires_at)
-        self.assertGreater(order.reservation_expires_at, timezone.now())
-
-    def test_pedido_expirado_e_cancelado_e_estoque_e_devolvido(self):
-        order = CustomerOrder.objects.create(
-            user=self.user,
-            address=self.address,
-            subtotal=200.00,
-            total_amount=200.00,
-            status=OrderStatus.AWAITING_PAYMENT,
-            shipping_zip_code="000",
-            shipping_street="X",
-            shipping_number="1",
-            shipping_neighborhood="Y",
-            shipping_city="Z",
-            shipping_state="DF",
-            reservation_expires_at=timezone.now() - timedelta(minutes=1),
-        )
-        order_item = OrderItem.objects.create(
-            order=order,
-            variation=self.variation,
-            quantity=2,
-            unit_price=100.00,
-            product_name="Jaqueta Exp - M",
-            sku_snapshot=self.variation.sku,
-        )
-        from products.services import move_stock
-
-        move_stock(
-            variation=self.variation,
-            kind="SAIDA",
-            reason="VENDA",
-            quantity=2,
-            origin_type="ORDER",
-            origin_id=order.pk,
-            order_item=order_item,
-            idempotency_key=f"sale:{order_item.pk}",
-            created_by=self.user,
-        )
-        self.variation.refresh_from_db()
-        self.assertEqual(self.variation.stock_quantity, 8)
-
-        response = self.client.get(f"/api/orders/my-orders/{order.id}/")
-
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-
-        order.refresh_from_db()
-        self.assertEqual(order.status, OrderStatus.CANCELED)
-
-        self.variation.refresh_from_db()
-        self.assertEqual(self.variation.stock_quantity, 10)
-
-        self.assertEqual(
-            StockMovement.objects.filter(
-                variation=self.variation, reason="DEVOLUCAO"
-            ).count(),
-            1,
-        )
-
-    def test_pedido_nao_expirado_nao_e_afetado(self):
-        order = CustomerOrder.objects.create(
-            user=self.user,
-            address=self.address,
-            subtotal=200.00,
-            total_amount=200.00,
-            status=OrderStatus.AWAITING_PAYMENT,
-            shipping_zip_code="000",
-            shipping_street="X",
-            shipping_number="1",
-            shipping_neighborhood="Y",
-            shipping_city="Z",
-            shipping_state="DF",
-            reservation_expires_at=timezone.now() + timedelta(minutes=30),
-        )
-
-        response = self.client.get(f"/api/orders/my-orders/{order.id}/")
-
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-
-        order.refresh_from_db()
-        self.assertEqual(order.status, OrderStatus.AWAITING_PAYMENT)
-
-
-class InfinitePayCardSimulationTests(APITestCase):
-    """Simula o gateway InfinitePay (POST /links e /payment_check) via mock de
-    requests.post, sem bater na rede nem exigir cartão real. Cobre o fluxo
-    completo: checkout -> pagamento aprovado / recusado."""
         response = self.client.post(self.url, payload, format="json")
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
@@ -946,7 +811,148 @@ class InfinitePayCardSimulationTests(APITestCase):
                 self.assertEqual(response.data["total_amount"], expected)
 
 
-@skipUnlessDBFeature("has_select_for_update")
+class StockReservationExpirationTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="testador_exp@shio.com",
+            name="Testador Exp",
+            password="senha_forte_123",
+        )
+        self.client.force_authenticate(user=self.user)
+
+        self.address = Address.objects.create(
+            user=self.user,
+            zip_code="71000000",
+            street="Rua Teste",
+            address_number="123",
+            neighborhood="Centro",
+            city="Brasília",
+            state="DF",
+        )
+
+        self.category = Category.objects.create(name="RoupasExp", slug="roupas-exp")
+        self.product = Product.objects.create(
+            category=self.category, name="Jaqueta Exp", base_price=100.00
+        )
+        self.variation = ProductVariation.objects.create(
+            product=self.product, size="M", sku="TESTE-EXP-M", stock_quantity=10
+        )
+
+        self.cart = Cart.objects.create(user=self.user, status="ACTIVE")
+        CartItem.objects.create(
+            cart=self.cart, variation=self.variation, quantity=2, unit_price=100.00
+        )
+
+    @patch("orders.services.create_infinitepay_checkout")
+    def test_checkout_grava_prazo_de_expiracao(self, mock_create_checkout):
+        mock_create_checkout.return_value = "https://pay.infinitepay.io/mock-url"
+
+        with (
+            patch(
+                "orders.services.fetch_shipping_price_by_service_and_ceps",
+                return_value={"pcFinal": "15.00"},
+            ),
+            patch(
+                "orders.services.fetch_shipping_deadline_by_service_and_ceps",
+                return_value={"prazoEntrega": 3},
+            ),
+        ):
+            quote = create_shipping_quote(self.user, self.address.pk)
+
+        response = self.client.post(
+            "/api/orders/checkout/",
+            {
+                "address_id": str(self.address.id),
+                "shipping_quote_id": str(quote.pk),
+                "idempotency_key": str(uuid.uuid4()),
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        order = CustomerOrder.objects.get(user=self.user)
+        self.assertIsNotNone(order.reservation_expires_at)
+        self.assertGreater(order.reservation_expires_at, timezone.now())
+
+    def test_pedido_expirado_e_cancelado_e_estoque_e_devolvido(self):
+        order = CustomerOrder.objects.create(
+            user=self.user,
+            address=self.address,
+            subtotal=200.00,
+            total_amount=200.00,
+            status=OrderStatus.AWAITING_PAYMENT,
+            shipping_zip_code="000",
+            shipping_street="X",
+            shipping_number="1",
+            shipping_neighborhood="Y",
+            shipping_city="Z",
+            shipping_state="DF",
+            reservation_expires_at=timezone.now() - timedelta(minutes=1),
+        )
+        order_item = OrderItem.objects.create(
+            order=order,
+            variation=self.variation,
+            quantity=2,
+            unit_price=100.00,
+            product_name="Jaqueta Exp - M",
+            sku_snapshot=self.variation.sku,
+        )
+        from products.services import move_stock
+
+        move_stock(
+            variation=self.variation,
+            kind="SAIDA",
+            reason="VENDA",
+            quantity=2,
+            origin_type="ORDER",
+            origin_id=order.pk,
+            order_item=order_item,
+            idempotency_key=f"sale:{order_item.pk}",
+            created_by=self.user,
+        )
+        self.variation.refresh_from_db()
+        self.assertEqual(self.variation.stock_quantity, 8)
+
+        response = self.client.get(f"/api/orders/my-orders/{order.id}/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        order.refresh_from_db()
+        self.assertEqual(order.status, OrderStatus.CANCELED)
+
+        self.variation.refresh_from_db()
+        self.assertEqual(self.variation.stock_quantity, 10)
+
+        self.assertEqual(
+            StockMovement.objects.filter(
+                variation=self.variation, reason="DEVOLUCAO"
+            ).count(),
+            1,
+        )
+
+    def test_pedido_nao_expirado_nao_e_afetado(self):
+        order = CustomerOrder.objects.create(
+            user=self.user,
+            address=self.address,
+            subtotal=200.00,
+            total_amount=200.00,
+            status=OrderStatus.AWAITING_PAYMENT,
+            shipping_zip_code="000",
+            shipping_street="X",
+            shipping_number="1",
+            shipping_neighborhood="Y",
+            shipping_city="Z",
+            shipping_state="DF",
+            reservation_expires_at=timezone.now() + timedelta(minutes=30),
+        )
+
+        response = self.client.get(f"/api/orders/my-orders/{order.id}/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        order.refresh_from_db()
+        self.assertEqual(order.status, OrderStatus.AWAITING_PAYMENT)
+        
 @override_settings(CORREIOS_REMETENTE_CEP="70000000")
 class CheckoutConcurrencyTests(APITransactionTestCase):
     def setUp(self):

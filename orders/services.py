@@ -600,7 +600,10 @@ def prepare_checkout_attempt(user, address_id, shipping_quote_id, idempotency_ke
             shipping_neighborhood=address.neighborhood,
             shipping_city=address.city,
             shipping_state=address.state,
+            reservation_expires_at=timezone.now()
+            + timedelta(minutes=settings.STOCK_RESERVATION_TTL_MINUTES),
         )
+        
         for item in calculation["items"]:
             variation = item["variation"]
             order_item = OrderItem.objects.create(
