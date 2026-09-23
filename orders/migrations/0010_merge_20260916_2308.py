@@ -4,12 +4,10 @@ from django.db import migrations
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('orders', '0004_customerorder_reservation_expires_at'),
-        ('orders', '0004_merge_payment_paid_at_and_welcome_coupon'),
-        ('orders', '0009_merge_checkout_welcome_coupon'),
+        ("orders", "0004_customerorder_reservation_expires_at"),
+        ("orders", "0004_merge_payment_paid_at_and_welcome_coupon"),
+        ("orders", "0009_merge_checkout_welcome_coupon"),
     ]
 
-    operations = [
-    ]
+    operations = []

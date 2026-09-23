@@ -4,9 +4,9 @@ from django.db.models import F
 
 def backfill_paid_at(apps, schema_editor):
     Payment = apps.get_model("orders", "Payment")
-    Payment.objects.filter(status__in=["PAID", "REFUNDED"], paid_at__isnull=True).update(
-        paid_at=F("updated_at")
-    )
+    Payment.objects.filter(
+        status__in=["PAID", "REFUNDED"], paid_at__isnull=True
+    ).update(paid_at=F("updated_at"))
 
 
 class Migration(migrations.Migration):

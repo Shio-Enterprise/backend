@@ -3,7 +3,7 @@ import uuid
 
 from django.core.files.base import ContentFile
 from django.db import transaction
-from django.db.models import Exists, Max, OuterRef, Q, Sum
+from django.db.models import Exists, Max, OuterRef, Sum
 from django.db.models.deletion import ProtectedError
 from django.http import JsonResponse
 from django.shortcuts import get_object_or_404
@@ -668,7 +668,6 @@ class ProductDetailView(APIView):
         if is_admin and allow_inactive_for_admin:
             return product
         if not is_product_visible(product):
-
             raise Product.DoesNotExist
         return product
 

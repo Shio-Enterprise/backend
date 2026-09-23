@@ -548,22 +548,31 @@ class CustomerCRMViewSet(viewsets.ReadOnlyModelViewSet):
             status=OrderStatus.DELIVERED,
             payment__status=PaymentStatus.PAID,
         ).distinct()
-        refunded_orders = base_orders.filter(payment__status=PaymentStatus.REFUNDED).distinct()
+        refunded_orders = base_orders.filter(
+            payment__status=PaymentStatus.REFUNDED
+        ).distinct()
         money_field = models.DecimalField(max_digits=14, decimal_places=2)
         sales_group = sales_orders.values("user")
         refund_group = refunded_orders.values("user")
         qs = User.objects.filter(profile__role="CUSTOMER").annotate(
             total_orders=Coalesce(
                 Subquery(sales_group.annotate(value=Count("id")).values("value")[:1]),
-                Value(0), output_field=IntegerField(),
+                Value(0),
+                output_field=IntegerField(),
             ),
             positive_spent=Coalesce(
-                Subquery(sales_group.annotate(value=Sum("total_amount")).values("value")[:1]),
-                Value(Decimal("0")), output_field=money_field,
+                Subquery(
+                    sales_group.annotate(value=Sum("total_amount")).values("value")[:1]
+                ),
+                Value(Decimal("0")),
+                output_field=money_field,
             ),
             refunded_spent=Coalesce(
-                Subquery(refund_group.annotate(value=Sum("total_amount")).values("value")[:1]),
-                Value(Decimal("0")), output_field=money_field,
+                Subquery(
+                    refund_group.annotate(value=Sum("total_amount")).values("value")[:1]
+                ),
+                Value(Decimal("0")),
+                output_field=money_field,
             ),
             total_spent=F("positive_spent") - F("refunded_spent"),
             last_purchase_date=Subquery(

@@ -20,9 +20,7 @@ from django.test import (
     RequestFactory,
     TransactionTestCase,
     override_settings,
-    skipUnlessDBFeature,
 )
-
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from rest_framework import status
@@ -56,8 +54,13 @@ from orders.services import (
     update_status,
     validate_shipping_quote,
 )
-from products.models import Category, Product, ProductVariation, StockMovement
-from products.models import Category, DropCampaign, Product, ProductVariation
+from products.models import (
+    Category,
+    DropCampaign,
+    Product,
+    ProductVariation,
+    StockMovement,
+)
 
 User = get_user_model()
 
@@ -952,7 +955,8 @@ class StockReservationExpirationTests(APITestCase):
 
         order.refresh_from_db()
         self.assertEqual(order.status, OrderStatus.AWAITING_PAYMENT)
-        
+
+
 @override_settings(CORREIOS_REMETENTE_CEP="70000000")
 class CheckoutConcurrencyTests(APITransactionTestCase):
     def setUp(self):
@@ -1836,7 +1840,9 @@ class AdminDashboardViewTests(APITestCase):
         payment = Payment.objects.create(
             order=order,
             method=PaymentMethod.PIX,
-            status=PaymentStatus.PAID if payment_status == PaymentStatus.REFUNDED else payment_status,
+            status=PaymentStatus.PAID
+            if payment_status == PaymentStatus.REFUNDED
+            else payment_status,
             total_amount=total,
         )
         if payment_status == PaymentStatus.REFUNDED:
@@ -1845,7 +1851,9 @@ class AdminDashboardViewTests(APITestCase):
         return order
 
     def test_receita_exige_pagamento_e_entrega_e_subtrai_reembolso(self):
-        self.create_metric_order(OrderStatus.DELIVERED, PaymentStatus.PAID, "110.00", "100.00")
+        self.create_metric_order(
+            OrderStatus.DELIVERED, PaymentStatus.PAID, "110.00", "100.00"
+        )
         self.create_metric_order(OrderStatus.SHIPPED, PaymentStatus.PAID, "200.00")
         self.create_metric_order(OrderStatus.DELIVERED, PaymentStatus.PENDING, "300.00")
         self.create_metric_order(OrderStatus.DELIVERED, PaymentStatus.REFUNDED, "40.00")
@@ -1875,19 +1883,27 @@ class AdminDashboardViewTests(APITestCase):
         drop = DropCampaign.objects.create(name="Drop 1", slug="drop-1")
         category = Category.objects.create(name="Camisetas", slug="camisetas-dashboard")
         product = Product.objects.create(
-            name="Camiseta", description="Teste", base_price="999.00",
-            category=category, drop=drop,
+            name="Camiseta",
+            description="Teste",
+            base_price="999.00",
+            category=category,
+            drop=drop,
         )
         variation = ProductVariation.objects.create(
             product=product, size="M", sku="DROP-M", stock_quantity=10
         )
-        order = self.create_metric_order(OrderStatus.DELIVERED, PaymentStatus.PAID, "105.00", "100.00")
+        order = self.create_metric_order(
+            OrderStatus.DELIVERED, PaymentStatus.PAID, "105.00", "100.00"
+        )
         order.shipping_cost = Decimal("15.00")
         order.discount_amount = Decimal("10.00")
         order.save()
         OrderItem.objects.create(
-            order=order, variation=variation, quantity=2,
-            unit_price="50.00", product_name="Camiseta",
+            order=order,
+            variation=variation,
+            quantity=2,
+            unit_price="50.00",
+            product_name="Camiseta",
         )
 
         response = self.client.get(
@@ -3100,15 +3116,23 @@ class CartSellabilityTests(APITestCase):
     cart_items_url = "/api/orders/cart/items/"
 
     def setUp(self):
-        self.category = Category.objects.create(name="CartSellCat", slug="cart-sell-cat")
+        self.category = Category.objects.create(
+            name="CartSellCat", slug="cart-sell-cat"
+        )
 
     def test_nao_pode_adicionar_produto_de_drop_privado_ao_carrinho(self):
         hidden_drop = DropCampaign.objects.create(
-            name="DropOcultoCart", slug="drop-oculto-cart", is_public=False, is_active=True
+            name="DropOcultoCart",
+            slug="drop-oculto-cart",
+            is_public=False,
+            is_active=True,
         )
         product = Product.objects.create(
-            category=self.category, drop=hidden_drop, name="ProdutoOculto",
-            description="x", base_price=30,
+            category=self.category,
+            drop=hidden_drop,
+            name="ProdutoOculto",
+            description="x",
+            base_price=30,
         )
         variation = ProductVariation.objects.create(
             product=product, size="U", sku="OCULTO-1", stock_quantity=10
@@ -3130,8 +3154,11 @@ class CartSellabilityTests(APITestCase):
             max_quantity=1,
         )
         product = Product.objects.create(
-            category=self.category, drop=sold_out_drop, name="ProdutoEsgotado",
-            description="x", base_price=20,
+            category=self.category,
+            drop=sold_out_drop,
+            name="ProdutoEsgotado",
+            description="x",
+            base_price=20,
         )
         variation = ProductVariation.objects.create(
             product=product, size="U", sku="ESGOT-1", stock_quantity=10
@@ -3152,7 +3179,10 @@ class CartSellabilityTests(APITestCase):
             shipping_state="DF",
         )
         OrderItem.objects.create(
-            order=order, variation=variation, quantity=1, unit_price=20,
+            order=order,
+            variation=variation,
+            quantity=1,
+            unit_price=20,
             product_name="ProdutoEsgotado - U",
         )
 
@@ -3165,7 +3195,10 @@ class CartSellabilityTests(APITestCase):
 
     def test_produto_sem_drop_pode_ser_adicionado_normalmente(self):
         product = Product.objects.create(
-            category=self.category, name="ProdutoLivre", description="x", base_price=15,
+            category=self.category,
+            name="ProdutoLivre",
+            description="x",
+            base_price=15,
         )
         variation = ProductVariation.objects.create(
             product=product, size="U", sku="LIVRE-1", stock_quantity=10
@@ -3222,8 +3255,11 @@ class CheckoutRevalidationTests(APITestCase):
         )
         self.category = Category.objects.create(name="RevalCat", slug="reval-cat")
         self.product = Product.objects.create(
-            category=self.category, drop=self.drop, name="ProdutoReval",
-            description="x", base_price=80,
+            category=self.category,
+            drop=self.drop,
+            name="ProdutoReval",
+            description="x",
+            base_price=80,
         )
         self.variation = ProductVariation.objects.create(
             product=self.product, size="M", sku="REVAL-M", stock_quantity=5
@@ -3235,7 +3271,9 @@ class CheckoutRevalidationTests(APITestCase):
         self.client.force_authenticate(user=self.user)
         self.url = "/api/orders/checkout/"
 
-    def test_checkout_bloqueado_quando_drop_fica_inativo_apos_adicionar_ao_carrinho(self):
+    def test_checkout_bloqueado_quando_drop_fica_inativo_apos_adicionar_ao_carrinho(
+        self,
+    ):
         payload = make_checkout_payload(self.client, self.address)
         self.drop.is_active = False
         self.drop.save()
@@ -3249,7 +3287,9 @@ class CheckoutRevalidationTests(APITestCase):
         self.assertEqual(self.variation.stock_quantity, 5)
         self.assertEqual(CustomerOrder.objects.count(), 0)
 
-    def test_checkout_bloqueado_quando_produto_fica_inativo_apos_adicionar_ao_carrinho(self):
+    def test_checkout_bloqueado_quando_produto_fica_inativo_apos_adicionar_ao_carrinho(
+        self,
+    ):
         payload = make_checkout_payload(self.client, self.address)
         self.product.is_active = False
         self.product.save()
@@ -3268,19 +3308,27 @@ class CheckoutDropLimitTests(APITestCase):
 
     def setUp(self):
         self.drop = DropCampaign.objects.create(
-            name="DropLimite", slug="drop-limite", is_public=True, is_active=True,
+            name="DropLimite",
+            slug="drop-limite",
+            is_public=True,
+            is_active=True,
             max_quantity=3,
         )
         self.category = Category.objects.create(name="LimiteCat", slug="limite-cat")
         self.product = Product.objects.create(
-            category=self.category, drop=self.drop, name="ProdutoLimite",
-            description="x", base_price=40,
+            category=self.category,
+            drop=self.drop,
+            name="ProdutoLimite",
+            description="x",
+            base_price=40,
         )
         self.variation = ProductVariation.objects.create(
             product=self.product, size="U", sku="LIMITE-1", stock_quantity=100
         )
 
-        existing_buyer = User.objects.create_user(email="buyer1@shio.com", name="Buyer1")
+        existing_buyer = User.objects.create_user(
+            email="buyer1@shio.com", name="Buyer1"
+        )
         make_address(existing_buyer)
         self.existing_order = CustomerOrder.objects.create(
             user=existing_buyer,
@@ -3295,7 +3343,10 @@ class CheckoutDropLimitTests(APITestCase):
             shipping_state="DF",
         )
         OrderItem.objects.create(
-            order=self.existing_order, variation=self.variation, quantity=3, unit_price=40,
+            order=self.existing_order,
+            variation=self.variation,
+            quantity=3,
+            unit_price=40,
             product_name="ProdutoLimite - U",
         )
 
@@ -3354,22 +3405,30 @@ class ConcurrentCheckoutStockTests(TransactionTestCase):
     def setUp(self):
         self.category = Category.objects.create(name="ConcCat", slug="conc-cat")
         self.product = Product.objects.create(
-            category=self.category, name="ProdutoConcorrente", description="x",
+            category=self.category,
+            name="ProdutoConcorrente",
+            description="x",
             base_price=100,
         )
         self.variation = ProductVariation.objects.create(
             product=self.product, size="U", sku="CONC-STOCK-1", stock_quantity=1
         )
 
-        self.user1 = User.objects.create_user(email="conc_stock1@shio.com", name="ConcStock1")
-        self.user2 = User.objects.create_user(email="conc_stock2@shio.com", name="ConcStock2")
+        self.user1 = User.objects.create_user(
+            email="conc_stock1@shio.com", name="ConcStock1"
+        )
+        self.user2 = User.objects.create_user(
+            email="conc_stock2@shio.com", name="ConcStock2"
+        )
 
         self.address1 = make_address(self.user1)
         self.address2 = make_address(self.user2)
 
         for user in (self.user1, self.user2):
             cart = Cart.objects.create(user=user, status="ACTIVE")
-            CartItem.objects.create(cart=cart, variation=self.variation, quantity=1, unit_price=100)
+            CartItem.objects.create(
+                cart=cart, variation=self.variation, quantity=1, unit_price=100
+            )
 
     @patch("orders.services.create_infinitepay_checkout")
     def test_checkout_concorrente_nao_ultrapassa_estoque(self, mock_checkout):
@@ -3417,7 +3476,9 @@ class ConcurrentCheckoutStockTests(TransactionTestCase):
 
         statuses = list(results.values())
         self.assertEqual(len(statuses), 2)
-        self.assertEqual(statuses.count(201), 1, f"esperado exatamente 1 sucesso, obtido {statuses}")
+        self.assertEqual(
+            statuses.count(201), 1, f"esperado exatamente 1 sucesso, obtido {statuses}"
+        )
 
         self.variation.refresh_from_db()
         self.assertEqual(self.variation.stock_quantity, 0)
@@ -3437,27 +3498,41 @@ class ConcurrentCheckoutDropLimitTests(TransactionTestCase):
 
     def setUp(self):
         self.drop = DropCampaign.objects.create(
-            name="DropConcorrente", slug="drop-concorrente", is_public=True,
-            is_active=True, max_quantity=1,
+            name="DropConcorrente",
+            slug="drop-concorrente",
+            is_public=True,
+            is_active=True,
+            max_quantity=1,
         )
-        self.category = Category.objects.create(name="ConcDropCat", slug="conc-drop-cat")
+        self.category = Category.objects.create(
+            name="ConcDropCat", slug="conc-drop-cat"
+        )
         self.product = Product.objects.create(
-            category=self.category, drop=self.drop, name="ProdutoDropConcorrente",
-            description="x", base_price=50,
+            category=self.category,
+            drop=self.drop,
+            name="ProdutoDropConcorrente",
+            description="x",
+            base_price=50,
         )
         self.variation = ProductVariation.objects.create(
             product=self.product, size="U", sku="CONC-DROP-1", stock_quantity=10
         )
 
-        self.user1 = User.objects.create_user(email="conc_drop1@shio.com", name="ConcDrop1")
-        self.user2 = User.objects.create_user(email="conc_drop2@shio.com", name="ConcDrop2")
+        self.user1 = User.objects.create_user(
+            email="conc_drop1@shio.com", name="ConcDrop1"
+        )
+        self.user2 = User.objects.create_user(
+            email="conc_drop2@shio.com", name="ConcDrop2"
+        )
 
         self.address1 = make_address(self.user1)
         self.address2 = make_address(self.user2)
 
         for user in (self.user1, self.user2):
             cart = Cart.objects.create(user=user, status="ACTIVE")
-            CartItem.objects.create(cart=cart, variation=self.variation, quantity=1, unit_price=50)
+            CartItem.objects.create(
+                cart=cart, variation=self.variation, quantity=1, unit_price=50
+            )
 
     @patch("orders.services.create_infinitepay_checkout")
     def test_checkout_concorrente_nao_ultrapassa_max_quantity(self, mock_checkout):
@@ -3500,7 +3575,9 @@ class ConcurrentCheckoutDropLimitTests(TransactionTestCase):
 
         statuses = list(results.values())
         self.assertEqual(len(statuses), 2)
-        self.assertEqual(statuses.count(201), 1, f"esperado exatamente 1 sucesso, obtido {statuses}")
+        self.assertEqual(
+            statuses.count(201), 1, f"esperado exatamente 1 sucesso, obtido {statuses}"
+        )
 
         total_sold = (
             OrderItem.objects.filter(variation__product__drop=self.drop)
@@ -3508,6 +3585,8 @@ class ConcurrentCheckoutDropLimitTests(TransactionTestCase):
             .aggregate(total=Sum("quantity"))["total"]
         )
         self.assertEqual(total_sold, 1)
+
+
 class WelcomeCouponSeedTests(APITestCase):
     def test_seed_cria_cupom_bemvindo10(self):
         from orders.models import Coupon
