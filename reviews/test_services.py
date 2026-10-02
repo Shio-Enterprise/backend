@@ -4,14 +4,22 @@ from django.test import TestCase
 
 from orders.models import OrderItem, OrderStatus, PaymentStatus
 
-from .factories import make_order_item, make_product, make_user
-from .models import ProductReview, RemovalReason, ReviewStatus
+from .factories import make_order_item, make_product, make_review, make_user
+from .models import ProductReview, RemovalReason, ReviewFit, ReviewStatus
 from .services import (
     AlreadyReviewed,
+    InvalidTransition,
+    MissingRemovalNote,
     NotEligible,
+    clear_reply,
     create_review,
     delete_review,
     get_eligible_order_item,
+    rating_summary,
+    recompute_product_rating,
+    remove_review,
+    restore_review,
+    set_reply,
     update_review,
 )
 
@@ -176,3 +184,131 @@ class DeleteReviewTests(TestCase):
         product.refresh_from_db()
         self.assertEqual(product.rating_avg, Decimal("0.00"))
         self.assertEqual(product.rating_count, 0)
+
+
+class ModerationTests(TestCase):
+    def setUp(self):
+        self.product, (self.variation,) = make_product()
+        self.admin = make_user(admin=True)
+        self.user = make_user()
+        make_order_item(self.user, self.variation)
+        self.review = create_review(self.user, self.product, rating=1)
+        other = make_user()
+        make_order_item(other, self.variation)
+        create_review(other, self.product, rating=5)
+
+    def test_remover_tira_da_media_e_grava_motivo(self):
+        remove_review(self.review, admin=self.admin, reason=RemovalReason.SPAM)
+
+        self.review.refresh_from_db()
+        self.assertEqual(self.review.status, ReviewStatus.REMOVED)
+        self.assertEqual(self.review.removal_reason, RemovalReason.SPAM)
+        self.assertEqual(self.review.removed_by, self.admin)
+        self.assertIsNotNone(self.review.removed_at)
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.rating_avg, Decimal("5.00"))
+        self.assertEqual(self.product.rating_count, 1)
+
+    def test_outro_exige_texto(self):
+        for note in ("", "   "):
+            with self.subTest(note=note):
+                with self.assertRaises(MissingRemovalNote):
+                    remove_review(
+                        self.review,
+                        admin=self.admin,
+                        reason=RemovalReason.OTHER,
+                        note=note,
+                    )
+        self.review.refresh_from_db()
+        self.assertEqual(self.review.status, ReviewStatus.PUBLISHED)
+
+    def test_outro_com_texto_grava_nota(self):
+        remove_review(
+            self.review, admin=self.admin, reason=RemovalReason.OTHER, note=" Golpe "
+        )
+        self.review.refresh_from_db()
+        self.assertEqual(self.review.removal_note, "Golpe")
+
+    def test_remover_duas_vezes_e_erro(self):
+        remove_review(self.review, admin=self.admin, reason=RemovalReason.SPAM)
+        with self.assertRaises(InvalidTransition):
+            remove_review(self.review, admin=self.admin, reason=RemovalReason.SPAM)
+
+    def test_restaurar_volta_para_media(self):
+        remove_review(self.review, admin=self.admin, reason=RemovalReason.SPAM)
+
+        restore_review(self.review)
+
+        self.review.refresh_from_db()
+        self.assertEqual(self.review.status, ReviewStatus.PUBLISHED)
+        self.assertEqual(self.review.removal_reason, "")
+        self.assertIsNone(self.review.removed_by)
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.rating_avg, Decimal("3.00"))
+        self.assertEqual(self.product.rating_count, 2)
+
+    def test_restaurar_publicada_e_erro(self):
+        with self.assertRaises(InvalidTransition):
+            restore_review(self.review)
+
+
+class ReplyTests(TestCase):
+    def setUp(self):
+        self.product, _ = make_product()
+        self.review = make_review(make_user(), self.product, rating=4)
+
+    def test_responder_grava_texto_e_data(self):
+        set_reply(self.review, "  Obrigado!  ")
+        self.review.refresh_from_db()
+        self.assertEqual(self.review.admin_reply, "Obrigado!")
+        self.assertIsNotNone(self.review.admin_reply_at)
+
+    def test_responder_nao_mexe_na_media(self):
+        set_reply(self.review, "Obrigado!")
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.rating_count, 0)  # make_review não recalcula
+
+    def test_nao_responde_removida(self):
+        self.review.status = ReviewStatus.REMOVED
+        self.review.save(update_fields=["status"])
+        with self.assertRaises(InvalidTransition):
+            set_reply(self.review, "Obrigado!")
+
+    def test_apagar_resposta(self):
+        set_reply(self.review, "Obrigado!")
+        clear_reply(self.review)
+        self.review.refresh_from_db()
+        self.assertEqual(self.review.admin_reply, "")
+        self.assertIsNone(self.review.admin_reply_at)
+
+
+class SummaryTests(TestCase):
+    def test_resumo_conta_so_publicadas(self):
+        product, _ = make_product()
+        make_review(make_user(), product, rating=5, fit=ReviewFit.TRUE_TO_SIZE)
+        make_review(make_user(), product, rating=4, fit=ReviewFit.SMALL)
+        make_review(make_user(), product, rating=4)
+        make_review(
+            make_user(),
+            product,
+            rating=1,
+            fit=ReviewFit.LARGE,
+            status=ReviewStatus.REMOVED,
+        )
+        recompute_product_rating(product)
+
+        summary = rating_summary(product)
+
+        self.assertEqual(summary["rating_avg"], Decimal("4.33"))
+        self.assertEqual(summary["rating_count"], 3)
+        self.assertEqual(
+            summary["distribution"], {"1": 0, "2": 0, "3": 0, "4": 2, "5": 1}
+        )
+        self.assertEqual(summary["fit"], {"SMALL": 1, "TRUE_TO_SIZE": 1, "LARGE": 0})
+
+    def test_resumo_vazio(self):
+        product, _ = make_product()
+        summary = rating_summary(product)
+        self.assertEqual(summary["rating_count"], 0)
+        self.assertEqual(summary["distribution"], {str(n): 0 for n in range(1, 6)})
+        self.assertEqual(summary["fit"], {"SMALL": 0, "TRUE_TO_SIZE": 0, "LARGE": 0})

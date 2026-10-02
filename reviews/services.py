@@ -2,11 +2,12 @@ from decimal import ROUND_HALF_UP, Decimal
 
 from django.db import IntegrityError, transaction
 from django.db.models import Avg, Count
+from django.utils import timezone
 
 from orders.models import OrderItem, OrderStatus
 from products.models import Product
 
-from .models import ProductReview, ReviewStatus
+from .models import ProductReview, RemovalReason, ReviewFit, ReviewStatus
 
 TWO_PLACES = Decimal("0.01")
 EDITABLE_FIELDS = ("rating", "comment", "fit")
@@ -141,3 +142,67 @@ def delete_review(review):
     with transaction.atomic():
         review.delete()
         recompute_product_rating(product)
+
+
+def remove_review(review, *, admin, reason, note=""):
+    note = (note or "").strip()
+    if reason == RemovalReason.OTHER and not note:
+        raise MissingRemovalNote()
+    with transaction.atomic():
+        if review.status == ReviewStatus.REMOVED:
+            raise InvalidTransition("Avaliação já está removida.")
+        review.status = ReviewStatus.REMOVED
+        review.removal_reason = reason
+        review.removal_note = note
+        review.removed_by = admin
+        review.removed_at = timezone.now()
+        review.save()
+        recompute_product_rating(review.product)
+    return review
+
+
+def restore_review(review):
+    with transaction.atomic():
+        if review.status != ReviewStatus.REMOVED:
+            raise InvalidTransition("Avaliação já está publicada.")
+        review.status = ReviewStatus.PUBLISHED
+        _clear_removal(review)
+        review.save()
+        recompute_product_rating(review.product)
+    return review
+
+
+def set_reply(review, text):
+    if review.status != ReviewStatus.PUBLISHED:
+        raise InvalidTransition("Só é possível responder avaliações publicadas.")
+    review.admin_reply = text.strip()
+    review.admin_reply_at = timezone.now()
+    review.save(update_fields=["admin_reply", "admin_reply_at", "updated_at"])
+    return review
+
+
+def clear_reply(review):
+    review.admin_reply = ""
+    review.admin_reply_at = None
+    review.save(update_fields=["admin_reply", "admin_reply_at", "updated_at"])
+    return review
+
+
+def rating_summary(product):
+    published = ProductReview.objects.filter(
+        product=product, status=ReviewStatus.PUBLISHED
+    )
+    distribution = {str(n): 0 for n in range(1, 6)}
+    for row in published.values("rating").annotate(total=Count("id")).order_by():
+        distribution[str(row["rating"])] = row["total"]
+    fit = {choice: 0 for choice in ReviewFit.values}
+    for row in (
+        published.exclude(fit="").values("fit").annotate(total=Count("id")).order_by()
+    ):
+        fit[row["fit"]] = row["total"]
+    return {
+        "rating_avg": product.rating_avg,
+        "rating_count": product.rating_count,
+        "distribution": distribution,
+        "fit": fit,
+    }
