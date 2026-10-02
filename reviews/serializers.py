@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from rest_framework.pagination import PageNumberPagination
 
-from .models import ProductReview, ReviewFit
+from .models import ProductReview, RemovalReason, ReviewFit, ReviewStatus
 
 
 class ReviewPagination(PageNumberPagination):
@@ -105,3 +105,41 @@ class RatingSummarySerializer(serializers.Serializer):
     rating_count = serializers.IntegerField()
     distribution = serializers.DictField(child=serializers.IntegerField())
     fit = serializers.DictField(child=serializers.IntegerField())
+
+
+class ReviewAdminSerializer(ReviewMineSerializer):
+    author_email = serializers.EmailField(source="user.email", read_only=True)
+    removed_by_name = serializers.SerializerMethodField()
+
+    class Meta(ReviewMineSerializer.Meta):
+        fields = ReviewMineSerializer.Meta.fields + ["author_email", "removed_by_name"]
+        read_only_fields = fields
+
+    def get_removed_by_name(self, obj) -> str | None:
+        return obj.removed_by.get_full_name() if obj.removed_by else None
+
+
+class AdminReviewListQuerySerializer(serializers.Serializer):
+    status = serializers.ChoiceField(choices=ReviewStatus.choices, required=False)
+    rating = serializers.IntegerField(min_value=1, max_value=5, required=False)
+    product = serializers.UUIDField(required=False)
+    page = serializers.IntegerField(min_value=1, required=False)
+    page_size = serializers.IntegerField(min_value=1, required=False)
+
+
+class RemovalInputSerializer(RejectUnknownFieldsMixin, serializers.Serializer):
+    reason = serializers.ChoiceField(choices=RemovalReason.choices)
+    note = serializers.CharField(
+        max_length=500, required=False, allow_blank=True, default=""
+    )
+
+    def validate(self, attrs):
+        if attrs["reason"] == RemovalReason.OTHER and not attrs["note"].strip():
+            raise serializers.ValidationError(
+                {"note": "Descreva o motivo quando escolher 'Outro'."}
+            )
+        return attrs
+
+
+class ReplyInputSerializer(RejectUnknownFieldsMixin, serializers.Serializer):
+    text = serializers.CharField(max_length=1000)

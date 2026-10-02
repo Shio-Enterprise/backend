@@ -332,6 +332,7 @@ SPECTACULAR_SETTINGS = {
     "ENUM_NAME_OVERRIDES": {
         # 'NomeBonitoNoSwagger': 'caminho.do.seu.app.models.NomeDaClasseDeChoices'
         "OrderStatusEnum": "orders.models.OrderStatus",
+        "ReviewStatusEnum": "reviews.models.ReviewStatus",
         # Se tiver outro enum de status dando conflito, adicione aqui embaixo
     },
 }

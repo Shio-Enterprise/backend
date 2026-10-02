@@ -6,12 +6,17 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
+from authentication.permissions import IsStaffOrSuperUser
 from products.models import Product
 
 from .models import ProductReview, ReviewStatus
 from .serializers import (
+    AdminReviewListQuerySerializer,
     EligibilitySerializer,
     RatingSummarySerializer,
+    RemovalInputSerializer,
+    ReplyInputSerializer,
+    ReviewAdminSerializer,
     ReviewListQuerySerializer,
     ReviewMineSerializer,
     ReviewPagination,
@@ -22,10 +27,14 @@ from .services import (
     AlreadyReviewed,
     NotEligible,
     ReviewError,
+    clear_reply,
     create_review,
     delete_review,
     get_eligible_order_item,
     rating_summary,
+    remove_review,
+    restore_review,
+    set_reply,
     update_review,
 )
 
@@ -186,3 +195,102 @@ class MyReviewsView(APIView):
             .order_by("-created_at", "id")
         )
         return paginate(self, request, queryset, ReviewMineSerializer)
+
+
+def get_review_for_admin(review_id):
+    return get_object_or_404(
+        ProductReview.objects.select_related("product", "user", "removed_by"),
+        pk=review_id,
+    )
+
+
+class AdminReviewListView(APIView):
+    permission_classes = [IsStaffOrSuperUser]
+
+    @extend_schema(
+        parameters=[AdminReviewListQuerySerializer],
+        responses={200: ReviewAdminSerializer(many=True)},
+        summary="Listar avaliações para moderação",
+    )
+    def get(self, request):
+        query = AdminReviewListQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        filters = {
+            key: value
+            for key, value in query.validated_data.items()
+            if key in ("status", "rating", "product")
+        }
+        if "product" in filters:
+            filters["product_id"] = filters.pop("product")
+        queryset = (
+            ProductReview.objects.filter(**filters)
+            .select_related("product", "user", "removed_by")
+            .order_by("-created_at", "id")
+        )
+        return paginate(self, request, queryset, ReviewAdminSerializer)
+
+
+class AdminReviewRemoveView(APIView):
+    permission_classes = [IsStaffOrSuperUser]
+
+    @extend_schema(
+        request=RemovalInputSerializer,
+        responses={200: ReviewAdminSerializer},
+        summary="Remover avaliação da loja com motivo",
+    )
+    def post(self, request, review_id):
+        review = get_review_for_admin(review_id)
+        serializer = RemovalInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            review = remove_review(
+                review, admin=request.user, **serializer.validated_data
+            )
+        except ReviewError as exc:
+            return review_error_response(exc)
+        return Response(ReviewAdminSerializer(review).data)
+
+
+class AdminReviewRestoreView(APIView):
+    permission_classes = [IsStaffOrSuperUser]
+
+    @extend_schema(
+        request=None,
+        responses={200: ReviewAdminSerializer},
+        summary="Desfazer remoção",
+    )
+    def post(self, request, review_id):
+        review = get_review_for_admin(review_id)
+        try:
+            review = restore_review(review)
+        except ReviewError as exc:
+            return review_error_response(exc)
+        return Response(ReviewAdminSerializer(review).data)
+
+
+class AdminReviewReplyView(APIView):
+    permission_classes = [IsStaffOrSuperUser]
+
+    @extend_schema(
+        request=ReplyInputSerializer,
+        responses={200: ReviewAdminSerializer},
+        summary="Criar ou editar resposta da Shio",
+    )
+    def put(self, request, review_id):
+        review = get_review_for_admin(review_id)
+        serializer = ReplyInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            review = set_reply(review, serializer.validated_data["text"])
+        except ReviewError as exc:
+            return review_error_response(exc)
+        return Response(ReviewAdminSerializer(review).data)
+
+    @extend_schema(
+        request=None,
+        responses={200: ReviewAdminSerializer},
+        summary="Apagar resposta da Shio",
+    )
+    def delete(self, request, review_id):
+        review = clear_reply(get_review_for_admin(review_id))
+        return Response(ReviewAdminSerializer(review).data)
