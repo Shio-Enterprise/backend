@@ -92,6 +92,14 @@ class AdminReviewApiTests(APITestCase):
         self.assertEqual(self.product.rating_count, 0)
         self.assertEqual(self.product.rating_avg, Decimal("0.00"))
 
+    def test_remover_com_corpo_que_nao_e_objeto_400(self):
+        response = self.client.post(
+            action_url(self.review, "remove"), ["SPAM"], format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.review.refresh_from_db()
+        self.assertEqual(self.review.status, ReviewStatus.PUBLISHED)
+
     def test_remover_outro_sem_texto_400(self):
         for body in ({"reason": "OTHER"}, {"reason": "OTHER", "note": "   "}):
             with self.subTest(body=body):

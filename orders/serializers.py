@@ -67,7 +67,9 @@ class SimpleOrderItemSerializer(serializers.ModelSerializer):
 
     def get_can_review(self, obj) -> bool:
         return (
-            obj.order.status == OrderStatus.DELIVERED and obj.variation_id is not None
+            obj.order.status == OrderStatus.DELIVERED
+            and obj.variation_id is not None
+            and obj.variation.product.is_active
         )
 
     def get_review_id(self, obj) -> str | None:

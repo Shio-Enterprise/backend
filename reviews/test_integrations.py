@@ -85,6 +85,21 @@ class OrderItemReviewFieldsTests(APITestCase):
         self.assertFalse(data["can_review"])
         self.assertIsNone(data["review_id"])
 
+    def test_produto_inativo_nao_pode_avaliar(self):
+        item = make_order_item(self.user, self.variation)
+        type(self.product).objects.filter(pk=self.product.pk).update(is_active=False)
+        data = self.get_item(item)
+        self.assertFalse(data["can_review"])
+
+    def test_avaliacao_de_outro_usuario_nao_vaza(self):
+        item = make_order_item(self.user, self.variation)
+        other = make_user()
+        make_order_item(other, self.variation)
+        create_review(other, self.product, rating=4)
+        data = self.get_item(item)
+        self.assertIsNone(data["review_id"])
+        self.assertTrue(data["can_review"])
+
     def test_item_sem_variacao(self):
         item = make_order_item(self.user, self.variation)
         type(item).objects.filter(pk=item.pk).update(variation=None)

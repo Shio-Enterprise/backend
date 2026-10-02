@@ -312,3 +312,34 @@ class SummaryTests(TestCase):
         self.assertEqual(summary["rating_count"], 0)
         self.assertEqual(summary["distribution"], {str(n): 0 for n in range(1, 6)})
         self.assertEqual(summary["fit"], {"SMALL": 0, "TRUE_TO_SIZE": 0, "LARGE": 0})
+
+
+class LostUpdateTests(TestCase):
+    def setUp(self):
+        self.product, (variation,) = make_product()
+        self.user = make_user()
+        make_order_item(self.user, variation)
+        self.review = create_review(self.user, self.product, rating=5)
+        self.admin = make_user(admin=True)
+
+    def test_edicao_do_autor_nao_apaga_resposta_do_admin(self):
+        a = ProductReview.objects.get(pk=self.review.pk)
+        b = ProductReview.objects.get(pk=self.review.pk)
+        set_reply(a, "Obrigado")
+
+        update_review(b, comment="Novo")
+
+        self.review.refresh_from_db()
+        self.assertEqual(self.review.admin_reply, "Obrigado")
+        self.assertEqual(self.review.comment, "Novo")
+
+    def test_remocao_do_admin_nao_reverte_texto_do_autor(self):
+        a = ProductReview.objects.get(pk=self.review.pk)
+        b = ProductReview.objects.get(pk=self.review.pk)
+        update_review(a, comment="Novo")
+
+        remove_review(b, admin=self.admin, reason=RemovalReason.SPAM)
+
+        self.review.refresh_from_db()
+        self.assertEqual(self.review.comment, "Novo")
+        self.assertEqual(self.review.status, ReviewStatus.REMOVED)

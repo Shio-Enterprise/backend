@@ -188,9 +188,18 @@ class CreateReviewApiTests(APITestCase):
                 self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertFalse(ProductReview.objects.exists())
 
-    def test_limite_de_5_por_hora(self):
+    def test_corpo_que_nao_e_objeto_400(self):
         self.client.force_authenticate(self.user)
-        for _ in range(5):
+        make_order_item(self.user, self.variation)
+        for body in ([{"rating": 5}], 5):
+            with self.subTest(body=body):
+                response = self.client.post(self.url, body, format="json")
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(ProductReview.objects.exists())
+
+    def test_limite_de_20_por_hora(self):
+        self.client.force_authenticate(self.user)
+        for _ in range(20):
             self.client.post(self.url, {"rating": 5}, format="json")
         response = self.client.post(self.url, {"rating": 5}, format="json")
         self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
@@ -233,10 +242,23 @@ class AuthorReviewApiTests(APITestCase):
 
     def test_patch_com_campo_proibido_400(self):
         self.client.force_authenticate(self.user)
-        response = self.client.patch(
-            review_url(self.review), {"status": "REMOVED"}, format="json"
-        )
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        forbidden = [
+            {"status": "REMOVED"},
+            {"user": str(self.stranger.id)},
+            {"product": str(self.product.id)},
+            {"admin_reply": "Oficial"},
+            {"purchased_size": "GG"},
+        ]
+        for extra in forbidden:
+            with self.subTest(extra=extra):
+                response = self.client.patch(
+                    review_url(self.review), {"rating": 1, **extra}, format="json"
+                )
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.review.refresh_from_db()
+        self.assertEqual(self.review.rating, 5)
+        self.assertEqual(self.review.status, ReviewStatus.PUBLISHED)
+        self.assertEqual(self.review.admin_reply, "")
 
     def test_editar_ou_excluir_de_outra_pessoa_404(self):
         self.client.force_authenticate(self.stranger)

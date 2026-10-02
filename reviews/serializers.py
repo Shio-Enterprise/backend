@@ -1,3 +1,5 @@
+from collections.abc import Mapping
+
 from rest_framework import serializers
 from rest_framework.pagination import PageNumberPagination
 
@@ -14,6 +16,8 @@ class RejectUnknownFieldsMixin:
     """Mesmo contrato do StrictSerializer de products: campo extra -> 400."""
 
     def to_internal_value(self, data):
+        if not isinstance(data, Mapping):
+            return super().to_internal_value(data)
         unknown = set(data) - set(self.fields)
         if unknown:
             raise serializers.ValidationError(

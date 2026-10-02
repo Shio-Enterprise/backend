@@ -11,6 +11,14 @@ from .models import ProductReview, RemovalReason, ReviewFit, ReviewStatus
 
 TWO_PLACES = Decimal("0.01")
 EDITABLE_FIELDS = ("rating", "comment", "fit")
+MODERATION_FIELDS = [
+    "status",
+    "removal_reason",
+    "removal_note",
+    "removed_by",
+    "removed_at",
+    "updated_at",
+]
 
 
 class ReviewError(Exception):
@@ -42,7 +50,9 @@ class MissingRemovalNote(ReviewError):
 def recompute_product_rating(product):
     """Único ponto que escreve rating_avg/rating_count no produto."""
     with transaction.atomic():
-        locked = Product.objects.select_for_update().get(pk=product.pk)
+        # no_key: o insert da avaliação já tomou FOR KEY SHARE no produto (FK);
+        # FOR UPDATE completo conflitaria e causaria deadlock em criações concorrentes.
+        locked = Product.objects.select_for_update(no_key=True).get(pk=product.pk)
         stats = ProductReview.objects.filter(
             product_id=locked.pk, status=ReviewStatus.PUBLISHED
         ).aggregate(avg=Avg("rating"), count=Count("id"))
@@ -132,7 +142,19 @@ def update_review(review, **changes):
         if review.status == ReviewStatus.REMOVED:
             review.status = ReviewStatus.PUBLISHED
             _clear_removal(review)
-        review.save()
+        # Só campos do autor: não sobrescreve resposta do admin feita em paralelo.
+        update_fields = {
+            *changes,
+            "order_item",
+            "purchased_size",
+            "status",
+            "removal_reason",
+            "removal_note",
+            "removed_by",
+            "removed_at",
+            "updated_at",
+        }
+        review.save(update_fields=sorted(update_fields))
         recompute_product_rating(review.product)
     return review
 
@@ -156,7 +178,7 @@ def remove_review(review, *, admin, reason, note=""):
         review.removal_note = note
         review.removed_by = admin
         review.removed_at = timezone.now()
-        review.save()
+        review.save(update_fields=MODERATION_FIELDS)
         recompute_product_rating(review.product)
     return review
 
@@ -167,7 +189,7 @@ def restore_review(review):
             raise InvalidTransition("Avaliação já está publicada.")
         review.status = ReviewStatus.PUBLISHED
         _clear_removal(review)
-        review.save()
+        review.save(update_fields=MODERATION_FIELDS)
         recompute_product_rating(review.product)
     return review
 
