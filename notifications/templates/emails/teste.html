@@ -1,0 +1,5 @@
+{% extends "emails/base.html" %}
+{% block content %}
+<p style="margin:0 0 16px;">{% if nome %}Olá, {{ nome }}!{% else %}Olá!{% endif %}</p>
+<p style="margin:0;">Este é um e-mail de teste da Shio. Se você recebeu esta mensagem, o envio de e-mails está funcionando.</p>
+{% endblock %}

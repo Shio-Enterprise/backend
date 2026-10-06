@@ -1,0 +1,4 @@
+{% extends "emails/base.txt" %}
+{% block content %}{% if nome %}Olá, {{ nome }}!{% else %}Olá!{% endif %}
+
+Este é um e-mail de teste da Shio. Se você recebeu esta mensagem, o envio de e-mails está funcionando.{% endblock %}
