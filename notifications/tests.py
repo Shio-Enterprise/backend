@@ -155,11 +155,19 @@ class SendEmailTests(SimpleTestCase):
         self.assertEqual(len(mail.outbox), 0)
 
     def test_sem_destinatario_retorna_false(self):
-        for vazio in ("", [], [""]):
+        for vazio in ("", [], [""], None):
             with self.subTest(to=vazio):
                 with self.assertLogs("notifications", level="WARNING"):
                     ok = send_email(vazio, "Assunto", "teste")
                 self.assertFalse(ok)
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_destinatario_com_item_nao_string_retorna_false_sem_lancar(self):
+        with self.assertLogs("notifications", level="ERROR") as logs:
+            ok = send_email(["cliente@teste.com", 123], "Assunto", "teste")
+
+        self.assertFalse(ok)
+        self.assertNotIn("cliente@teste.com", "\n".join(logs.output))
         self.assertEqual(len(mail.outbox), 0)
 
 

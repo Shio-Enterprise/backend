@@ -20,7 +20,10 @@ logger = logging.getLogger(__name__)
 
 
 def mask_email(address: str) -> str:
-    """Esconde o endereço para os logs (LGPD): `arthur@gmail.com` -> `ar***@gmail.com`."""
+    """Esconde o endereço para os logs (LGPD): `arthur@gmail.com` -> `ar***@gmail.com`.
+
+    Espera um único endereço simples (sem nome de exibição nem lista separada por vírgula).
+    """
     user, sep, domain = address.partition("@")
     if not sep:
         return "***"
@@ -35,13 +38,20 @@ def send_email(
     context: dict | None = None,
 ) -> bool:
     """Envia e-mail em texto + HTML. Nunca lança exceção: falhas viram log e `False`."""
-    recipients = [r for r in ([to] if isinstance(to, str) else to) if r]
-    if not recipients:
-        logger.warning("E-mail '%s' sem destinatário; nada foi enviado.", template)
-        return False
-
-    masked = ", ".join(mask_email(r) for r in recipients)
+    masked = "***"
     try:
+        if to is None:
+            raw = []
+        elif isinstance(to, str):
+            raw = [to]
+        else:
+            raw = list(to)
+        recipients = [r for r in raw if r]
+        if not recipients:
+            logger.warning("E-mail '%s' sem destinatário; nada foi enviado.", template)
+            return False
+
+        masked = ", ".join(mask_email(r) for r in recipients)
         full_context = {
             "subject": subject,
             "year": date.today().year,

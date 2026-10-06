@@ -221,7 +221,7 @@ CORREIOS_REMETENTE_UF = config("CORREIOS_REMETENTE_UF", default="")
 
 # E-mail — Resend via django-anymail (API HTTPS; Railway Hobby bloqueia SMTP).
 # Sem RESEND_API_KEY, os e-mails vão para o console/log e nada é enviado.
-RESEND_API_KEY = config("RESEND_API_KEY", default="")
+RESEND_API_KEY = config("RESEND_API_KEY", default="").strip()
 EMAIL_BACKEND = select_email_backend(RESEND_API_KEY)
 ANYMAIL = {"RESEND_API_KEY": RESEND_API_KEY}
 DEFAULT_FROM_EMAIL = config(
