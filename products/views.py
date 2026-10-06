@@ -17,7 +17,7 @@ from rest_framework import status
 from rest_framework.exceptions import ValidationError
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -42,6 +42,7 @@ from .models import (
     Product,
     ProductImage,
     ProductVariation,
+    Wishlist,
 )
 from .serializers import (
     CatalogFilterOptionsSerializer,
@@ -57,9 +58,128 @@ from .serializers import (
     ProductVariationSerializer,
     ProductWriteSerializer,
     StockMovementSerializer,
+    WishlistCreateSerializer,
+    WishlistIdsSerializer,
+    WishlistPageSerializer,
+    WishlistSerializer,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def wishlist_products_queryset():
+    return visible_products_queryset(
+        Product.objects.select_related("category", "drop").prefetch_related(
+            "variations", "images"
+        )
+    )
+
+
+class WishlistListCreateView(APIView):
+    permission_classes = [IsAuthenticated]
+    pagination_class = CatalogPagination
+
+    @extend_schema(
+        tags=["Wishlist"],
+        summary="Listar favoritos",
+        parameters=[
+            OpenApiParameter(
+                "page", OpenApiTypes.INT, description="Página, a partir de 1."
+            ),
+            OpenApiParameter(
+                "page_size",
+                OpenApiTypes.INT,
+                description="Itens por página: padrão 20, máximo 50.",
+            ),
+        ],
+        responses={
+            200: WishlistPageSerializer,
+            404: OpenApiResponse(description="Página inexistente."),
+            401: OpenApiResponse(description="Não autenticado."),
+        },
+    )
+    def get(self, request):
+        queryset = (
+            Wishlist.objects.filter(
+                user=request.user, product__in=wishlist_products_queryset()
+            )
+            .select_related("product", "product__category", "product__drop")
+            .prefetch_related("product__variations", "product__images")
+            .order_by("-created_at", "id")
+        )
+        paginator = self.pagination_class()
+        page = paginator.paginate_queryset(queryset, request, view=self)
+        serializer = WishlistSerializer(page, many=True, context={"request": request})
+        return paginator.get_paginated_response(serializer.data)
+
+    @extend_schema(
+        tags=["Wishlist"],
+        summary="Adicionar produto aos favoritos",
+        request=WishlistCreateSerializer,
+        responses={
+            200: WishlistSerializer,
+            201: WishlistSerializer,
+            400: OpenApiResponse(description="Produto inválido."),
+            401: OpenApiResponse(description="Não autenticado."),
+            404: OpenApiResponse(description="Produto não visível."),
+        },
+    )
+    def post(self, request):
+        input_serializer = WishlistCreateSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+        product = get_object_or_404(
+            wishlist_products_queryset(), pk=input_serializer.validated_data["product"]
+        )
+        entry, created = Wishlist.objects.get_or_create(
+            user=request.user, product=product
+        )
+        entry = (
+            Wishlist.objects.select_related(
+                "product", "product__category", "product__drop"
+            )
+            .prefetch_related("product__variations", "product__images")
+            .get(pk=entry.pk)
+        )
+        return Response(
+            WishlistSerializer(entry, context={"request": request}).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+class WishlistIdsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["Wishlist"],
+        summary="Listar IDs dos produtos favoritos",
+        responses={
+            200: WishlistIdsSerializer,
+            401: OpenApiResponse(description="Não autenticado."),
+        },
+    )
+    def get(self, request):
+        product_ids = Wishlist.objects.filter(
+            user=request.user, product__in=wishlist_products_queryset()
+        ).values_list("product_id", flat=True)
+        return Response(
+            {"product_ids": [str(product_id) for product_id in product_ids]}
+        )
+
+
+class WishlistDeleteView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["Wishlist"],
+        summary="Remover produto dos favoritos",
+        responses={
+            204: OpenApiResponse(description="Favorito removido."),
+            401: OpenApiResponse(description="Não autenticado."),
+        },
+    )
+    def delete(self, request, product_id):
+        Wishlist.objects.filter(user=request.user, product_id=product_id).delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 def inventory_summary(request):

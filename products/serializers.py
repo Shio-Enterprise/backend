@@ -14,6 +14,7 @@ from .models import (
     ProductImage,
     ProductVariation,
     StockMovement,
+    Wishlist,
 )
 from .services import create_variation, move_stock, normalize_color, normalize_variation
 
@@ -452,6 +453,30 @@ class ProductListSerializer(ProductPricingSerializer):
 
     def get_is_sellable(self, obj) -> bool:
         return is_product_sellable(obj)
+
+
+class WishlistSerializer(serializers.ModelSerializer):
+    product = ProductListSerializer(read_only=True)
+
+    class Meta:
+        model = Wishlist
+        fields = ["id", "product", "created_at"]
+        read_only_fields = fields
+
+
+class WishlistCreateSerializer(serializers.Serializer):
+    product = serializers.UUIDField()
+
+
+class WishlistPageSerializer(serializers.Serializer):
+    count = serializers.IntegerField()
+    next = serializers.URLField(allow_null=True)
+    previous = serializers.URLField(allow_null=True)
+    results = WishlistSerializer(many=True)
+
+
+class WishlistIdsSerializer(serializers.Serializer):
+    product_ids = serializers.ListField(child=serializers.UUIDField())
 
 
 class ProductDetailSerializer(ProductPricingSerializer):
