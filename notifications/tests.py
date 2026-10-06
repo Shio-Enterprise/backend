@@ -1,8 +1,11 @@
+from contextlib import redirect_stdout
 from datetime import date
+from io import StringIO
 
 from django.conf import settings
 from django.core import mail
 from django.core.mail.backends.base import BaseEmailBackend
+from django.core.management import CommandError, call_command
 from django.test import SimpleTestCase, override_settings
 
 from notifications.backends import (
@@ -158,3 +161,32 @@ class SendEmailTests(SimpleTestCase):
                     ok = send_email(vazio, "Assunto", "teste")
                 self.assertFalse(ok)
         self.assertEqual(len(mail.outbox), 0)
+
+
+class EnviarEmailTesteCommandTests(SimpleTestCase):
+    def test_envia_e_informa_sucesso(self):
+        out = StringIO()
+
+        call_command("enviar_email_teste", "dev@teste.com", stdout=out)
+
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, ["dev@teste.com"])
+        self.assertEqual(mail.outbox[0].subject, "Teste de envio — Shio")
+        self.assertIn("E-mail de teste enviado para dev@teste.com.", out.getvalue())
+        self.assertNotIn("não enviado", out.getvalue())
+
+    @override_settings(EMAIL_BACKEND=FAILING_BACKEND)
+    def test_falha_gera_command_error(self):
+        with self.assertLogs("notifications", level="ERROR"):
+            with self.assertRaises(CommandError):
+                call_command("enviar_email_teste", "dev@teste.com", stdout=StringIO())
+
+    @override_settings(EMAIL_BACKEND=CONSOLE_BACKEND)
+    def test_avisa_quando_backend_e_console(self):
+        out = StringIO()
+
+        # O backend de console imprime o e-mail inteiro no stdout; descartar.
+        with redirect_stdout(StringIO()):
+            call_command("enviar_email_teste", "dev@teste.com", stdout=out)
+
+        self.assertIn("não enviado", out.getvalue())
