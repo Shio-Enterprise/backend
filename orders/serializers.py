@@ -3,7 +3,7 @@ from rest_framework import serializers
 
 from products.models import ProductVariation
 
-from .models import CustomerOrder, OrderItem, OrderStatusLog, Payment
+from .models import CustomerOrder, OrderItem, OrderStatus, OrderStatusLog, Payment
 
 User = get_user_model()
 
@@ -45,16 +45,46 @@ class DashboardLowStockSerializer(serializers.ModelSerializer):
 
 
 class SimpleOrderItemSerializer(serializers.ModelSerializer):
+    product_id = serializers.UUIDField(
+        source="variation.product_id", read_only=True, allow_null=True
+    )
+    can_review = serializers.SerializerMethodField()
+    review_id = serializers.SerializerMethodField()
+
     class Meta:
         model = OrderItem
         fields = [
             "id",
+            "product_id",
             "product_name",
             "sku_snapshot",
             "quantity",
             "unit_price",
             "updated_at",
+            "can_review",
+            "review_id",
         ]
+
+    def get_can_review(self, obj) -> bool:
+        return (
+            obj.order.status == OrderStatus.DELIVERED
+            and obj.variation_id is not None
+            and obj.variation.product.is_active
+        )
+
+    def get_review_id(self, obj) -> str | None:
+        from reviews.models import ProductReview
+
+        if obj.variation_id is None:
+            return None
+        review_id = (
+            ProductReview.objects.filter(
+                user_id=obj.order.user_id, product_id=obj.variation.product_id
+            )
+            .values_list("id", flat=True)
+            .first()
+        )
+        return str(review_id) if review_id else None
 
 
 class PaymentSerializer(serializers.ModelSerializer):

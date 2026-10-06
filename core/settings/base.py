@@ -40,6 +40,7 @@ INSTALLED_APPS = [
     "authentication",
     "products",
     "orders",
+    "reviews",
     "rest_framework",
     "rest_framework_simplejwt",
     "rest_framework_simplejwt.token_blacklist",
@@ -72,6 +73,7 @@ REST_FRAMEWORK = {
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 20,
+    "DEFAULT_THROTTLE_RATES": {"review_create": "20/hour"},
 }
 
 ROOT_URLCONF = "core.urls"
@@ -330,6 +332,7 @@ SPECTACULAR_SETTINGS = {
     "ENUM_NAME_OVERRIDES": {
         # 'NomeBonitoNoSwagger': 'caminho.do.seu.app.models.NomeDaClasseDeChoices'
         "OrderStatusEnum": "orders.models.OrderStatus",
+        "ReviewStatusEnum": "reviews.models.ReviewStatus",
         # Se tiver outro enum de status dando conflito, adicione aqui embaixo
     },
 }
