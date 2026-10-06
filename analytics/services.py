@@ -1,6 +1,6 @@
 from datetime import timedelta
 
-from django.db.models import Count
+from django.db.models import Count, Q
 from django.db.models.functions import TruncDay, TruncMonth
 from django.utils import timezone
 
@@ -8,6 +8,16 @@ from .models import SiteEvent, SiteEventType
 from .periods import BUSINESS_TIMEZONE, resolve_period
 
 TOP_PRODUCTS_LIMIT = 5
+
+# Eventos das telas administrativas ficam na linha do tempo do usuário, mas não entram nas métricas gerais.
+ADMIN_PATH_FILTER = Q(path="/admin") | Q(path__startswith="/admin/")
+
+
+def link_anonymous_events(user, anonymous_id):
+    """Vincula os eventos anônimos deste identificador à conta que acabou de fazer login."""
+    return SiteEvent.objects.filter(
+        anonymous_id=anonymous_id, user__isnull=True
+    ).update(user=user)
 
 
 def _buckets(start, group_by):
@@ -31,7 +41,9 @@ def _buckets(start, group_by):
 
 def build_overview(period_name):
     start, end, group_by = resolve_period(period_name)
-    events = SiteEvent.objects.filter(occurred_at__gte=start, occurred_at__lte=end)
+    events = SiteEvent.objects.filter(
+        occurred_at__gte=start, occurred_at__lte=end
+    ).exclude(ADMIN_PATH_FILTER)
 
     totals = {
         row["event_type"]: row["total"]

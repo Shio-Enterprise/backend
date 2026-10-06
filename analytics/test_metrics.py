@@ -144,6 +144,24 @@ class SiteEventMetricsTests(APITestCase):
         self.assertEqual(len(results), 2)
         self.assertGreater(results[0]["occurred_at"], results[1]["occurred_at"])
 
+    def test_timeline_informa_nome_do_produto_quando_houver(self):
+        self._event(
+            days_ago=1,
+            event_type=SiteEventType.PRODUCT_VIEW,
+            product=self.product,
+            user=self.cliente,
+        )
+        self._event(days_ago=1, event_type=SiteEventType.PAGE_VIEW, user=self.cliente)
+        self.client.force_authenticate(user=self.admin)
+
+        results = self.client.get(
+            f"/api/analytics/users/{self.cliente.pk}/events/"
+        ).json()["results"]
+
+        por_tipo = {item["event_type"]: item for item in results}
+        self.assertEqual(por_tipo["PRODUCT_VIEW"]["product_name"], "Boné")
+        self.assertIsNone(por_tipo["PAGE_VIEW"]["product_name"])
+
     def test_timeline_exige_administrador(self):
         self.client.force_authenticate(user=self.cliente)
 
