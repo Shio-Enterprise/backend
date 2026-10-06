@@ -33,10 +33,11 @@ ORDER_METRICS = {
     *ITEM_METRICS,
 }
 DETAIL_FILTERS = ("period", "start_date", "end_date", "drop", "category")
+DRILLDOWN_FILTERS = (*DETAIL_FILTERS, "customer", "search")
 
 
 def _detail_params(params):
-    return {name: params[name] for name in DETAIL_FILTERS if params.get(name)}
+    return {name: params[name] for name in DRILLDOWN_FILTERS if params.get(name)}
 
 
 def _required_uuid(params, name):

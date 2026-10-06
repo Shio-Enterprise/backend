@@ -136,6 +136,7 @@ class DashboardApiTests(TestCase):
 
         for params in (
             {"metric": "desconhecida"},
+            {"metric": "valid_sales", "customer": "invalido"},
             {"metric": "status"},
             {"metric": "status", "status": "INEXISTENTE"},
             {"metric": "payment_method"},
@@ -147,6 +148,30 @@ class DashboardApiTests(TestCase):
             with self.subTest(params=params):
                 response = self.client.get(self.orders_url, params)
                 self.assertEqual(response.status_code, 400)
+
+    def test_seletores_preservam_busca_e_cliente_do_resumo(self):
+        selected = self.create_order(total="25.00")
+        other = self.create_order(total="40.00")
+        other.user = User.objects.create_user(
+            email="other-api-detail@example.com", name="Outra Pessoa"
+        )
+        other.save(update_fields=["user", "updated_at"])
+
+        for extra in (
+            {"search": "Cliente"},
+            {"customer": str(self.customer.id)},
+        ):
+            with self.subTest(extra=extra):
+                params = {**self.today_params(), **extra}
+                summary = self.client.get(
+                    "/api/orders/dashboard/summary/", params
+                ).json()
+                detail = self.client.get(
+                    self.orders_url, {**params, "metric": "valid_sales"}
+                ).json()
+                self.assertEqual(summary["sales_summary"]["total_orders"], 1)
+                self.assertEqual(detail["count"], 1)
+                self.assertEqual(detail["results"][0]["id"], str(selected.id))
 
     def test_drill_down_corresponde_aos_agregados(self):
         drop_a = DropCampaign.objects.create(name="Drop A", slug="detail-api-a")

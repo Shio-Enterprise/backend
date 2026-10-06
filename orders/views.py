@@ -96,7 +96,7 @@ METRIC_PARAMETERS = [
     ),
     OpenApiParameter("drop", OpenApiTypes.UUID, description="ID do drop"),
     OpenApiParameter("category", OpenApiTypes.UUID, description="ID da categoria"),
-    OpenApiParameter("customer", OpenApiTypes.UUID, description="ID do cliente"),
+    OpenApiParameter("customer", OpenApiTypes.INT, description="ID inteiro do cliente"),
     OpenApiParameter(
         "search",
         OpenApiTypes.STR,
@@ -403,6 +403,8 @@ class DashboardDrillDownView(APIView):
             "selecionados por pedido; total_amount é o valor completo do pedido. "
             "Drop e categoria juntos devem ocorrer no mesmo item. Métricas "
             "comerciais usam payment.paid_at; status usa order.created_at. "
+            "customer e search também restringem os seletores, para preservar "
+            "os filtros do dashboard resumido. "
             "Cadastros e estoque têm destinos próprios e não usam esta lista. "
             "Ordenação estável por data decrescente e ID; 20 pedidos por página."
         ),

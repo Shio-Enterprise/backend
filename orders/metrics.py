@@ -87,11 +87,18 @@ def dimension_filters(params):
         value = params.get(name)
         if not value:
             continue
-        if name in {"drop", "category", "customer"}:
+        if name in {"drop", "category"}:
             try:
                 UUID(str(value))
             except ValueError as exc:
                 raise ValidationError(f"{name} deve ser um UUID válido.") from exc
+        elif name == "customer":
+            try:
+                value = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValidationError("customer deve ser um ID inteiro válido.") from exc
+            if value < 1:
+                raise ValidationError("customer deve ser um ID inteiro válido.")
         filters[lookup] = value
     return filters
 
