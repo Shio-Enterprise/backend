@@ -15,6 +15,8 @@ from pathlib import Path
 
 from decouple import config
 
+from notifications.backends import select_email_backend
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -41,10 +43,12 @@ INSTALLED_APPS = [
     "products",
     "orders",
     "reviews",
+    "notifications",
     "rest_framework",
     "rest_framework_simplejwt",
     "rest_framework_simplejwt.token_blacklist",
     "corsheaders",
+    "anymail",
     "drf_spectacular",
     "whitenoise.runserver_nostatic",
 ]
@@ -217,6 +221,15 @@ CORREIOS_REMETENTE_BAIRRO = config("CORREIOS_REMETENTE_BAIRRO", default="")
 CORREIOS_REMETENTE_CIDADE = config("CORREIOS_REMETENTE_CIDADE", default="")
 CORREIOS_REMETENTE_UF = config("CORREIOS_REMETENTE_UF", default="")
 
+# E-mail — Resend via django-anymail (API HTTPS; Railway Hobby bloqueia SMTP).
+# Sem RESEND_API_KEY, os e-mails vão para o console/log e nada é enviado.
+RESEND_API_KEY = config("RESEND_API_KEY", default="").strip()
+EMAIL_BACKEND = select_email_backend(RESEND_API_KEY)
+ANYMAIL = {"RESEND_API_KEY": RESEND_API_KEY}
+DEFAULT_FROM_EMAIL = config(
+    "DEFAULT_FROM_EMAIL", default="Shio <nao-responda@localhost>"
+)
+
 CORS_ALLOW_CREDENTIALS = True
 
 CORS_ALLOW_HEADERS = [
@@ -248,6 +261,11 @@ LOGGING = {
     },
     "loggers": {
         "authentication": {
+            "handlers": ["console"],
+            "level": "INFO",
+            "propagate": True,
+        },
+        "notifications": {
             "handlers": ["console"],
             "level": "INFO",
             "propagate": True,

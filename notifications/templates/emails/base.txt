@@ -1,0 +1,9 @@
+{% autoescape off %}SHIO
+========================================
+
+{% block content %}{% endblock %}
+
+----------------------------------------
+Este é um e-mail automático, por favor não responda.
+© {{ year }} Shio
+{% endautoescape %}

@@ -80,6 +80,7 @@ O container já executa as migrações e cria o administrador automaticamente.
 - `DJANGO_SECRET_KEY`: chave secreta do Django.
 - `GOOGLE_CLIENT_ID`: client ID do OAuth do Google usado para validar `id_token`.
 - `ADMIN_NAME`, `ADMIN_PASS`, `ADMIN_EMAIL`: credenciais para o superusuário inicial.
+- `RESEND_API_KEY`, `DEFAULT_FROM_EMAIL`: envio de e-mails (veja [E-mails](#e-mails)).
 
 ## Integração com os Correios
 
@@ -122,6 +123,54 @@ As variáveis de ambiente são definidas no painel do Railway, em **Variables**
   ```
 
   Após salvar, o Railway faz o redeploy automaticamente.
+
+## E-mails
+
+O backend envia e-mails pelo [Resend](https://resend.com) usando a API HTTPS
+(via `django-anymail`). Não usamos SMTP porque o Railway bloqueia SMTP de saída
+nos planos Free/Trial/Hobby.
+
+### Desenvolvimento e testes
+
+- Sem `RESEND_API_KEY`, nenhum e-mail é enviado: o conteúdo aparece no console
+  (logs do `docker compose`).
+- Os testes usam o backend em memória do Django; nada sai da máquina.
+
+### Configuração em produção (Railway)
+
+1. Crie uma conta no Resend e adicione o domínio da loja em **Domains**.
+2. Cadastre no DNS do domínio os registros SPF e DKIM indicados pelo Resend e
+   aguarde a verificação.
+3. Gere uma API key com permissão **Sending access**, restrita ao domínio.
+4. No Railway, em **Variables**, defina:
+   - `RESEND_API_KEY`: a chave gerada.
+   - `DEFAULT_FROM_EMAIL`: remetente, ex.: `Shio <nao-responda@seudominio.com.br>`
+     (precisa ser do domínio verificado).
+5. Após o deploy, valide o envio:
+
+```bash
+python manage.py enviar_email_teste seu-email@exemplo.com
+```
+
+Se a chave não estiver definida em produção, o log do boot mostra
+`RESEND_API_KEY ausente: e-mails não serão enviados, apenas exibidos no log.`
+
+### Enviando e-mail em uma nova funcionalidade
+
+Use sempre `send_email`; ele nunca lança exceção (falhas vão para o log e a
+função retorna `False`), então não interrompe a ação do usuário.
+
+```python
+from notifications.email import send_email
+
+send_email(
+    user.email, "Seu pedido foi confirmado", "pedido_confirmado", {"pedido": order}
+)
+```
+
+Crie o par de templates em `notifications/templates/emails/`
+(`pedido_confirmado.html` e `pedido_confirmado.txt`), estendendo
+`emails/base.html` e `emails/base.txt` e preenchendo `{% block content %}`.
 
 ## Google Auth
 
