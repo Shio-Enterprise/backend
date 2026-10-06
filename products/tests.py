@@ -2166,11 +2166,12 @@ class ProductVisibilityViaDropTests(APITestCase):
             name="DropOcultoPV", slug="dropoculto-pv", is_public=False, is_active=True
         )
 
-        self.product_no_drop = make_product(name="SemDropPV")
-        self.product_visible_drop = make_product(
+        # A listagem pública exige estoque; sem ele o teste não exercita o drop.
+        self.product_no_drop = make_stocked_product(name="SemDropPV")
+        self.product_visible_drop = make_stocked_product(
             name="ComDropVisivelPV", drop=self.visible_drop
         )
-        self.product_hidden_drop = make_product(
+        self.product_hidden_drop = make_stocked_product(
             name="ComDropOcultoPV", drop=self.hidden_drop
         )
 
@@ -2215,7 +2216,7 @@ class ProductVisibilityViaDropTests(APITestCase):
             is_public=True,
             is_active=False,
         )
-        product = make_product(name="ComDropRascunhoPV", drop=draft_drop)
+        product = make_stocked_product(name="ComDropRascunhoPV", drop=draft_drop)
 
         list_response = self.client.get(self.products_url)
         names = [p["name"] for p in list_response.json()["results"]]

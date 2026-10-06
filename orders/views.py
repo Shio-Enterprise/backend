@@ -576,6 +576,7 @@ class CheckoutAPIView(APIView):
                 request.user, **serializer.validated_data
             )
         except Exception:
+            logger.exception("Falha ao preparar a tentativa de checkout.")
             return Response(
                 {
                     "success": False,
