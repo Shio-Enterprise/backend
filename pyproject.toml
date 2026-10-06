@@ -10,7 +10,7 @@ ignore = ["E501"]
 "core/settings/*.py" = ["F403", "F405"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["authentication", "core", "products", "orders"]
+known-first-party = ["authentication", "core", "products", "orders", "notifications"]
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "core.settings.test"
