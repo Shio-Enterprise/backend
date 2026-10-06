@@ -15,6 +15,7 @@ class OrderStatus(models.TextChoices):
 
 
 class PaymentMethod(models.TextChoices):
+    UNKNOWN = "UNKNOWN", "Not confirmed"
     PIX = "PIX", "Pix"
     CREDIT_CARD = "CREDIT_CARD", "Credit Card"
     BOLETO = "BOLETO", "Boleto"
@@ -205,7 +206,9 @@ class Payment(models.Model):
     order = models.OneToOneField(
         CustomerOrder, on_delete=models.CASCADE, related_name="payment"
     )
-    method = models.CharField(max_length=50, choices=PaymentMethod.choices)
+    method = models.CharField(
+        max_length=50, choices=PaymentMethod.choices, default=PaymentMethod.UNKNOWN
+    )
     status = models.CharField(
         max_length=50, choices=PaymentStatus.choices, default=PaymentStatus.PENDING
     )
@@ -217,6 +220,7 @@ class Payment(models.Model):
     gateway_transaction_id = models.CharField(
         max_length=255, unique=True, null=True, blank=True
     )
+    gateway_invoice_slug = models.CharField(max_length=255, blank=True)
     qrcode_pix = models.TextField(null=True, blank=True)
     paid_at = models.DateTimeField(null=True, blank=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)

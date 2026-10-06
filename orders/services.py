@@ -7,8 +7,9 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ImproperlyConfigured, ObjectDoesNotExist
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db import models, transaction
+from django.db import IntegrityError, models, transaction
 from django.shortcuts import get_object_or_404
+from django.urls import reverse
 from django.utils import timezone
 from rest_framework.exceptions import APIException, ValidationError
 
@@ -27,6 +28,7 @@ from orders.models import (
     OrderStatus,
     OrderStatusLog,
     Payment,
+    PaymentMethod,
     PaymentStatus,
     ShippingQuote,
 )
@@ -393,7 +395,7 @@ def checkout_from_shipping_quote(user, quote_id, address_id):
 def create_infinitepay_checkout(order, request):
     payment, _ = Payment.objects.get_or_create(
         order=order,
-        defaults={"method": "CREDIT_CARD", "total_amount": order.total_amount},
+        defaults={"total_amount": order.total_amount},
     )
 
     items_data = []
@@ -427,7 +429,10 @@ def create_infinitepay_checkout(order, request):
             }
         )
 
-    redirect_url = request.build_absolute_uri("/api/orders/pagamento-sucesso/")
+    redirect_url = request.build_absolute_uri(reverse("orders:payment-success"))
+    webhook_url = settings.INFINITEPAY_WEBHOOK_URL or request.build_absolute_uri(
+        reverse("orders:infinitepay-webhook")
+    )
 
     phone_number = ""
     try:
@@ -439,6 +444,7 @@ def create_infinitepay_checkout(order, request):
     payload = {
         "handle": settings.INFINITEPAY_HANDLE,
         "redirect_url": redirect_url,
+        "webhook_url": webhook_url,
         "order_nsu": str(order.id),
         "items": items_data,
         "customer": {
@@ -630,9 +636,7 @@ def prepare_checkout_attempt(user, address_id, shipping_quote_id, idempotency_ke
             )
         cart.status = "FINISHED"
         cart.save()
-        Payment.objects.create(
-            order=order, method="CREDIT_CARD", total_amount=order.total_amount
-        )
+        Payment.objects.create(order=order, total_amount=order.total_amount)
         attempt = CheckoutAttempt.objects.create(
             user=user,
             idempotency_key=idempotency_key,
@@ -680,11 +684,126 @@ def check_payment_status(order_nsu, transaction_nsu, slug):
         json=payload,
         headers=headers,
         timeout=10,
+        allow_redirects=False,
     )
 
-    if response.status_code == 200:
-        return response.json()
-    return None
+    if response.status_code != 200:
+        raise ValueError("Consulta de pagamento indisponível.")
+    data = response.json()
+    if not isinstance(data, dict):
+        raise ValueError("Resposta de pagamento inválida.")
+    return data
+
+
+def confirm_infinitepay_payment(order_nsu, transaction_nsu, invoice_slug):
+    """Confirma um pagamento apenas após consultar a InfinitePay.
+
+    Os identificadores recebidos no webhook servem somente para localizar a
+    transação no gateway. Valores e método sempre vêm da resposta verificada.
+    """
+    order = CustomerOrder.objects.filter(pk=order_nsu).first()
+    if order is None or not Payment.objects.filter(order=order).exists():
+        raise ValidationError("Pedido ou pagamento não encontrado.")
+
+    try:
+        data = check_payment_status(str(order.id), transaction_nsu, invoice_slug)
+    except (requests.RequestException, ValueError) as exc:
+        raise ValidationError(
+            "Não foi possível verificar o pagamento. Reenvie a notificação."
+        ) from exc
+
+    methods = {
+        "pix": PaymentMethod.PIX,
+        "credit_card": PaymentMethod.CREDIT_CARD,
+    }
+    capture_method = data.get("capture_method")
+    method = methods.get(capture_method) if isinstance(capture_method, str) else None
+    amount = data.get("amount")
+    paid_amount = data.get("paid_amount")
+    installments = data.get("installments")
+
+    if (
+        data.get("success") is not True
+        or data.get("paid") is not True
+        or type(amount) is not int
+        or type(paid_amount) is not int
+        or amount != money_to_cents(order.total_amount)
+        or paid_amount < amount
+        or type(installments) is not int
+        or not 1 <= installments <= 2147483647
+        or method is None
+        or (method == PaymentMethod.PIX and installments != 1)
+    ):
+        raise ValidationError("Dados do pagamento incompatíveis com o pedido.")
+
+    for field, expected in (
+        ("order_nsu", str(order.id)),
+        ("transaction_nsu", transaction_nsu),
+        ("invoice_slug", invoice_slug),
+        ("slug", invoice_slug),
+        ("handle", settings.INFINITEPAY_HANDLE),
+    ):
+        if field in data and data[field] != expected:
+            raise ValidationError("Identificação do pagamento incompatível.")
+
+    try:
+        with transaction.atomic():
+            try:
+                order = CustomerOrder.objects.select_for_update().get(pk=order.pk)
+                payment = Payment.objects.select_for_update().get(order=order)
+            except (CustomerOrder.DoesNotExist, Payment.DoesNotExist) as exc:
+                raise ValidationError("Pedido ou pagamento não encontrado.") from exc
+
+            if (
+                money_to_cents(order.total_amount) != amount
+                or payment.total_amount != order.total_amount
+            ):
+                raise ValidationError("Valor do pagamento incompatível com o pedido.")
+            if (
+                payment.gateway_transaction_id
+                and payment.gateway_transaction_id != transaction_nsu
+            ):
+                raise ValidationError("Pedido já associado a outra transação.")
+            if (
+                payment.gateway_invoice_slug
+                and payment.gateway_invoice_slug != invoice_slug
+            ):
+                raise ValidationError("Pedido já associado a outra fatura.")
+
+            if payment.status in (PaymentStatus.PAID, PaymentStatus.REFUNDED):
+                if payment.gateway_transaction_id != transaction_nsu:
+                    raise ValidationError(
+                        "Pagamento sem vínculo verificável com a transação."
+                    )
+                return payment
+
+            payment.method = method
+            payment.status = PaymentStatus.PAID
+            payment.gateway_transaction_id = transaction_nsu
+            payment.gateway_invoice_slug = invoice_slug
+            payment.installments = installments
+            payment.installment_value = None
+            payment.save(
+                update_fields=[
+                    "method",
+                    "status",
+                    "gateway_transaction_id",
+                    "gateway_invoice_slug",
+                    "installments",
+                    "installment_value",
+                    "updated_at",
+                ]
+            )
+
+            if order.status == OrderStatus.AWAITING_PAYMENT:
+                update_status(
+                    order,
+                    OrderStatus.PAID,
+                    comment="Pagamento verificado na InfinitePay.",
+                )
+            return payment
+    except IntegrityError as exc:
+        raise ValidationError("Transação já vinculada a outro pedido.") from exc
 
 
 def get_or_create_user_cart(user):
