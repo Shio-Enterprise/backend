@@ -88,6 +88,11 @@ class Product(models.Model):
     promo_start = models.DateTimeField(null=True, blank=True)
     promo_end = models.DateTimeField(null=True, blank=True)
     is_active = models.BooleanField(default=True)
+    # Escritos apenas por reviews.services.recompute_product_rating.
+    rating_avg = models.DecimalField(
+        max_digits=3, decimal_places=2, default=Decimal("0.00")
+    )
+    rating_count = models.PositiveIntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

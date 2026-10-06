@@ -13,6 +13,7 @@ urlpatterns = [
     path("api/auth/", include("authentication.urls", namespace="authentication")),
     path("api/catalog/", include("products.urls", namespace="products")),
     path("api/orders/", include("orders.urls", namespace="orders")),
+    path("api/reviews/", include("reviews.urls", namespace="reviews")),
 ]
 
 urlpatterns += [

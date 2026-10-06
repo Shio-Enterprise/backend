@@ -139,6 +139,8 @@ def filter_catalog(queryset, params, *, require_stock=False):
     if ordering == "-sales_count":
         queryset = with_sales_count(queryset)
 
+    if ordering == "-rating_avg":
+        return queryset.order_by("-rating_avg", "-rating_count", "-created_at", "id")
     if ordering == "-created_at":
         return queryset.order_by("-created_at", "id")
     return queryset.order_by(ordering, "-created_at", "id")
