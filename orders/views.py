@@ -37,6 +37,7 @@ from .metrics import (
     positive_sales,
     refunds,
     resolve_period,
+    sale_items,
 )
 from .models import (
     CustomerOrder,
@@ -320,25 +321,25 @@ class DashboardDropRevenueView(APIView):
     )
     def get(self, request):
         start, end, _ = resolve_period(request.query_params)
-        sales = positive_sales(metric_orders(request.query_params, start, end))
         item_total = ExpressionWrapper(
-            F("items__quantity") * F("items__unit_price"),
+            F("quantity") * F("unit_price"),
             output_field=DecimalField(max_digits=14, decimal_places=2),
         )
         rows = (
-            sales.exclude(items__variation__product__drop__isnull=True)
+            sale_items(request.query_params, start, end)
+            .exclude(variation__product__drop__isnull=True)
             .values(
-                "items__variation__product__drop_id",
-                "items__variation__product__drop__name",
+                "variation__product__drop_id",
+                "variation__product__drop__name",
             )
             .annotate(revenue=Sum(item_total))
-            .order_by("items__variation__product__drop__name")
+            .order_by("variation__product__drop__name")
         )
         return Response(
             [
                 {
-                    "drop_id": row["items__variation__product__drop_id"],
-                    "drop_name": row["items__variation__product__drop__name"],
+                    "drop_id": row["variation__product__drop_id"],
+                    "drop_name": row["variation__product__drop__name"],
                     "revenue": row["revenue"],
                 }
                 for row in rows
