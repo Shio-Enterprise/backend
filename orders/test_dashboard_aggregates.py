@@ -258,7 +258,11 @@ class DashboardAggregatesTests(TestCase):
             created_at=timezone.now() - datetime.timedelta(days=40)
         )
         drops = [
-            DropCampaign.objects.create(name=f"Drop {i}", slug=f"detail-drop-{i}")
+            DropCampaign.objects.create(
+                name=f"Drop {i}",
+                slug=f"detail-drop-{i}",
+                launch_date=timezone.now() + datetime.timedelta(days=i),
+            )
             for i in range(3)
         ]
         category = Category.objects.create(name="Estoque", slug="detail-stock")

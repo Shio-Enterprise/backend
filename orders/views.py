@@ -10,6 +10,7 @@ from django.http import Http404
 from django.utils.decorators import method_decorator
 from drf_spectacular.utils import (
     OpenApiParameter,
+    OpenApiResponse,
     OpenApiTypes,
     extend_schema,
     inline_serializer,
@@ -30,6 +31,8 @@ from .correios import (
     dispatch_order_and_get_tracking_code,
     get_order_tracking_data,
 )
+from .dashboard_aggregates import dashboard_detail_aggregates
+from .dashboard_drilldown import DETAIL_FILTERS, ORDER_METRICS, dashboard_order_queryset
 from .metrics import (
     METRICS_TIMEZONE,
     is_recurring_customer,
@@ -42,6 +45,7 @@ from .metrics import (
 from .models import (
     CustomerOrder,
     OrderStatus,
+    PaymentMethod,
     PaymentStatus,
 )
 from .serializers import (
@@ -51,7 +55,10 @@ from .serializers import (
     CheckoutCalculationInputSerializer,
     CheckoutCalculationSerializer,
     CheckoutInputSerializer,
+    DashboardDetailSerializer,
     DashboardLowStockSerializer,
+    DashboardOrderDrillDownSerializer,
+    DashboardOrderPageSerializer,
     DashboardRecentOrderSerializer,
     OrderDetailSerializer,
     OrderStatusUpdateSerializer,
@@ -96,6 +103,113 @@ METRIC_PARAMETERS = [
         description="Busca única por cliente/e-mail, produto, drop ou categoria",
     ),
 ]
+
+DETAIL_PARAMETERS = [
+    OpenApiParameter(
+        "period",
+        OpenApiTypes.STR,
+        enum=["monthly", "annual"],
+        description="monthly = 30 dias móveis (padrão); annual = 365 dias móveis.",
+    ),
+    OpenApiParameter(
+        "start_date",
+        OpenApiTypes.DATE,
+        description="Início inclusivo no fuso America/Sao_Paulo.",
+    ),
+    OpenApiParameter(
+        "end_date",
+        OpenApiTypes.DATE,
+        description="Fim inclusivo no fuso America/Sao_Paulo.",
+    ),
+    OpenApiParameter(
+        "drop",
+        OpenApiTypes.UUID,
+        description="ID do drop atual. Com categoria, exige o mesmo item.",
+    ),
+    OpenApiParameter(
+        "category",
+        OpenApiTypes.UUID,
+        description="ID da categoria atual. Com drop, exige o mesmo item.",
+    ),
+]
+
+DRILLDOWN_PARAMETERS = METRIC_PARAMETERS + [
+    OpenApiParameter(
+        "metric",
+        OpenApiTypes.STR,
+        enum=sorted(ORDER_METRICS),
+        description="População da métrica; all preserva o drill-down anterior.",
+    ),
+    OpenApiParameter(
+        "status",
+        OpenApiTypes.STR,
+        enum=OrderStatus.values,
+        description="Obrigatório para metric=status.",
+    ),
+    OpenApiParameter(
+        "payment_method",
+        OpenApiTypes.STR,
+        enum=PaymentMethod.values,
+        description="Obrigatório para metric=payment_method.",
+    ),
+    OpenApiParameter(
+        "product_id",
+        OpenApiTypes.UUID,
+        description=(
+            "Obrigatório para product_units/product_revenue, salvo unclassified=true."
+        ),
+    ),
+    OpenApiParameter(
+        "unclassified",
+        OpenApiTypes.BOOL,
+        description=(
+            "Seleciona itens sem produto, drop ou categoria atual em métricas de itens."
+        ),
+    ),
+    OpenApiParameter("page", OpenApiTypes.INT, description="Página, iniciando em 1."),
+]
+
+
+class DashboardDetailView(APIView):
+    """Agregados completos para a página administrativa de análise detalhada."""
+
+    permission_classes = [IsStaffOrSuperUser]
+
+    @extend_schema(
+        description=(
+            "Vendas válidas: pedido DELIVERED e pagamento PAID; reembolsos: "
+            "pagamento REFUNDED. Financeiro e séries usam payment.paid_at em "
+            "America/Sao_Paulo; receita líquida = total_amount das vendas válidas "
+            "menos total_amount dos reembolsos; ticket = líquido / vendas válidas "
+            "(zero sem vendas). Pedidos por status incluem todos os pedidos e usam "
+            "CustomerOrder.created_at. Drops e categorias selecionam pedidos que "
+            "tenham um mesmo item correspondente; rankings e distribuições somam "
+            "somente esses itens por quantity × unit_price, sem rateio de frete ou "
+            "desconto. Classificações históricas dependem dos vínculos atuais do "
+            "catálogo; itens sem vínculo aparecem como Sem classificação. "
+            "Cadastros usam User.created_at; total_registered é global e não recebe "
+            "filtro de catálogo. Recorrência exige compras válidas em dois drops "
+            "consecutivos no histórico filtrado. Estoque é saldo atual, independente "
+            "do período. Rankings têm até 10 produtos; attention tem até 50 "
+            "variações, enquanto as contagens abrangem todas. Valores monetários "
+            "são strings decimais em reais; contagens são unidades ou pedidos."
+        ),
+        parameters=DETAIL_PARAMETERS,
+        responses={
+            200: DashboardDetailSerializer,
+            400: OpenApiResponse(description="Período, data ou UUID inválido."),
+            401: OpenApiResponse(description="Autenticação necessária."),
+            403: OpenApiResponse(description="Acesso administrativo necessário."),
+        },
+    )
+    def get(self, request):
+        params = {
+            name: request.query_params[name]
+            for name in DETAIL_FILTERS
+            if request.query_params.get(name)
+        }
+        payload = DashboardDetailSerializer(dashboard_detail_aggregates(params)).data
+        return Response(payload)
 
 
 class AdminDashboardView(APIView):
@@ -269,29 +383,51 @@ class AdminDashboardView(APIView):
 
 
 class DashboardDrillDownView(APIView):
-    """Pedidos que compõem cards e pontos do gráfico, usando a consulta das métricas."""
+    """Pedidos paginados que compõem o agregado selecionado."""
 
     permission_classes = [IsStaffOrSuperUser]
 
     @extend_schema(
         description=(
-            "Lista paginada dos pedidos das métricas. Aceita period, start_date, "
-            "end_date e busca textual. Ordena por paid_at decrescente."
+            "all mantém a lista comercial anterior e seus filtros customer/search. "
+            "valid_sales/gross_revenue usam vendas DELIVERED + PAID; refunds "
+            "usa pagamentos REFUNDED; net_revenue/average_ticket incluem ambos "
+            "os conjuntos que compõem o numerador. status requer status e usa "
+            "CustomerOrder.created_at, incluindo pedidos sem pagamento. "
+            "payment_method requer payment_method e usa apenas vendas válidas. "
+            "product_units/product_revenue requerem product_id; "
+            "drop_item_revenue requer drop; category_item_revenue requer category. "
+            "Em métricas de itens, unclassified=true seleciona itens sem o vínculo "
+            "atual correspondente, sem combinar com o ID da mesma dimensão. "
+            "metric_units e metric_item_revenue mostram a contribuição dos itens "
+            "selecionados por pedido; total_amount é o valor completo do pedido. "
+            "Drop e categoria juntos devem ocorrer no mesmo item. Métricas "
+            "comerciais usam payment.paid_at; status usa order.created_at. "
+            "Cadastros e estoque têm destinos próprios e não usam esta lista. "
+            "Ordenação estável por data decrescente e ID; 20 pedidos por página."
         ),
-        parameters=METRIC_PARAMETERS,
-        responses={200: DashboardRecentOrderSerializer(many=True)},
+        parameters=DRILLDOWN_PARAMETERS,
+        responses={
+            200: DashboardOrderPageSerializer,
+            400: OpenApiResponse(
+                description="Métrica, seletor, data ou UUID inválido."
+            ),
+            401: OpenApiResponse(description="Autenticação necessária."),
+            403: OpenApiResponse(description="Acesso administrativo necessário."),
+            404: OpenApiResponse(description="Página inexistente."),
+        },
     )
     def get(self, request):
-        queryset = (
-            metric_orders(request.query_params)
-            .select_related("user", "payment")
-            .order_by("-payment__paid_at")
-        )
+        queryset, metric, date_basis = dashboard_order_queryset(request.query_params)
+        queryset = queryset.select_related("user", "payment")
         paginator = PageNumberPagination()
         page = paginator.paginate_queryset(queryset, request, view=self)
-        return paginator.get_paginated_response(
-            DashboardRecentOrderSerializer(page, many=True).data
+        response = paginator.get_paginated_response(
+            DashboardOrderDrillDownSerializer(page, many=True).data
         )
+        response.data["metric"] = metric
+        response.data["date_basis"] = date_basis
+        return response
 
 
 class DashboardDropRevenueView(APIView):
