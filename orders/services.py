@@ -1,5 +1,5 @@
 from datetime import timedelta
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import Decimal
 from uuid import UUID
 
 import requests
@@ -33,6 +33,7 @@ from orders.models import (
     PaymentStatus,
     ShippingQuote,
 )
+from orders.money import money_to_cents, normalize_money
 from products.availability import (
     get_drop_sold_quantity,
     is_product_open_for_sale,
@@ -58,24 +59,6 @@ ALLOWED_TRANSITIONS = {
     OrderStatus.DELIVERED: set(),
     OrderStatus.CANCELED: set(),
 }
-
-
-def normalize_money(value):
-    """Valida reais e arredonda centavos sem passar por ponto flutuante."""
-    try:
-        amount = Decimal(str(value).replace(",", "."))
-        if not amount.is_finite() or amount < 0:
-            raise ValueError("Valor monetário inválido.")
-        amount = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        if amount > Decimal("99999999.99"):
-            raise ValueError("Valor monetário acima do limite.")
-        return amount
-    except (InvalidOperation, TypeError) as exc:
-        raise ValueError("Valor monetário inválido.") from exc
-
-
-def money_to_cents(value):
-    return int(normalize_money(value) * Decimal("100"))
 
 
 class CheckoutShippingUnavailable(APIException):
