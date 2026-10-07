@@ -1,6 +1,6 @@
 """Local-only wishlist browser validation; never use for deployment."""
 
-from .test_postgres import *  # noqa: F403
+from .wishlist_postgres_settings import *  # noqa: F403
 
 DEBUG = True
 ALLOWED_HOSTS = ["localhost", "127.0.0.1"]
