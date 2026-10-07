@@ -5,7 +5,6 @@ from django.core.files.base import ContentFile
 from django.db import transaction
 from django.db.models import Exists, Max, OuterRef, Sum
 from django.db.models.deletion import ProtectedError
-from django.http import JsonResponse
 from django.shortcuts import get_object_or_404
 from drf_spectacular.utils import (
     OpenApiParameter,
@@ -14,6 +13,7 @@ from drf_spectacular.utils import (
     extend_schema,
 )
 from rest_framework import status
+from rest_framework.decorators import api_view, permission_classes
 from rest_framework.exceptions import ValidationError
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
@@ -62,6 +62,8 @@ from .serializers import (
 logger = logging.getLogger(__name__)
 
 
+@api_view(["GET"])
+@permission_classes([IsStaffOrSuperUser])
 def inventory_summary(request):
     products = Product.objects.all()
     data = []
@@ -75,7 +77,7 @@ def inventory_summary(request):
                 "total_stock": total_stock,
             }
         )
-    return JsonResponse({"inventory": data})
+    return Response({"inventory": data})
 
 
 # ─── Categories ───────────────────────────────────────────────────────────────
