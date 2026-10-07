@@ -17,6 +17,7 @@ from orders.correios import (
     fetch_shipping_deadline_by_service_and_ceps,
     fetch_shipping_price_by_service_and_ceps,
 )
+from orders.coupons import valid_order_q
 from orders.models import (
     Cart,
     CartItem,
@@ -1256,7 +1257,11 @@ def _compute_welcome_discount(user, subtotal, *, lock=False):
     if not user.is_authenticated:
         return None, Decimal("0.00")
 
-    has_previous_order = CustomerOrder.objects.filter(user=user).exists()
+    # Pedido cancelado (desistência ou reserva vencida) não é compra: o
+    # cliente continua tendo direito ao desconto de primeira compra.
+    has_previous_order = CustomerOrder.objects.filter(
+        valid_order_q(), user=user
+    ).exists()
     if has_previous_order:
         return None, Decimal("0.00")
 

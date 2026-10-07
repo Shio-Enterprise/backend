@@ -15,6 +15,7 @@ from orders.models import (
     OrderStatus,
     normalize_coupon_code,
 )
+from orders.services import get_welcome_discount, get_welcome_discount_preview
 
 User = get_user_model()
 
@@ -205,3 +206,41 @@ class CouponUsageCountTests(TestCase):
             )
 
         self.assertEqual(uses, {"VERAO20": 1, "INVERNO10": 1, "BEMVINDO10": 0})
+
+
+class WelcomeDiscountEligibilityTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(email="novo@shio.com", name="Novo")
+
+    def assert_eligible(self, expected):
+        coupon, _ = get_welcome_discount_preview(self.user, Decimal("200.00"))
+        with transaction.atomic():
+            locked_coupon, _ = get_welcome_discount(self.user, Decimal("200.00"))
+
+        self.assertEqual(coupon is not None, expected)
+        self.assertEqual(locked_coupon is not None, expected)
+
+    def test_cliente_sem_pedidos_e_elegivel(self):
+        self.assert_eligible(True)
+
+    def test_pedido_cancelado_nao_tira_o_desconto_de_primeira_compra(self):
+        coupon = Coupon.objects.get(code="BEMVINDO10")
+        create_order(self.user, coupon=coupon, order_status=OrderStatus.CANCELED)
+
+        self.assert_eligible(True)
+
+    def test_pedido_pago_tira_o_desconto_de_primeira_compra(self):
+        create_order(self.user, order_status=OrderStatus.PAID)
+
+        self.assert_eligible(False)
+
+    def test_pedido_aguardando_pagamento_tira_o_desconto_mesmo_com_reserva_vencida(
+        self,
+    ):
+        create_order(
+            self.user,
+            order_status=OrderStatus.AWAITING_PAYMENT,
+            reservation_expires_at=timezone.now() - timedelta(minutes=1),
+        )
+
+        self.assert_eligible(False)
