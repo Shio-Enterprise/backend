@@ -354,3 +354,5 @@ SPECTACULAR_SETTINGS = {
         # Se tiver outro enum de status dando conflito, adicione aqui embaixo
     },
 }
+
+FRONTEND_URL = config("FRONTEND_URL", default="http://localhost:5173")
