@@ -10,6 +10,7 @@ from .views import (
     CartItemDetailAPIView,
     CheckoutAPIView,
     CheckoutCalculationView,
+    DashboardDetailView,
     DashboardDrillDownView,
     DashboardDropRevenueView,
     InfinitePayWebhookView,
@@ -29,6 +30,7 @@ urlpatterns = [
         name="infinitepay-webhook",
     ),
     path("dashboard/summary/", AdminDashboardView.as_view(), name="dashboard_summary"),
+    path("dashboard/detail/", DashboardDetailView.as_view(), name="dashboard_detail"),
     path(
         "dashboard/orders/", DashboardDrillDownView.as_view(), name="dashboard_orders"
     ),
