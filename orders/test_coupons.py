@@ -2,12 +2,19 @@ from datetime import timedelta
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
-from django.db import IntegrityError, transaction
+from django.contrib.auth.models import AnonymousUser
+from django.db import IntegrityError, connection, transaction
 from django.db.models import Count, ProtectedError
-from django.test import TestCase
+from django.test import TestCase, skipUnlessDBFeature
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
-from orders.coupons import count_coupon_uses, valid_order_q
+from orders.coupons import (
+    COUPON_ERROR_MESSAGES,
+    count_coupon_uses,
+    resolve_coupon,
+    valid_order_q,
+)
 from orders.models import (
     Coupon,
     CouponDiscountType,
@@ -16,6 +23,7 @@ from orders.models import (
     normalize_coupon_code,
 )
 from orders.services import get_welcome_discount, get_welcome_discount_preview
+from products.models import Category, DropCampaign, Product, ProductVariation
 
 User = get_user_model()
 
@@ -244,3 +252,287 @@ class WelcomeDiscountEligibilityTests(TestCase):
         )
 
         self.assert_eligible(False)
+
+
+class ResolveCouponTestCase(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(email="compra@shio.com", name="Cliente")
+        self.verao = DropCampaign.objects.create(name="Verão", slug="verao")
+        self.camisetas = Category.objects.create(name="Camisetas", slug="camisetas")
+        self.calcas = Category.objects.create(name="Calças", slug="calcas")
+        self.camiseta_verao = self.item(
+            drop=self.verao, category=self.camisetas, total="120.00"
+        )
+        self.calca = self.item(category=self.calcas, total="200.00")
+        self.items = [self.camiseta_verao, self.calca]
+        self.subtotal = Decimal("320.00")
+        # Isola os testes de código digitado do cupom automático da seed.
+        Coupon.objects.filter(code="BEMVINDO10").update(is_active=False)
+
+    def item(self, *, total, drop=None, category=None):
+        product = Product.objects.create(
+            name=f"Produto {Product.objects.count()}",
+            description="x",
+            base_price=total,
+            drop=drop,
+            category=category,
+        )
+        variation = ProductVariation.objects.create(
+            product=product,
+            size="M",
+            sku=f"SKU-{product.pk}",
+            stock_quantity=10,
+        )
+        return {"variation": variation, "total_price": Decimal(total)}
+
+    def resolve(self, code=None, **kwargs):
+        return resolve_coupon(self.user, self.items, self.subtotal, code, **kwargs)
+
+    def assert_error(self, result, error_code):
+        self.assertEqual(result.error_code, error_code)
+        self.assertIsNone(result.coupon)
+        self.assertEqual(result.discount, Decimal("0.00"))
+        self.assertTrue(result.error_message)
+
+
+class ResolveCouponValidationTests(ResolveCouponTestCase):
+    def test_codigo_inexistente(self):
+        self.assert_error(self.resolve("NAOEXISTE"), "coupon_not_found")
+
+    def test_cupom_inativo(self):
+        create_coupon(is_active=False)
+        self.assert_error(self.resolve("VERAO20"), "coupon_inactive")
+
+    def test_cupom_que_ainda_nao_comecou(self):
+        create_coupon(starts_at=timezone.now() + timedelta(days=1))
+        self.assert_error(self.resolve("VERAO20"), "coupon_not_started")
+
+    def test_cupom_expirado(self):
+        create_coupon(expiration_date=timezone.now() - timedelta(seconds=1))
+        self.assert_error(self.resolve("VERAO20"), "coupon_expired")
+
+    def test_cupom_de_primeira_compra_para_quem_ja_comprou(self):
+        create_coupon(first_purchase_only=True)
+        create_order(self.user)
+        self.assert_error(self.resolve("VERAO20"), "coupon_first_purchase_only")
+
+    def test_valor_minimo_informa_quanto_falta(self):
+        create_coupon(min_order_value=Decimal("357.50"))
+
+        result = self.resolve("VERAO20")
+
+        self.assert_error(result, "coupon_min_value")
+        self.assertEqual(result.error_message, "Faltam R$ 37,50 para usar este cupom.")
+
+    def test_valor_minimo_e_comparado_com_o_subtotal_inteiro(self):
+        coupon = create_coupon(min_order_value=Decimal("320.00"))
+        coupon.drops.add(self.verao)
+
+        result = self.resolve("VERAO20")
+
+        self.assertIsNone(result.error_code)
+        self.assertEqual(result.discount, Decimal("24.00"))
+
+    def test_nenhum_item_no_escopo(self):
+        inverno = DropCampaign.objects.create(name="Inverno", slug="inverno")
+        coupon = create_coupon()
+        coupon.drops.add(inverno)
+        self.assert_error(self.resolve("VERAO20"), "coupon_not_applicable")
+
+    def test_limite_total_atingido(self):
+        coupon = create_coupon(max_uses_total=1)
+        other = User.objects.create_user(email="outro@shio.com", name="Outro")
+        create_order(other, coupon=coupon)
+        self.assert_error(self.resolve("VERAO20"), "coupon_limit_reached")
+
+    def test_limite_por_cliente_atingido(self):
+        coupon = create_coupon(max_uses_per_user=1)
+        create_order(self.user, coupon=coupon)
+        self.assert_error(self.resolve("VERAO20"), "coupon_user_limit_reached")
+
+    def test_pedido_cancelado_nao_conta_para_os_limites(self):
+        coupon = create_coupon(max_uses_total=1, max_uses_per_user=1)
+        create_order(self.user, coupon=coupon, order_status=OrderStatus.CANCELED)
+
+        self.assertIsNone(self.resolve("VERAO20").error_code)
+
+    def test_primeira_verificacao_que_falha_define_o_erro(self):
+        create_coupon(
+            is_active=False, expiration_date=timezone.now() - timedelta(days=1)
+        )
+        self.assert_error(self.resolve("VERAO20"), "coupon_inactive")
+
+    def test_todos_os_codigos_de_erro_tem_mensagem(self):
+        self.assertEqual(len(COUPON_ERROR_MESSAGES), 9)
+
+
+class ResolveCouponDiscountTests(ResolveCouponTestCase):
+    def test_percentual_sobre_o_carrinho_inteiro(self):
+        create_coupon(discount_value=Decimal("10.00"))
+
+        result = self.resolve("VERAO20")
+
+        self.assertEqual(result.coupon.code, "VERAO20")
+        self.assertEqual(result.discount, Decimal("32.00"))
+
+    def test_percentual_respeita_o_teto(self):
+        create_coupon(max_discount_amount=Decimal("50.00"))
+        self.assertEqual(self.resolve("VERAO20").discount, Decimal("50.00"))
+
+    def test_escopo_misto_do_documento(self):
+        """Camiseta do drop Verão (R$ 120) + calça fora dele (R$ 200), 20% só no
+        drop com teto de R$ 50: desconta R$ 24."""
+        coupon = create_coupon(max_discount_amount=Decimal("50.00"))
+        coupon.drops.add(self.verao)
+        self.assertEqual(self.resolve("VERAO20").discount, Decimal("24.00"))
+
+    def test_escopo_por_categoria(self):
+        coupon = create_coupon(discount_value=Decimal("10.00"))
+        coupon.categories.add(self.calcas)
+        self.assertEqual(self.resolve("VERAO20").discount, Decimal("20.00"))
+
+    def test_escopo_por_drop_ou_categoria(self):
+        coupon = create_coupon(discount_value=Decimal("10.00"))
+        coupon.drops.add(self.verao)
+        coupon.categories.add(self.calcas)
+        self.assertEqual(self.resolve("VERAO20").discount, Decimal("32.00"))
+
+    def test_fixo_nunca_passa_da_base_elegivel(self):
+        coupon = create_coupon(
+            code="CAMISA50",
+            discount_type=CouponDiscountType.FIXED_VALUE,
+            discount_value=Decimal("150.00"),
+        )
+        coupon.categories.add(self.camisetas)
+        self.assertEqual(self.resolve("CAMISA50").discount, Decimal("120.00"))
+
+    def test_fixo_menor_que_a_base(self):
+        create_coupon(
+            discount_type=CouponDiscountType.FIXED_VALUE,
+            discount_value=Decimal("15.00"),
+        )
+        self.assertEqual(self.resolve("VERAO20").discount, Decimal("15.00"))
+
+    def test_arredonda_centavos_para_cima_na_metade(self):
+        self.items = [self.item(total="0.25")]
+        self.subtotal = Decimal("0.25")
+        create_coupon(discount_value=Decimal("10.00"))
+        # 10% de R$ 0,25 = 0,025 -> 0,03 (ROUND_HALF_UP)
+        self.assertEqual(self.resolve("VERAO20").discount, Decimal("0.03"))
+
+    def test_codigo_digitado_em_minusculas_e_com_espacos(self):
+        create_coupon()
+        self.assertEqual(self.resolve("  verao 20 ").coupon.code, "VERAO20")
+
+
+class ResolveCouponAutoApplyTests(ResolveCouponTestCase):
+    def setUp(self):
+        super().setUp()
+        Coupon.objects.filter(code="BEMVINDO10").update(is_active=True)
+
+    def test_sem_codigo_aplica_o_cupom_automatico(self):
+        result = self.resolve()
+
+        self.assertEqual(result.coupon.code, "BEMVINDO10")
+        self.assertEqual(result.discount, Decimal("32.00"))
+
+    def test_sem_codigo_e_sem_elegibilidade_nao_e_erro(self):
+        create_order(self.user)
+
+        result = self.resolve()
+
+        self.assertIsNone(result.coupon)
+        self.assertEqual(result.discount, Decimal("0.00"))
+        self.assertIsNone(result.error_code)
+
+    def test_codigo_vazio_e_o_mesmo_que_sem_codigo(self):
+        self.assertEqual(self.resolve("   ").coupon.code, "BEMVINDO10")
+
+    def test_codigo_digitado_substitui_o_automatico(self):
+        create_coupon(discount_value=Decimal("5.00"))
+        self.assertEqual(self.resolve("VERAO20").coupon.code, "VERAO20")
+
+    def test_codigo_invalido_nao_cai_para_o_automatico(self):
+        self.assert_error(self.resolve("NAOEXISTE"), "coupon_not_found")
+
+    def test_cliente_anonimo_nao_recebe_cupom_automatico(self):
+        result = resolve_coupon(AnonymousUser(), self.items, self.subtotal)
+        self.assertEqual(result.coupon, None)
+
+    def test_cliente_anonimo_nao_pode_digitar_codigo(self):
+        with self.assertRaises(ValueError):
+            resolve_coupon(AnonymousUser(), self.items, self.subtotal, "VERAO20")
+
+    # No SQLite (core.settings.test) o Django omite o FOR UPDATE.
+    @skipUnlessDBFeature("has_select_for_update")
+    def test_lock_trava_a_linha_do_cupom(self):
+        create_coupon()
+        with CaptureQueriesContext(connection) as queries, transaction.atomic():
+            self.resolve("VERAO20", lock=True)
+
+        coupon_queries = [q["sql"] for q in queries if '"orders_coupon"' in q["sql"]]
+        self.assertIn("FOR UPDATE", coupon_queries[0])
+
+
+class ResolveCouponEmptyCartTests(ResolveCouponTestCase):
+    def test_cupom_sem_restricao_com_carrinho_vazio_vale_com_desconto_zero(self):
+        create_coupon()
+        self.items, self.subtotal = [], Decimal("0.00")
+
+        result = self.resolve("VERAO20")
+
+        self.assertEqual(result.coupon.code, "VERAO20")
+        self.assertEqual(result.discount, Decimal("0.00"))
+
+    def test_cupom_restrito_com_carrinho_vazio_nao_se_aplica(self):
+        coupon = create_coupon()
+        coupon.drops.add(self.verao)
+        self.items, self.subtotal = [], Decimal("0.00")
+
+        self.assert_error(self.resolve("VERAO20"), "coupon_not_applicable")
+
+
+class ResolveCouponWelcomeEquivalenceTests(ResolveCouponTestCase):
+    """O modo automático precisa repetir o BEMVINDO10 de hoje, para que a
+    troca de _compute_welcome_discount por resolve_coupon não mude nada."""
+
+    def setUp(self):
+        super().setUp()
+        self.welcome = Coupon.objects.get(code="BEMVINDO10")
+        self.welcome.is_active = True
+        self.welcome.save()
+
+    def assert_equivalent(self):
+        old_coupon, old_discount = get_welcome_discount_preview(
+            self.user, self.subtotal
+        )
+        result = self.resolve()
+        self.assertEqual(result.coupon, old_coupon)
+        self.assertEqual(result.discount, old_discount)
+
+    def test_cliente_novo(self):
+        self.assert_equivalent()
+
+    def test_cliente_com_pedido_pago(self):
+        create_order(self.user)
+        self.assert_equivalent()
+
+    def test_cliente_com_pedido_cancelado(self):
+        create_order(self.user, order_status=OrderStatus.CANCELED)
+        self.assert_equivalent()
+
+    def test_cupom_inativo(self):
+        self.welcome.is_active = False
+        self.welcome.save()
+        self.assert_equivalent()
+
+    def test_cupom_expirado(self):
+        self.welcome.expiration_date = timezone.now() - timedelta(days=1)
+        self.welcome.save()
+        self.assert_equivalent()
+
+    def test_cupom_de_valor_fixo_maior_que_o_subtotal(self):
+        self.welcome.discount_type = CouponDiscountType.FIXED_VALUE
+        self.welcome.discount_value = Decimal("500.00")
+        self.welcome.save()
+        self.assert_equivalent()
