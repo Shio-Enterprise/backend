@@ -1,12 +1,14 @@
 import datetime
 import logging
 from decimal import Decimal
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.db import transaction
+from django.db import DatabaseError, transaction
 from django.db.models import Count, DecimalField, ExpressionWrapper, F, Q, Sum
 from django.db.models.functions import TruncDay, TruncMonth
-from django.http import Http404
+from django.http import Http404, HttpResponseRedirect
 from django.utils.decorators import method_decorator
 from drf_spectacular.utils import (
     OpenApiParameter,
@@ -15,6 +17,7 @@ from drf_spectacular.utils import (
     inline_serializer,
 )
 from rest_framework import serializers, status
+from rest_framework.exceptions import ValidationError
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
@@ -54,12 +57,14 @@ from .serializers import (
     DashboardRecentOrderSerializer,
     OrderDetailSerializer,
     OrderStatusUpdateSerializer,
+    PaymentReturnSerializer,
+    PaymentWebhookSerializer,
 )
 from .services import (
     add_item_to_cart,
-    check_payment_status,
     clear_cart,
     complete_checkout_attempt,
+    confirm_infinitepay_payment,
     create_shipping_quote,
     get_cart_data,
     prepare_checkout_attempt,
@@ -593,80 +598,84 @@ class CheckoutAPIView(APIView):
 
 class PaymentSuccessRedirectView(APIView):
     permission_classes = [AllowAny]
+    authentication_classes = []
 
     @extend_schema(
-        summary="Confirmação de Pagamento (Redirect InfinitePay)",
+        summary="Retorno do pagamento",
         description=(
-            "Rota de fallback acessada pelo navegador do cliente após o pagamento na InfinitePay. "
-            "Recebe os parâmetros via query string, consulta o status real da transação no servidor "
-            "da InfinitePay e efetiva a baixa do pedido (muda status para PAID) caso aprovado.\n\n"
-            "⚠️ *Não envia token JWT. O front-end deve exibir uma tela de 'Processando' ao carregar esta rota.*"
+            "Redireciona o navegador para a consulta autenticada no frontend. "
+            "Esta rota nunca confirma nem altera o pagamento."
         ),
         parameters=[
             OpenApiParameter(
                 name="order_nsu",
-                type=str,
+                type=OpenApiTypes.UUID,
                 location=OpenApiParameter.QUERY,
-                description="UUID do pedido gerado no nosso sistema",
-            ),
-            OpenApiParameter(
-                name="transaction_nsu",
-                type=str,
-                location=OpenApiParameter.QUERY,
-                description="ID único da transação gerado pela InfinitePay",
-            ),
-            OpenApiParameter(
-                name="slug",
-                type=str,
-                location=OpenApiParameter.QUERY,
-                description="Código da fatura gerado pela InfinitePay",
+                description="UUID do pedido gerado no sistema",
             ),
         ],
-        responses={
-            200: OpenApiTypes.OBJECT,
-            400: OpenApiTypes.OBJECT,
-            404: OpenApiTypes.OBJECT,
-        },
+        responses={302: None, 400: OpenApiTypes.OBJECT},
     )
     def get(self, request):
-        order_nsu = request.query_params.get("order_nsu")
-        transaction_nsu = request.query_params.get("transaction_nsu")
-        slug = request.query_params.get("slug")
+        serializer = PaymentReturnSerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+        target = urlsplit(settings.INFINITEPAY_RETURN_URL)
+        query = urlencode({"order_nsu": str(serializer.validated_data["order_nsu"])})
+        return HttpResponseRedirect(
+            urlunsplit(target._replace(query=query, fragment=""))
+        )
 
-        if not all([order_nsu, transaction_nsu, slug]):
+
+@method_decorator(transaction.non_atomic_requests, name="dispatch")
+class InfinitePayWebhookView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    @extend_schema(
+        summary="Notificação de pagamento InfinitePay",
+        description=(
+            "Consulta a InfinitePay e valida a transação antes de atualizar o "
+            "pagamento. Respostas 400 permitem que o provedor reenvie a notificação."
+        ),
+        request=PaymentWebhookSerializer,
+        responses={200: OpenApiTypes.OBJECT, 400: OpenApiTypes.OBJECT},
+    )
+    def post(self, request):
+        serializer = PaymentWebhookSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            confirm_infinitepay_payment(**serializer.validated_data)
+        except ValidationError as exc:
+            detail = exc.detail
+            if isinstance(detail, (list, tuple)) and detail:
+                detail = detail[0]
+            elif isinstance(detail, dict) and detail:
+                detail = next(iter(detail.values()))
+                if isinstance(detail, (list, tuple)) and detail:
+                    detail = detail[0]
             return Response(
-                {"message": "Faltam parâmetros de validação."},
+                {"success": False, "message": str(detail)},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
-        try:
-            order = CustomerOrder.objects.get(id=order_nsu)
-        except CustomerOrder.DoesNotExist:
+        except DatabaseError:
+            logger.warning("Falha ao persistir confirmação de pagamento InfinitePay.")
             return Response(
-                {"message": "Pedido não encontrado."}, status=status.HTTP_404_NOT_FOUND
+                {
+                    "success": False,
+                    "message": "Falha temporária. Reenvie a notificação.",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
             )
-
-        if order.status != OrderStatus.PAID:
-            check_data = check_payment_status(order_nsu, transaction_nsu, slug)
-
-            if check_data and check_data.get("paid") is True:
-                order.payment.gateway_transaction_id = transaction_nsu
-                order.payment.status = PaymentStatus.PAID
-                order.payment.save()
-                order.status = OrderStatus.PAID
-                order.save()
-
-        if order.status == OrderStatus.PAID:
+        except Exception:
+            logger.exception("Falha inesperada ao confirmar pagamento InfinitePay.")
             return Response(
-                {"message": "Pagamento confirmado com sucesso!", "order_id": order_nsu}
+                {
+                    "success": False,
+                    "message": "Falha temporária. Reenvie a notificação.",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
             )
-
-        return Response(
-            {
-                "message": "Pagamento pendente ou em processamento.",
-                "order_id": order_nsu,
-            }
-        )
+        return Response({"success": True, "message": None})
 
 
 class OrderTrackingView(APIView):
