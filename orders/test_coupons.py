@@ -3,10 +3,11 @@ from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
-from django.db.models import ProtectedError
+from django.db.models import Count, ProtectedError
 from django.test import TestCase
 from django.utils import timezone
 
+from orders.coupons import count_coupon_uses, valid_order_q
 from orders.models import (
     Coupon,
     CouponDiscountType,
@@ -28,11 +29,12 @@ def create_coupon(**fields):
     return Coupon.objects.create(**data)
 
 
-def create_order(user, *, coupon=None, order_status=OrderStatus.PAID):
+def create_order(user, *, coupon=None, order_status=OrderStatus.PAID, **fields):
     return CustomerOrder.objects.create(
         user=user,
         coupon=coupon,
         status=order_status,
+        **fields,
         subtotal=Decimal("100.00"),
         total_amount=Decimal("100.00"),
         shipping_zip_code="70000000",
@@ -147,3 +149,59 @@ class WelcomeCouponMigrationTests(TestCase):
         self.assertIsNone(coupon.max_uses_total)
         self.assertFalse(coupon.drops.exists())
         self.assertFalse(coupon.categories.exists())
+
+
+class CouponUsageCountTests(TestCase):
+    def setUp(self):
+        self.coupon = create_coupon()
+        self.user = User.objects.create_user(email="cliente@shio.com", name="Cliente")
+        self.other = User.objects.create_user(email="outro@shio.com", name="Outro")
+
+    def test_cupom_sem_pedidos_tem_zero_usos(self):
+        self.assertEqual(count_coupon_uses(self.coupon), 0)
+        self.assertEqual(count_coupon_uses(self.coupon, user=self.user), 0)
+
+    def test_conta_usos_totais_e_por_usuario(self):
+        create_order(self.user, coupon=self.coupon)
+        create_order(self.user, coupon=self.coupon, order_status=OrderStatus.DELIVERED)
+        create_order(self.other, coupon=self.coupon)
+        create_order(self.user)  # pedido sem cupom não conta
+
+        self.assertEqual(count_coupon_uses(self.coupon), 3)
+        self.assertEqual(count_coupon_uses(self.coupon, user=self.user), 2)
+        self.assertEqual(count_coupon_uses(self.coupon, user=self.other), 1)
+
+    def test_pedido_cancelado_devolve_o_uso(self):
+        order = create_order(self.user, coupon=self.coupon)
+        self.assertEqual(count_coupon_uses(self.coupon), 1)
+
+        order.status = OrderStatus.CANCELED
+        order.save(update_fields=["status"])
+
+        self.assertEqual(count_coupon_uses(self.coupon), 0)
+        self.assertEqual(count_coupon_uses(self.coupon, user=self.user), 0)
+
+    def test_pedido_aguardando_pagamento_com_reserva_vencida_ainda_conta(self):
+        create_order(
+            self.user,
+            coupon=self.coupon,
+            order_status=OrderStatus.AWAITING_PAYMENT,
+            reservation_expires_at=timezone.now() - timedelta(minutes=1),
+        )
+
+        self.assertEqual(count_coupon_uses(self.coupon, user=self.user), 1)
+
+    def test_filtro_funciona_a_partir_do_cupom_numa_unica_consulta(self):
+        other_coupon = create_coupon(code="INVERNO10")
+        create_order(self.user, coupon=self.coupon)
+        create_order(self.other, coupon=self.coupon, order_status=OrderStatus.CANCELED)
+        create_order(self.other, coupon=other_coupon)
+
+        with self.assertNumQueries(1):
+            uses = dict(
+                Coupon.objects.annotate(
+                    uses=Count("orders", filter=valid_order_q("orders__"))
+                ).values_list("code", "uses")
+            )
+
+        self.assertEqual(uses, {"VERAO20": 1, "INVERNO10": 1, "BEMVINDO10": 0})
