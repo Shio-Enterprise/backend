@@ -20,6 +20,7 @@ from django.test import (
     RequestFactory,
     TransactionTestCase,
     override_settings,
+    skipUnlessDBFeature,
 )
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
@@ -64,14 +65,18 @@ from products.models import (
 
 User = get_user_model()
 
+# O snapshot da cotação inclui estes settings; cotação e checkout precisam vê-los
+# iguais, então eles valem para o teste inteiro, sem depender do .env.
+SHIPPING_TEST_SETTINGS = {
+    "CORREIOS_REMETENTE_CEP": "70000000",
+    "CORREIOS_CODIGO_SERVICO": "03220",
+    "CORREIOS_PESO_PADRAO_GRAMAS": "300",
+}
+
 
 def make_checkout_payload(client, address, *, idempotency_key=None):
     """Cria uma cotação real com o transporte externo isolado pelo teste."""
-    shipping_settings = override_settings(
-        CORREIOS_REMETENTE_CEP="70000000",
-        CORREIOS_CODIGO_SERVICO="03220",
-        CORREIOS_PESO_PADRAO_GRAMAS="300",
-    )
+    shipping_settings = override_settings(**SHIPPING_TEST_SETTINGS)
     with (
         shipping_settings,
         patch(
@@ -143,11 +148,7 @@ class CheckoutAPITests(APITestCase):
         self.mock_deadline = deadline_patch.start()
         self.addCleanup(deadline_patch.stop)
         self.mock_deadline.return_value = {"prazoEntrega": 3}
-        shipping_settings = override_settings(
-            CORREIOS_REMETENTE_CEP="70000000",
-            CORREIOS_CODIGO_SERVICO="03220",
-            CORREIOS_PESO_PADRAO_GRAMAS="300",
-        )
+        shipping_settings = override_settings(**SHIPPING_TEST_SETTINGS)
         shipping_settings.enable()
         self.addCleanup(shipping_settings.disable)
 
@@ -814,6 +815,7 @@ class CheckoutAPITests(APITestCase):
                 self.assertEqual(response.data["total_amount"], expected)
 
 
+@override_settings(**SHIPPING_TEST_SETTINGS)
 class StockReservationExpirationTests(APITestCase):
     def setUp(self):
         self.user = User.objects.create_user(
@@ -3302,6 +3304,7 @@ class CheckoutRevalidationTests(APITestCase):
         self.assertEqual(CustomerOrder.objects.count(), 0)
 
 
+@override_settings(**SHIPPING_TEST_SETTINGS)
 class CheckoutDropLimitTests(APITestCase):
     """Checkout deve recusar (409) quando a compra ultrapassaria o max_quantity
     do drop, contabilizado pela soma de unidades de pedidos não cancelados."""
@@ -3398,6 +3401,7 @@ class CheckoutDropLimitTests(APITestCase):
         self.assertEqual(self.variation.stock_quantity, 99)
 
 
+@override_settings(**SHIPPING_TEST_SETTINGS)
 class ConcurrentCheckoutStockTests(TransactionTestCase):
     """Comprova que dois checkouts concorrentes para a última unidade em
     estoque não resultam em overselling: só um é confirmado."""
@@ -3430,6 +3434,9 @@ class ConcurrentCheckoutStockTests(TransactionTestCase):
                 cart=cart, variation=self.variation, quantity=1, unit_price=100
             )
 
+    # SQLite trava a tabela inteira e falha na hora ("database table is locked");
+    # o teste só é significativo com locks de linha reais (Postgres).
+    @skipUnlessDBFeature("has_select_for_update")
     @patch("orders.services.create_infinitepay_checkout")
     def test_checkout_concorrente_nao_ultrapassa_estoque(self, mock_checkout):
         mock_checkout.return_value = "https://pay.example.com/mock"
@@ -3487,6 +3494,7 @@ class ConcurrentCheckoutStockTests(TransactionTestCase):
         )
 
 
+@override_settings(**SHIPPING_TEST_SETTINGS)
 class ConcurrentCheckoutDropLimitTests(TransactionTestCase):
     """Comprova que dois checkouts concorrentes para a última unidade do
     max_quantity de um drop não resultam em overselling: só um é confirmado.
@@ -3534,6 +3542,9 @@ class ConcurrentCheckoutDropLimitTests(TransactionTestCase):
                 cart=cart, variation=self.variation, quantity=1, unit_price=50
             )
 
+    # SQLite trava a tabela inteira e falha na hora ("database table is locked");
+    # o teste só é significativo com locks de linha reais (Postgres).
+    @skipUnlessDBFeature("has_select_for_update")
     @patch("orders.services.create_infinitepay_checkout")
     def test_checkout_concorrente_nao_ultrapassa_max_quantity(self, mock_checkout):
         mock_checkout.return_value = "https://pay.example.com/mock"
@@ -3785,6 +3796,7 @@ class WelcomeDiscountCouponRulesTests(APITestCase):
         self.assertEqual(preview_discount, locked_discount)
 
 
+@override_settings(**SHIPPING_TEST_SETTINGS)
 class InfinitePayCardSimulationTests(APITestCase):
     """Simula o gateway InfinitePay (POST /links e /payment_check) via mock de
     requests.post, sem bater na rede nem exigir cartão real. Cobre o fluxo

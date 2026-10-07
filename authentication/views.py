@@ -1,7 +1,9 @@
 import logging
 from decimal import Decimal
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.contrib.auth.tokens import default_token_generator
 from django.db import models
 from django.db.models import (
     Count,
@@ -14,6 +16,8 @@ from django.db.models import (
     Value,
 )
 from django.db.models.functions import Coalesce
+from django.utils.encoding import force_bytes, force_str
+from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from drf_spectacular.utils import (
     OpenApiExample,
     OpenApiResponse,
@@ -26,6 +30,7 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from authentication.signals import google_login_completed
+from notifications.email import send_email
 from orders.models import CustomerOrder, OrderStatus, PaymentStatus
 
 from .models import NewsletterSubscriber
@@ -38,6 +43,8 @@ from .serializers import (
     LogoutInputSerializer,
     NewsletterSubscribeSerializer,
     PasswordLoginSerializer,
+    PasswordResetConfirmSerializer,
+    PasswordResetRequestSerializer,
     RegisterSerializer,
     TokenRefreshInputSerializer,
     UserSerializer,
@@ -628,3 +635,70 @@ class NewsletterSubscribeView(APIView):
         return Response(
             {"message": "Inscrito com sucesso!"}, status=status.HTTP_201_CREATED
         )
+
+
+class PasswordResetRequestView(APIView):
+    """Solicita redefinição de senha."""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        serializer = PasswordResetRequestSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        email = serializer.validated_data["email"]
+        user = User.objects.filter(email=email).first()
+
+        if user:
+            uid = urlsafe_base64_encode(force_bytes(user.pk))
+            token = default_token_generator.make_token(user)
+            reset_url = f"{settings.FRONTEND_URL}/reset-password/{uid}/{token}"
+
+            send_email(
+                to=user.email,
+                subject="Redefinição de Senha — Shio",
+                template="password_reset",
+                context={"nome": user.name, "reset_url": reset_url},
+            )
+
+        # Retornamos sucesso independente do user existir para não vazar e-mails cadastrados.
+        return Response(
+            {"message": "Se o e-mail existir, enviamos as instruções."},
+            status=status.HTTP_200_OK,
+        )
+
+
+class PasswordResetConfirmView(APIView):
+    """Confirma a nova senha."""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        serializer = PasswordResetConfirmSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        uidb64 = serializer.validated_data["uidb64"]
+        token = serializer.validated_data["token"]
+        new_password = serializer.validated_data["new_password"]
+
+        try:
+            uid = force_str(urlsafe_base64_decode(uidb64))
+            user = User.objects.get(pk=uid)
+        except (TypeError, ValueError, OverflowError, User.DoesNotExist):
+            user = None
+
+        if user is not None and default_token_generator.check_token(user, token):
+            user.set_password(new_password)
+            user.save()
+            return Response(
+                {"message": "Senha redefinida com sucesso!"}, status=status.HTTP_200_OK
+            )
+        else:
+            return Response(
+                {"error": "O link de redefinição é inválido ou expirou."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )

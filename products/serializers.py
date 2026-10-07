@@ -42,7 +42,13 @@ class ProductListQuerySerializer(CatalogPageQuerySerializer):
         max_digits=10, decimal_places=2, min_value=0, required=False
     )
     ordering = serializers.ChoiceField(
-        choices=("-created_at", "base_price", "-base_price", "-sales_count"),
+        choices=(
+            "-created_at",
+            "base_price",
+            "-base_price",
+            "-sales_count",
+            "-rating_avg",
+        ),
         default="-created_at",
     )
 
@@ -441,6 +447,8 @@ class ProductListSerializer(ProductPricingSerializer):
             *PRICE_FIELDS,
             "is_active",
             "is_sellable",
+            "rating_avg",
+            "rating_count",
             "category",
             "drop",
             "category_details",
@@ -498,6 +506,8 @@ class ProductDetailSerializer(ProductPricingSerializer):
             *PRICE_FIELDS,
             "is_active",
             "is_sellable",
+            "rating_avg",
+            "rating_count",
             "category",
             "drop",
             "variations",

@@ -18,3 +18,4 @@ pytest-cov>=5.0
 django-filter==24.2
 cloudinary==1.44.2
 django-cloudinary-storage==0.3.0
+django-anymail==15.2
