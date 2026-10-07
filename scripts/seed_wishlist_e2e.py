@@ -25,7 +25,11 @@ with transaction.atomic():
     )
     drop, _ = DropCampaign.objects.update_or_create(
         slug="wishlist-e2e-restored",
-        defaults={"name": "Wishlist restored drop", "is_public": True, "is_active": True},
+        defaults={
+            "name": "Wishlist restored drop",
+            "is_public": True,
+            "is_active": True,
+        },
     )
     for index in range(1, 16):
         product, _ = Product.objects.update_or_create(
@@ -43,7 +47,10 @@ with transaction.atomic():
             product=product,
             size="M",
             color="",
-            defaults={"sku": f"WISHLIST-E2E-{index:02d}", "stock_quantity": 0 if index == 14 else 10},
+            defaults={
+                "sku": f"WISHLIST-E2E-{index:02d}",
+                "stock_quantity": 0 if index == 14 else 10,
+            },
         )
 
 print(json.dumps({"products": 15, "out_of_stock": 14, "restored_drop": str(drop.id)}))
