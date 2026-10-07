@@ -55,9 +55,7 @@ def _unclassified(params, selector):
     if value not in {"true", "false"}:
         raise ValidationError({"unclassified": "Use true ou false."})
     if value == "true" and params.get(selector):
-        raise ValidationError(
-            {"unclassified": f"Não combine true com {selector}."}
-        )
+        raise ValidationError({"unclassified": f"Não combine true com {selector}."})
     return value == "true"
 
 

@@ -96,7 +96,9 @@ def dimension_filters(params):
             try:
                 value = int(value)
             except (TypeError, ValueError) as exc:
-                raise ValidationError("customer deve ser um ID inteiro válido.") from exc
+                raise ValidationError(
+                    "customer deve ser um ID inteiro válido."
+                ) from exc
             if value < 1:
                 raise ValidationError("customer deve ser um ID inteiro válido.")
         filters[lookup] = value

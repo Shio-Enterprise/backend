@@ -99,12 +99,8 @@ class DashboardAggregatesTests(TestCase):
         )
 
     def test_financeiro_serie_diaria_e_metodo_respeitam_pagamento_local(self):
-        jan_first_local = datetime.datetime(
-            2026, 1, 1, 23, 30, tzinfo=METRICS_TIMEZONE
-        )
-        jan_third_local = datetime.datetime(
-            2026, 1, 3, 12, 0, tzinfo=METRICS_TIMEZONE
-        )
+        jan_first_local = datetime.datetime(2026, 1, 1, 23, 30, tzinfo=METRICS_TIMEZONE)
+        jan_third_local = datetime.datetime(2026, 1, 3, 12, 0, tzinfo=METRICS_TIMEZONE)
         self.create_order(
             total="100.00", paid_at=jan_first_local.astimezone(datetime.UTC)
         )
@@ -213,8 +209,7 @@ class DashboardAggregatesTests(TestCase):
             {"units": 1, "revenue": Decimal("5.00")},
         )
         drops = {
-            row["drop_id"]: row["revenue"]
-            for row in result["item_revenue"]["by_drop"]
+            row["drop_id"]: row["revenue"] for row in result["item_revenue"]["by_drop"]
         }
         self.assertEqual(drops[drop_a.id], 50)
         self.assertEqual(drops[drop_b.id], 40)
@@ -227,8 +222,7 @@ class DashboardAggregatesTests(TestCase):
         self.assertEqual(categories[category_b.id], 60)
         self.assertEqual(categories[None], 5)
         statuses = {
-            row["status"]: row["orders"]
-            for row in result["orders_by_status"]["rows"]
+            row["status"]: row["orders"] for row in result["orders_by_status"]["rows"]
         }
         self.assertEqual(result["orders_by_status"]["date_basis"], "order_created_at")
         self.assertEqual(statuses[OrderStatus.DELIVERED], 2)
@@ -251,9 +245,7 @@ class DashboardAggregatesTests(TestCase):
         )
 
     def test_clientes_recorrentes_e_estoque_usam_bases_proprias(self):
-        other = User.objects.create_user(
-            email="other-detail@example.com", name="Other"
-        )
+        other = User.objects.create_user(email="other-detail@example.com", name="Other")
         User.objects.filter(pk=other.pk).update(
             created_at=timezone.now() - datetime.timedelta(days=40)
         )

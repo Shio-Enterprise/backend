@@ -284,9 +284,7 @@ class DashboardApiTests(TestCase):
         net_rows = self.client.get(
             self.orders_url, {**self.today_params(), "metric": "net_revenue"}
         ).json()
-        unfiltered_detail = self.client.get(
-            self.detail_url, self.today_params()
-        ).json()
+        unfiltered_detail = self.client.get(self.detail_url, self.today_params()).json()
         self.assertEqual(net_rows["count"], 3)
         self.assertEqual(
             sum(Decimal(row["revenue_value"]) for row in net_rows["results"]),

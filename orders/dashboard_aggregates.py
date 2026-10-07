@@ -180,8 +180,9 @@ def _recurring_customer_count(sales):
     drop_positions = {
         drop_id: position
         for position, drop_id in enumerate(
-            DropCampaign.objects.order_by("launch_date", "created_at", "id")
-            .values_list("id", flat=True)
+            DropCampaign.objects.order_by(
+                "launch_date", "created_at", "id"
+            ).values_list("id", flat=True)
         )
     }
     if len(drop_positions) < 2:
@@ -223,9 +224,7 @@ def _stock(params):
     if category_id := params.get("category"):
         variations = variations.filter(product__category_id=category_id)
     counts = variations.aggregate(
-        low_count=Count(
-            "id", filter=Q(stock_quantity__gt=0, stock_quantity__lt=10)
-        ),
+        low_count=Count("id", filter=Q(stock_quantity__gt=0, stock_quantity__lt=10)),
         out_count=Count("id", filter=Q(stock_quantity=0)),
     )
     attention = variations.filter(stock_quantity__lt=10).select_related("product")
