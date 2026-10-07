@@ -1,6 +1,4 @@
 import logging
-from django.utils.encoding import force_bytes, force_str
-from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from decimal import Decimal
 
 from django.conf import settings
@@ -18,6 +16,8 @@ from django.db.models import (
     Value,
 )
 from django.db.models.functions import Coalesce
+from django.utils.encoding import force_bytes, force_str
+from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from drf_spectacular.utils import (
     OpenApiExample,
     OpenApiResponse,
@@ -30,8 +30,8 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from authentication.signals import google_login_completed
-from orders.models import CustomerOrder, OrderStatus, PaymentStatus
 from notifications.email import send_email
+from orders.models import CustomerOrder, OrderStatus, PaymentStatus
 
 from .models import NewsletterSubscriber
 from .permissions import IsStaffOrSuperUser
@@ -660,11 +660,14 @@ class PasswordResetRequestView(APIView):
                 to=user.email,
                 subject="Redefinição de Senha — Shio",
                 template="password_reset",
-                context={"nome": user.name, "reset_url": reset_url}
+                context={"nome": user.name, "reset_url": reset_url},
             )
 
         # Retornamos sucesso independente do user existir para não vazar e-mails cadastrados.
-        return Response({"message": "Se o e-mail existir, enviamos as instruções."}, status=status.HTTP_200_OK)
+        return Response(
+            {"message": "Se o e-mail existir, enviamos as instruções."},
+            status=status.HTTP_200_OK,
+        )
 
 
 class PasswordResetConfirmView(APIView):
@@ -691,6 +694,11 @@ class PasswordResetConfirmView(APIView):
         if user is not None and default_token_generator.check_token(user, token):
             user.set_password(new_password)
             user.save()
-            return Response({"message": "Senha redefinida com sucesso!"}, status=status.HTTP_200_OK)
+            return Response(
+                {"message": "Senha redefinida com sucesso!"}, status=status.HTTP_200_OK
+            )
         else:
-            return Response({"error": "O link de redefinição é inválido ou expirou."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": "O link de redefinição é inválido ou expirou."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )

@@ -47,7 +47,11 @@ urlpatterns = [
     # POST - Solicitação de redefinição de senha
     path("password-reset/", PasswordResetRequestView.as_view(), name="password-reset"),
     # POST - Confirmação da nova senha
-    path("password-reset-confirm/", PasswordResetConfirmView.as_view(), name="password-reset-confirm"),
+    path(
+        "password-reset-confirm/",
+        PasswordResetConfirmView.as_view(),
+        name="password-reset-confirm",
+    ),
 ]
 
 urlpatterns += router.urls
