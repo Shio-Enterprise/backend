@@ -1,3 +1,5 @@
+import threading
+import time
 from datetime import timedelta
 from decimal import Decimal
 
@@ -5,7 +7,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import AnonymousUser
 from django.db import IntegrityError, connection, transaction
 from django.db.models import Count, ProtectedError
-from django.test import TestCase, skipUnlessDBFeature
+from django.test import TestCase, TransactionTestCase, skipUnlessDBFeature
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
@@ -536,3 +538,73 @@ class ResolveCouponWelcomeEquivalenceTests(ResolveCouponTestCase):
         self.welcome.discount_value = Decimal("500.00")
         self.welcome.save()
         self.assert_equivalent()
+
+
+class ConcurrentCouponLastUseTests(TransactionTestCase):
+    """Duas compras disputando o último uso de um cupom: só uma pode levar.
+
+    A primeira transação trava o cupom e só grava o pedido depois que a
+    segunda já tentou validar. Com a trava, a segunda espera o commit e vê o
+    cupom esgotado; sem ela, as duas veriam zero usos e passariam.
+    """
+
+    def setUp(self):
+        self.coupon = create_coupon(max_uses_total=1)
+        self.users = [
+            User.objects.create_user(email=f"disputa{i}@shio.com", name=f"C{i}")
+            for i in (1, 2)
+        ]
+        category = Category.objects.create(name="Disputa", slug="disputa")
+        product = Product.objects.create(
+            name="Camiseta", description="x", base_price=100, category=category
+        )
+        variation = ProductVariation.objects.create(
+            product=product, size="M", sku="DISPUTA-M", stock_quantity=10
+        )
+        self.items = [{"variation": variation, "total_price": Decimal("100.00")}]
+
+    # SQLite trava a tabela inteira; só faz sentido com locks de linha (Postgres).
+    @skipUnlessDBFeature("has_select_for_update")
+    def test_ultimo_uso_vai_para_uma_compra_so(self):
+        first_locked = threading.Event()
+        second_started = threading.Event()
+        results = {}
+
+        def buy(key, user, *, first):
+            try:
+                if not first:
+                    first_locked.wait(timeout=10)
+                with transaction.atomic():
+                    if not first:
+                        second_started.set()
+                    result = resolve_coupon(
+                        user, self.items, Decimal("100.00"), "VERAO20", lock=True
+                    )
+                    if first:
+                        first_locked.set()
+                        # Dá tempo de a segunda compra tentar validar antes do commit.
+                        second_started.wait(timeout=10)
+                        time.sleep(0.3)
+                    if result.error_code is None:
+                        create_order(user, coupon=result.coupon)
+                results[key] = result.error_code
+            except Exception as exc:  # noqa: BLE001 - o teste reporta o erro
+                results[key] = repr(exc)
+            finally:
+                connection.close()
+
+        threads = [
+            threading.Thread(
+                target=buy, args=("a", self.users[0]), kwargs={"first": True}
+            ),
+            threading.Thread(
+                target=buy, args=("b", self.users[1]), kwargs={"first": False}
+            ),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        self.assertEqual(results, {"a": None, "b": "coupon_limit_reached"})
+        self.assertEqual(count_coupon_uses(self.coupon), 1)
