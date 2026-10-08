@@ -16,7 +16,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 COPY entrypoint.sh /app/entrypoint.sh
-RUN sed -i 's/\r$//' /app/entrypoint.sh && chmod +x /app/entrypoint.sh
+
+RUN sed -i 's/\r$//' /app/entrypoint.sh \
+    && chmod +x /app/entrypoint.sh \
+    && mkdir -p /app/core/staticfiles /app/core/mediafiles \
+    && chown -R 1000:1000 /app/core/staticfiles /app/core/mediafiles
 
 USER 1000
 
