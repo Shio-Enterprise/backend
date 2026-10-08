@@ -182,7 +182,7 @@ DRILLDOWN_PARAMETERS = METRIC_PARAMETERS + [
 class DashboardDetailView(APIView):
     """Agregados completos para a página administrativa de análise detalhada."""
 
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanAccessAdminDashboard]
 
     @extend_schema(
         description=(
