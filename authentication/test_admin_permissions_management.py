@@ -49,7 +49,11 @@ class AdminPermissionManagementTests(APITestCase):
 
         self.assertEqual(admins.status_code, status.HTTP_200_OK)
         self.assertEqual(options.status_code, status.HTTP_200_OK)
-        admin_results = admins.data.get("results", admins.data)
+        admin_results = (
+            admins.data.get("results", [])
+            if isinstance(admins.data, dict)
+            else admins.data
+        )
         self.assertTrue(any(row["email"] == self.target.email for row in admin_results))
         codes = {row["code"] for row in options.data["results"]}
         self.assertEqual(codes, set(ADMIN_PERMISSION_CODES))
