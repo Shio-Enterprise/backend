@@ -675,7 +675,18 @@ class CheckoutCalculationView(APIView):
 
     @extend_schema(
         summary="Calcular valores atuais da compra",
-        description="Cria uma cotação com preços, frete e validade, sem criar pedido ou reservar estoque.",
+        description=(
+            "Cria uma cotação com preços, frete e validade, sem criar pedido ou "
+            "reservar estoque.\n\n"
+            "`coupon_code` é opcional. Sem ele, aplica o cupom automático para o "
+            "qual o cliente for elegível (ex.: BEMVINDO10). Com ele, só esse cupom "
+            "é considerado; se não vale, responde 400 no formato "
+            '`{"coupon_code": ["Este cupom expirou."], "code": "coupon_expired"}`. '
+            "Códigos possíveis: coupon_not_found, coupon_inactive, "
+            "coupon_not_started, coupon_expired, coupon_first_purchase_only, "
+            "coupon_min_value, coupon_not_applicable, coupon_limit_reached e "
+            "coupon_user_limit_reached."
+        ),
         request=CheckoutCalculationInputSerializer,
         responses={
             200: CheckoutCalculationSerializer,
@@ -688,7 +699,9 @@ class CheckoutCalculationView(APIView):
         serializer.is_valid(raise_exception=True)
         release_quietly(variation_ids=cart_variation_ids(request))
         calculation = create_shipping_quote(
-            request.user, serializer.validated_data["address_id"]
+            request.user,
+            serializer.validated_data["address_id"],
+            serializer.validated_data["coupon_code"],
         )
         return Response(CheckoutCalculationSerializer(calculation).data)
 

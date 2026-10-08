@@ -35,7 +35,7 @@ class CouponDiscountType(models.TextChoices):
 
 
 def normalize_coupon_code(code):
-    """Forma canônica do código: sem espaços e em maiúsculas (" verao 20" -> "VERAO20")."""
+    """Sem espaços e em maiúsculas: " verao 20" -> "VERAO20"."""
     return "".join(str(code).split()).upper()
 
 
@@ -45,7 +45,6 @@ class Coupon(models.Model):
     description = models.CharField(max_length=255, blank=True)
     discount_type = models.CharField(max_length=20, choices=CouponDiscountType.choices)
     discount_value = models.DecimalField(max_digits=10, decimal_places=2)
-    # Teto do desconto em reais; só faz sentido em cupom percentual.
     max_discount_amount = models.DecimalField(
         max_digits=10, decimal_places=2, null=True, blank=True
     )
@@ -55,12 +54,10 @@ class Coupon(models.Model):
     )
     starts_at = models.DateTimeField(null=True, blank=True)
     expiration_date = models.DateTimeField(null=True, blank=True)
-    # null = ilimitado. Os usos são contados a partir dos pedidos válidos
-    # (orders.coupons), não guardados num contador.
+    # null = ilimitado.
     max_uses_total = models.PositiveIntegerField(null=True, blank=True)
     max_uses_per_user = models.PositiveIntegerField(null=True, blank=True)
     first_purchase_only = models.BooleanField(default=False)
-    # Aplicado sem o cliente digitar o código (hoje, só o BEMVINDO10).
     auto_apply = models.BooleanField(default=False)
     # Sem drops nem categorias, o cupom vale para o carrinho inteiro.
     drops = models.ManyToManyField(
@@ -69,7 +66,6 @@ class Coupon(models.Model):
     categories = models.ManyToManyField(
         "products.Category", blank=True, related_name="coupons"
     )
-    # Origem da campanha (ex.: MELIUZ, INFLUENCER_ANA).
     partner = models.CharField(max_length=50, blank=True)
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -77,8 +73,7 @@ class Coupon(models.Model):
 
     class Meta:
         constraints = [
-            # Garante o formato mesmo em escritas que não passam pelo save(),
-            # como queryset.update() e bulk_create().
+            # Cobre também update() e bulk_create(), que não chamam save().
             models.CheckConstraint(
                 check=models.Q(code__regex=r"^[A-Z0-9_-]+$"),
                 name="coupon_code_normalized",
@@ -169,7 +164,6 @@ class ShippingQuote(models.Model):
     discount_amount = models.DecimalField(max_digits=10, decimal_places=2)
     total_amount = models.DecimalField(max_digits=10, decimal_places=2)
     prazo_dias = models.PositiveIntegerField(null=True, blank=True)
-    # Código digitado pelo cliente, já normalizado; vazio quando não digitou.
     coupon_code = models.CharField(max_length=50, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
     expires_at = models.DateTimeField()
@@ -197,7 +191,7 @@ class CustomerOrder(models.Model):
     address = models.ForeignKey(
         "authentication.Address", on_delete=models.SET_NULL, null=True, blank=True
     )
-    # PROTECT: apagar um cupom já usado apagaria a origem das vendas.
+    # PROTECT: apagar um cupom usado apagaria a origem das vendas.
     coupon = models.ForeignKey(
         Coupon,
         on_delete=models.PROTECT,
