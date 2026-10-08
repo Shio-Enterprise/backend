@@ -10,6 +10,8 @@ from .views import (
     CartItemDetailAPIView,
     CheckoutAPIView,
     CheckoutCalculationView,
+    CouponDetailView,
+    CouponListCreateView,
     DashboardDetailView,
     DashboardDrillDownView,
     DashboardDropRevenueView,
@@ -24,6 +26,12 @@ from .views import (
 app_name = "orders"
 
 urlpatterns = [
+    path("admin/coupons/", CouponListCreateView.as_view(), name="admin-coupons-list"),
+    path(
+        "admin/coupons/<uuid:uuid>/",
+        CouponDetailView.as_view(),
+        name="admin-coupons-detail",
+    ),
     path(
         "infinitepay/webhook/",
         InfinitePayWebhookView.as_view(),
