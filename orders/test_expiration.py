@@ -1,5 +1,6 @@
 import threading
 import time
+import uuid
 from datetime import timedelta
 from decimal import Decimal
 from unittest.mock import patch
@@ -8,11 +9,15 @@ from django.contrib.auth import get_user_model
 from django.db import connection
 from django.test import TransactionTestCase, override_settings, skipUnlessDBFeature
 from django.utils import timezone
+from rest_framework import status
 from rest_framework.test import APITestCase
 
-from orders import services
+from authentication.models import Address
+from orders import expiration, services
 from orders.expiration import release_expired_reservations
 from orders.models import (
+    Cart,
+    CartItem,
     CustomerOrder,
     OrderItem,
     OrderStatus,
@@ -334,3 +339,168 @@ class ConcurrentReleaseAndWebhookTests(ReservationMixin, TransactionTestCase):
         self.assertEqual(order.status, OrderStatus.PAID)
         self.assert_stock(8)
         self.assertEqual(self.returns(), 0)
+
+
+CART_ITEMS_URL = "/api/orders/cart/items/"
+CATALOG_URL = "/api/catalog/products/"
+SHIPPING_SETTINGS = {
+    "CORREIOS_REMETENTE_CEP": "70000000",
+    "CORREIOS_CODIGO_SERVICO": "03220",
+    "CORREIOS_PESO_PADRAO_GRAMAS": "300",
+}
+
+
+def correios_mocks():
+    return (
+        patch(
+            "orders.services.fetch_shipping_price_by_service_and_ceps",
+            return_value={"pcFinal": "15,00"},
+        ),
+        patch(
+            "orders.services.fetch_shipping_deadline_by_service_and_ceps",
+            return_value={"prazoEntrega": 3},
+        ),
+    )
+
+
+@override_settings(**SHIPPING_SETTINGS)
+class AutomaticReleaseTests(ReservationTestCase):
+    """Uma reserva abandonada segura as 2 únicas unidades da variação."""
+
+    def setUp(self):
+        super().setUp()
+        expiration._last_sweep = None
+        ProductVariation.objects.filter(pk=self.variation.pk).update(stock_quantity=2)
+        self.buyer = User.objects.create_user(email="comprador@shio.com", name="B")
+        self.client.force_authenticate(user=self.buyer)
+
+    def buyer_cart(self):
+        cart = Cart.objects.create(user=self.buyer, status="ACTIVE")
+        CartItem.objects.create(
+            cart=cart, variation=self.variation, quantity=1, unit_price=100
+        )
+        return Address.objects.create(
+            user=self.buyer,
+            zip_code="71000000",
+            street="Rua",
+            address_number="1",
+            neighborhood="Centro",
+            city="Brasília",
+            state="DF",
+        )
+
+    def quote(self, address):
+        price, deadline = correios_mocks()
+        with price, deadline:
+            return self.client.post(
+                "/api/orders/checkout/calculate/",
+                {"address_id": str(address.pk)},
+                format="json",
+            )
+
+    def test_reserva_abandonada_nao_bloqueia_quem_adiciona_ao_carrinho(self):
+        abandoned = self.create_reserved_order()
+        self.assert_stock(0)
+
+        response = self.client.post(
+            CART_ITEMS_URL,
+            {"variation_id": str(self.variation.pk), "quantity": 1},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        abandoned.refresh_from_db()
+        self.assertEqual(abandoned.status, OrderStatus.CANCELED)
+
+    def test_reserva_dentro_do_prazo_continua_segurando_o_estoque(self):
+        self.create_reserved_order(expires_in=timedelta(minutes=10))
+
+        response = self.client.post(
+            CART_ITEMS_URL,
+            {"variation_id": str(self.variation.pk), "quantity": 1},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assert_stock(0)
+
+    def test_produto_volta_ao_catalogo_sem_ninguem_abrir_o_pedido(self):
+        self.create_reserved_order()
+        product_id = str(self.variation.product_id)
+
+        with patch("products.views.sweep_expired_reservations"):
+            hidden = self.client.get(CATALOG_URL)
+        visible = self.client.get(CATALOG_URL)
+
+        ids = lambda response: [p["id"] for p in response.json()["results"]]  # noqa: E731
+        self.assertNotIn(product_id, ids(hidden))
+        self.assertIn(product_id, ids(visible))
+
+    def test_cotacao_libera_antes_de_validar_o_estoque(self):
+        address = self.buyer_cart()
+        self.create_reserved_order()
+
+        response = self.quote(address)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assert_stock(2)
+
+    @patch(
+        "orders.services.create_infinitepay_checkout",
+        return_value="https://pay.example.com/mock",
+    )
+    def test_checkout_libera_antes_de_validar_o_estoque(self, _):
+        address = self.buyer_cart()
+        quote = self.quote(address)
+        self.create_reserved_order()  # abandonada depois da cotação
+
+        response = self.client.post(
+            "/api/orders/checkout/",
+            {
+                "address_id": str(address.pk),
+                "shipping_quote_id": quote.data["shipping_quote_id"],
+                "idempotency_key": str(uuid.uuid4()),
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        order = CustomerOrder.objects.get(user=self.buyer)
+        self.assertIsNotNone(response.data["reservation_expires_at"])
+        self.assertEqual(
+            response.data["reservation_expires_at"], order.reservation_expires_at
+        )
+
+    def test_varredura_respeita_o_intervalo(self):
+        self.assertEqual(expiration.sweep_expired_reservations(), 0)
+        order = self.create_reserved_order()
+
+        self.assertEqual(expiration.sweep_expired_reservations(), 0)
+
+        order.refresh_from_db()
+        self.assertEqual(order.status, OrderStatus.AWAITING_PAYMENT)
+        expiration._last_sweep = None
+        self.assertEqual(expiration.sweep_expired_reservations(), 1)
+
+    def test_falha_na_liberacao_nao_quebra_catalogo_nem_carrinho(self):
+        with (
+            patch(
+                "orders.expiration.release_expired_reservations",
+                side_effect=RuntimeError("banco fora"),
+            ),
+            self.assertLogs("orders.expiration", level="ERROR"),
+        ):
+            catalog = self.client.get(CATALOG_URL)
+            cart = self.client.get("/api/orders/cart/")
+
+        self.assertEqual(catalog.status_code, status.HTTP_200_OK)
+        self.assertEqual(cart.status_code, status.HTTP_200_OK)
+
+    def test_detalhe_do_pedido_mostra_o_prazo_da_reserva(self):
+        order = self.create_reserved_order(expires_in=timedelta(minutes=10))
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.get(f"/api/orders/my-orders/{order.pk}/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNotNone(response.json()["reservation_expires_at"])

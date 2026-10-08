@@ -203,6 +203,11 @@ STOCK_RESERVATION_TTL_MINUTES = config(
 STOCK_RESERVATION_GRACE_SECONDS = config(
     "STOCK_RESERVATION_GRACE_SECONDS", default=120, cast=int
 )
+# Intervalo mínimo, por processo, entre varreduras de reservas vencidas
+# disparadas pelo catálogo e pelo carrinho.
+RESERVATION_SWEEP_INTERVAL_SECONDS = config(
+    "RESERVATION_SWEEP_INTERVAL_SECONDS", default=60, cast=int
+)
 SHIPPING_QUOTE_TTL_SECONDS = config("SHIPPING_QUOTE_TTL_SECONDS", default=900, cast=int)
 CHECKOUT_PROCESSING_TIMEOUT_SECONDS = config(
     "CHECKOUT_PROCESSING_TIMEOUT_SECONDS", default=60, cast=int

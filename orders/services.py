@@ -506,7 +506,11 @@ def checkout_attempt_result(attempt):
         "status": attempt.status,
     }
     if attempt.status == CheckoutAttemptStatus.SUCCEEDED:
-        return {**body, "checkout_url": attempt.checkout_url}, 201
+        return {
+            **body,
+            "checkout_url": attempt.checkout_url,
+            "reservation_expires_at": attempt.order.reservation_expires_at,
+        }, 201
     if attempt.status == CheckoutAttemptStatus.UNCERTAIN:
         return {
             **body,
