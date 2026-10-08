@@ -470,6 +470,5 @@ class CheckoutCalculationSerializer(serializers.Serializer):
     subtotal = serializers.DecimalField(max_digits=10, decimal_places=2)
     shipping_cost = serializers.DecimalField(max_digits=10, decimal_places=2)
     discount_amount = serializers.DecimalField(max_digits=10, decimal_places=2)
-    # Cupom aplicado (digitado ou automático), ou null.
     coupon = CheckoutCouponSerializer(source="snapshot.coupon", allow_null=True)
     total_amount = serializers.DecimalField(max_digits=10, decimal_places=2)

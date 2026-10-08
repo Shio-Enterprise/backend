@@ -146,8 +146,7 @@ def _get_checkout_contents(
             }
         )
 
-    # Por último: com lock=True, a trava do cupom vem depois de todas as
-    # outras (usuário, carrinho, produtos, drops, itens e endereço).
+    # A trava do cupom é sempre a última, para não inverter a ordem de locks.
     coupon_result = resolve_coupon(user, items, subtotal, coupon_code, lock=lock)
     destination = address.zip_code.replace("-", "").strip()
     if len(destination) != 8 or not destination.isdigit():
@@ -285,11 +284,7 @@ def _shipping_quote_snapshot(contents):
 
 
 def raise_coupon_error(contents):
-    """Recusa a compra quando o cupom digitado não vale.
-
-    O código do erro vai explícito no corpo, porque o DRF não serializa o
-    `code=` do ValidationError: {"coupon_code": [mensagem], "code": "..."}.
-    """
+    # "code" vai explícito no corpo: o DRF não serializa o code= do erro.
     error = contents["coupon_error"]
     if error:
         raise ValidationError(
@@ -299,11 +294,7 @@ def raise_coupon_error(contents):
 
 
 def create_shipping_quote(user, address_id, coupon_code=""):
-    """Persiste o cálculo do servidor sem criar pedido ou reservar estoque.
-
-    Com `coupon_code`, só esse cupom é considerado; se ele não vale, a
-    cotação é recusada em vez de sair sem desconto.
-    """
+    """Persiste o cálculo do servidor sem criar pedido ou reservar estoque."""
     ttl = settings.SHIPPING_QUOTE_TTL_SECONDS
     if isinstance(ttl, bool) or not isinstance(ttl, int) or ttl <= 0:
         raise ImproperlyConfigured(
@@ -382,8 +373,7 @@ def validate_shipping_quote(user, quote_id, cart_id, address_id, *, lock=False):
     except ValidationError:
         contents, matches = None, False
     if contents is not None and contents["coupon_error"]:
-        # O cupom digitado deixou de valer depois da cotação (desativado,
-        # esgotado, vencido): erro específico em vez de "a compra mudou".
+        # Cupom deixou de valer após a cotação: erro específico, não "a compra mudou".
         ShippingQuote.objects.filter(pk=quote.pk, invalidated_at__isnull=True).update(
             invalidated_at=timezone.now()
         )
@@ -893,8 +883,6 @@ def get_cart_data(request):
                     "is_sellable": is_product_sellable(item.variation.product),
                 }
             )
-        # Prévia sem código digitado e sem trava: só o cupom automático. A
-        # aplicação que vale é a do checkout.
         auto_coupon = resolve_coupon(request.user, coupon_items, subtotal)
         return {
             "id": cart.id,

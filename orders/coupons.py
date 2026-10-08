@@ -1,8 +1,7 @@
-"""Regras de cupons: uso derivado dos pedidos, validação e cálculo do desconto.
+"""Cupons: uso derivado dos pedidos, validação e cálculo do desconto.
 
-Não existe contador de usos no Coupon: um cupom foi usado quando há um
-pedido válido com ele. Assim, quando um pedido é cancelado (inclusive por
-reserva vencida), o uso volta sem precisar sincronizar nada.
+Não há contador de usos: o uso é um pedido válido com o cupom, então volta
+sozinho quando o pedido é cancelado.
 """
 
 from dataclasses import dataclass
@@ -20,8 +19,7 @@ from orders.models import (
 )
 from orders.money import normalize_money
 
-# Códigos de erro devolvidos por resolve_coupon, na ordem em que são
-# verificados. São o contrato com o frontend.
+# Na ordem em que são verificados. São o contrato com o frontend.
 COUPON_ERROR_MESSAGES = {
     "coupon_not_found": "Cupom não encontrado.",
     "coupon_inactive": "Este cupom não está mais disponível.",
@@ -38,29 +36,24 @@ COUPON_ERROR_MESSAGES = {
 @dataclass(frozen=True)
 class CouponResult:
     coupon: Coupon | None
-    discount: Decimal  # sempre entre 0 e o subtotal, já normalizado
-    error_code: str | None  # None quando deu certo ou quando não havia código
-    error_message: str | None  # em português, para mostrar ao cliente
+    discount: Decimal
+    error_code: str | None  # None também quando não havia código
+    error_message: str | None
 
 
 NO_COUPON = CouponResult(None, Decimal("0.00"), None, None)
 
 
 def valid_order_q(prefix=""):
-    """Filtro de pedido que conta como compra: qualquer pedido não cancelado.
+    """Pedido válido: qualquer pedido não cancelado.
 
-    Pedido aguardando pagamento com a reserva já vencida continua contando
-    até ser cancelado. Se deixasse de contar, o cliente poderia usar o cupom
-    de novo e depois pagar o link antigo, que o webhook ainda aceita.
-
-    `prefix` permite usar a mesma regra a partir de outro modelo, por
-    exemplo `Count("orders", filter=valid_order_q("orders__"))` no Coupon.
+    Reserva vencida ainda conta até o cancelamento: senão o cliente poderia
+    reusar o cupom e pagar o link antigo, que o webhook ainda aceita.
     """
     return ~Q(**{f"{prefix}status": OrderStatus.CANCELED})
 
 
 def count_coupon_uses(coupon, user=None):
-    """Quantos pedidos válidos usaram o cupom, no total ou só os do usuário."""
     orders = CustomerOrder.objects.filter(valid_order_q(), coupon=coupon)
     if user is not None:
         orders = orders.filter(user=user)
@@ -70,16 +63,11 @@ def count_coupon_uses(coupon, user=None):
 def resolve_coupon(user, items, subtotal, code=None, *, lock=False):
     """Decide qual cupom vale para o carrinho e quanto ele desconta.
 
-    `items` são os dicionários montados por _get_checkout_contents (cada um
-    com `variation` e `total_price`). Sem código, aplica o primeiro cupom
-    automático (auto_apply) para o qual o cliente é elegível, sem erro se
-    nenhum servir. Com código, só ele é avaliado: se for inválido, o erro é
-    devolvido em vez de cair para o automático.
+    Sem código, aplica o primeiro cupom automático elegível. Com código, só
+    ele é avaliado e o erro não cai para o automático.
 
-    Com `lock=True` (checkout), a linha do cupom é travada antes de contar
-    os usos, como última trava da sequência do checkout: duas compras
-    disputando o último uso ficam em fila. O chamador já deve ter travado o
-    usuário, o que serializa a regra de primeira compra.
+    lock=True trava o cupom antes de contar os usos; quem chama já deve ter
+    travado o usuário (regra de primeira compra).
     """
     code = normalize_coupon_code(code) if code else ""
     if not user.is_authenticated:
@@ -125,8 +113,7 @@ def _evaluate(coupon, user, items, subtotal, now):
         return _error("coupon_min_value", missing=missing)
 
     restricted, eligible = _eligible_items(coupon, items)
-    # Só cupom restrito a drops ou categorias pode "não servir" para o
-    # carrinho; sem restrição, carrinho vazio é apenas desconto zero.
+    # Sem restrição, carrinho vazio é só desconto zero, não erro.
     if restricted and not eligible:
         return _error("coupon_not_applicable")
     # Contagens por último: fazem consulta extra e dependem da trava.
@@ -147,16 +134,14 @@ def _evaluate(coupon, user, items, subtotal, now):
         if coupon.max_discount_amount is not None:
             discount = min(discount, coupon.max_discount_amount)
     else:
-        # O fixo nunca passa da base elegível: R$ 50 "só camisetas" não
-        # desconta da calça que está no mesmo carrinho.
+        # O fixo nunca passa da base elegível.
         discount = min(coupon.discount_value, base)
     discount = normalize_money(min(subtotal, max(Decimal("0.00"), discount)))
     return CouponResult(coupon, discount, None, None)
 
 
 def _eligible_items(coupon, items):
-    """Devolve (restrito, itens no escopo). Sem drops nem categorias, todos
-    os itens; senão, os de um dos drops ou de uma das categorias do cupom."""
+    """Devolve (restrito, itens no escopo do cupom)."""
     drop_ids = set(coupon.drops.values_list("id", flat=True))
     category_ids = set(coupon.categories.values_list("id", flat=True))
     if not drop_ids and not category_ids:
