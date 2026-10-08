@@ -5,6 +5,11 @@ from django.contrib.auth.models import AbstractUser
 from django.db import models
 from django.utils.translation import gettext_lazy as _
 
+from .admin_permissions import (
+    ADMIN_PERMISSION_DEFINITIONS,
+    assign_default_admin_permissions,
+)
+
 
 class UserManager(BaseUserManager):
     use_in_migrations = True
@@ -90,6 +95,24 @@ class User(AbstractUser):
         verbose_name = "Utilizador"
         verbose_name_plural = "Utilizadores"
         ordering = ["-created_at"]
+        permissions = [
+            (codename, name)
+            for codename, name, _label, _description in ADMIN_PERMISSION_DEFINITIONS
+        ]
+
+    def save(self, *args, **kwargs):
+        was_staff = False
+        if self.pk:
+            was_staff = (
+                type(self)
+                .objects.filter(pk=self.pk)
+                .values_list("is_staff", flat=True)
+                .first()
+                or False
+            )
+        super().save(*args, **kwargs)
+        if self.is_staff and not was_staff:
+            assign_default_admin_permissions(self)
 
     def __str__(self):
         return f"{self.name} <{self.email}>"
@@ -126,6 +149,19 @@ class UserProfile(models.Model):
     )
     updated_at = models.DateTimeField(auto_now=True)
 
+    def save(self, *args, **kwargs):
+        previous_role = None
+        if self.pk:
+            previous_role = (
+                type(self)
+                .objects.filter(pk=self.pk)
+                .values_list("role", flat=True)
+                .first()
+            )
+        super().save(*args, **kwargs)
+        if self.role == UserRole.ADMIN and previous_role != UserRole.ADMIN:
+            assign_default_admin_permissions(self.user)
+
     def __str__(self):
         return f"Perfil de {self.user.email}"
 
@@ -147,3 +183,14 @@ class Address(models.Model):
 
     def __str__(self):
         return f"{self.title} - {self.user.email}"
+
+
+class NewsletterSubscriber(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    email = models.EmailField(unique=True, verbose_name="Email")
+    consent_lgpd = models.BooleanField(default=False, verbose_name="Consentimento LGPD")
+    subscribed_at = models.DateTimeField(auto_now_add=True)
+    unsubscribed_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self):
+        return self.email

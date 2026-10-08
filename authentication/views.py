@@ -1,31 +1,54 @@
 import logging
+from decimal import Decimal
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.contrib.auth.tokens import default_token_generator
 from django.db import models
-from django.db.models import Count, Max, Sum
+from django.db.models import (
+    Count,
+    F,
+    IntegerField,
+    Max,
+    OuterRef,
+    Q,
+    Subquery,
+    Sum,
+    Value,
+)
 from django.db.models.functions import Coalesce
-from django_filters.rest_framework import DjangoFilterBackend
+from django.utils.encoding import force_bytes, force_str
+from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from drf_spectacular.utils import (
     OpenApiExample,
     OpenApiResponse,
     extend_schema,
 )
-from rest_framework import filters, status, viewsets
+from rest_framework import filters, mixins, status, viewsets
+from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from authentication.signals import google_login_completed
+from notifications.email import send_email
+from orders.models import CustomerOrder, OrderStatus, PaymentStatus
 
-from .permissions import IsStaffOrSuperUser
+from .admin_permissions import serialized_permission_definitions
+from .models import NewsletterSubscriber, UserRole
+from .permissions import CanManageAdminPermissions, CanManageCustomers
 from .serializers import (
     AddressSerializer,
+    AdminAccountSerializer,
     CustomerCRMDetailSerializer,
     CustomerCRMSerializer,
     GoogleAuthSerializer,
     LogoutInputSerializer,
+    NewsletterSubscribeSerializer,
     PasswordLoginSerializer,
+    PasswordResetConfirmSerializer,
+    PasswordResetRequestSerializer,
     RegisterSerializer,
     TokenRefreshInputSerializer,
     UserSerializer,
@@ -514,9 +537,8 @@ class AddressDetailView(APIView):
 class CustomerCRMViewSet(viewsets.ReadOnlyModelViewSet):
     """UC07 – Gerenciar Clientes (CRM)"""
 
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageCustomers]
     filter_backends = [
-        DjangoFilterBackend,
         filters.OrderingFilter,
         filters.SearchFilter,
     ]
@@ -530,26 +552,47 @@ class CustomerCRMViewSet(viewsets.ReadOnlyModelViewSet):
     ]
     ordering = ["-created_at"]
 
-    filterset_fields = {
-        "created_at": ["gte", "lte", "exact"],
-    }
-
     def get_queryset(self):
+        base_orders = CustomerOrder.objects.filter(user=OuterRef("pk"))
+
+        sales_orders = base_orders.filter(
+            status=OrderStatus.DELIVERED,
+            payment__status=PaymentStatus.PAID,
+        ).distinct()
+        refunded_orders = base_orders.filter(
+            payment__status=PaymentStatus.REFUNDED
+        ).distinct()
+        money_field = models.DecimalField(max_digits=14, decimal_places=2)
+        sales_group = sales_orders.values("user")
+        refund_group = refunded_orders.values("user")
         qs = User.objects.filter(profile__role="CUSTOMER").annotate(
-            total_orders=Count("orders"),
-            total_spent=Coalesce(
-                Sum("orders__total_amount"), 0.0, output_field=models.DecimalField()
+            total_orders=Coalesce(
+                Subquery(sales_group.annotate(value=Count("id")).values("value")[:1]),
+                Value(0),
+                output_field=IntegerField(),
             ),
-            last_purchase_date=Max("orders__created_at"),
+            positive_spent=Coalesce(
+                Subquery(
+                    sales_group.annotate(value=Sum("total_amount")).values("value")[:1]
+                ),
+                Value(Decimal("0")),
+                output_field=money_field,
+            ),
+            refunded_spent=Coalesce(
+                Subquery(
+                    refund_group.annotate(value=Sum("total_amount")).values("value")[:1]
+                ),
+                Value(Decimal("0")),
+                output_field=money_field,
+            ),
+            total_spent=F("positive_spent") - F("refunded_spent"),
+            last_purchase_date=Subquery(
+                sales_group.annotate(value=Max("payment__paid_at")).values("value")[:1]
+            ),
         )
 
-        min_freq = self.request.query_params.get("min_frequency")
-        max_freq = self.request.query_params.get("max_frequency")
-
-        if min_freq is not None:
-            qs = qs.filter(total_orders__gte=min_freq)
-        if max_freq is not None:
-            qs = qs.filter(total_orders__lte=max_freq)
+        if self.request.query_params.get("customer"):
+            qs = qs.filter(id=self.request.query_params["customer"])
 
         return qs
 
@@ -557,3 +600,142 @@ class CustomerCRMViewSet(viewsets.ReadOnlyModelViewSet):
         if self.action == "retrieve":
             return CustomerCRMDetailSerializer
         return CustomerCRMSerializer
+
+
+class AdminAccountViewSet(
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.UpdateModelMixin,
+    viewsets.GenericViewSet,
+):
+    """Lista administradores e gerencia as permissões funcionais do painel."""
+
+    permission_classes = [CanManageAdminPermissions]
+    serializer_class = AdminAccountSerializer
+    pagination_class = None
+    http_method_names = ["get", "patch", "head", "options"]
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ["name", "email"]
+    ordering_fields = ["name", "email", "created_at"]
+    ordering = ["name", "email"]
+
+    def get_queryset(self):
+        return (
+            User.objects.filter(
+                Q(is_staff=True)
+                | Q(is_superuser=True)
+                | Q(profile__role=UserRole.ADMIN)
+            )
+            .distinct()
+            .order_by(*self.ordering)
+        )
+
+    @action(detail=False, methods=["get"], url_path="permissions")
+    def permissions(self, request):
+        return Response({"results": serialized_permission_definitions()})
+
+
+class NewsletterSubscribeView(APIView):
+    """Inscrição pública na newsletter, com consentimento LGPD obrigatório."""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+    serializer_class = NewsletterSubscribeSerializer
+
+    def post(self, request):
+        serializer = NewsletterSubscribeSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        email = serializer.validated_data["email"]
+        # get_or_create em vez de filter().first() + create(): duas requisições
+        # concorrentes com o mesmo e-mail novo passariam ambas pela checagem e a
+        # segunda estouraria IntegrityError (500) na coluna única `email`.
+        subscriber, created = NewsletterSubscriber.objects.get_or_create(
+            email=email, defaults={"consent_lgpd": True}
+        )
+
+        if not created:
+            # Ao reenviar o formulário o usuário reconsente explicitamente:
+            # reativa a inscrição independentemente do consent_lgpd atual.
+            changed = (
+                not subscriber.consent_lgpd or subscriber.unsubscribed_at is not None
+            )
+            if changed:
+                subscriber.consent_lgpd = True
+                subscriber.unsubscribed_at = None
+                subscriber.save(update_fields=["consent_lgpd", "unsubscribed_at"])
+            return Response(
+                {"message": "E-mail já inscrito."}, status=status.HTTP_200_OK
+            )
+
+        return Response(
+            {"message": "Inscrito com sucesso!"}, status=status.HTTP_201_CREATED
+        )
+
+
+class PasswordResetRequestView(APIView):
+    """Solicita redefinição de senha."""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        serializer = PasswordResetRequestSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        email = serializer.validated_data["email"]
+        user = User.objects.filter(email=email).first()
+
+        if user:
+            uid = urlsafe_base64_encode(force_bytes(user.pk))
+            token = default_token_generator.make_token(user)
+            reset_url = f"{settings.FRONTEND_URL}/reset-password/{uid}/{token}"
+
+            send_email(
+                to=user.email,
+                subject="Redefinição de Senha — Shio",
+                template="password_reset",
+                context={"nome": user.name, "reset_url": reset_url},
+            )
+
+        # Retornamos sucesso independente do user existir para não vazar e-mails cadastrados.
+        return Response(
+            {"message": "Se o e-mail existir, enviamos as instruções."},
+            status=status.HTTP_200_OK,
+        )
+
+
+class PasswordResetConfirmView(APIView):
+    """Confirma a nova senha."""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        serializer = PasswordResetConfirmSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        uidb64 = serializer.validated_data["uidb64"]
+        token = serializer.validated_data["token"]
+        new_password = serializer.validated_data["new_password"]
+
+        try:
+            uid = force_str(urlsafe_base64_decode(uidb64))
+            user = User.objects.get(pk=uid)
+        except (TypeError, ValueError, OverflowError, User.DoesNotExist):
+            user = None
+
+        if user is not None and default_token_generator.check_token(user, token):
+            user.set_password(new_password)
+            user.save()
+            return Response(
+                {"message": "Senha redefinida com sucesso!"}, status=status.HTTP_200_OK
+            )
+        else:
+            return Response(
+                {"error": "O link de redefinição é inválido ou expirou."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )

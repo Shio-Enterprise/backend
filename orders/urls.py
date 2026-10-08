@@ -9,6 +9,11 @@ from .views import (
     CartItemAddAPIView,
     CartItemDetailAPIView,
     CheckoutAPIView,
+    CheckoutCalculationView,
+    DashboardDetailView,
+    DashboardDrillDownView,
+    DashboardDropRevenueView,
+    InfinitePayWebhookView,
     OrderDispatchView,
     OrderTrackingView,
     PaymentSuccessRedirectView,
@@ -19,8 +24,27 @@ from .views import (
 app_name = "orders"
 
 urlpatterns = [
+    path(
+        "infinitepay/webhook/",
+        InfinitePayWebhookView.as_view(),
+        name="infinitepay-webhook",
+    ),
     path("dashboard/summary/", AdminDashboardView.as_view(), name="dashboard_summary"),
+    path("dashboard/detail/", DashboardDetailView.as_view(), name="dashboard_detail"),
+    path(
+        "dashboard/orders/", DashboardDrillDownView.as_view(), name="dashboard_orders"
+    ),
+    path(
+        "dashboard/drop-revenue/",
+        DashboardDropRevenueView.as_view(),
+        name="dashboard_drop_revenue",
+    ),
     path("checkout/", CheckoutAPIView.as_view(), name="checkout"),
+    path(
+        "checkout/calculate/",
+        CheckoutCalculationView.as_view(),
+        name="checkout-calculate",
+    ),
     path(
         "pagamento-sucesso/",
         PaymentSuccessRedirectView.as_view(),

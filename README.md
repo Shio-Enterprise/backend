@@ -9,6 +9,13 @@ Este repositório contém o backend Django da aplicação, com autenticação JW
 - Python 3.9+
 - Docker e Docker Compose
 
+## Decisões funcionais
+
+- [DF-001: preços, variações, duplicação e estoque](docs/decisions/DF-001-produtos-precos-estoque.md)
+- [Issue técnica derivada da DF-001 (texto preparado)](docs/issues/IT-001-produtos-precos-estoque.md)
+
+- [Implementação da DF-001: uso, migração e validação](docs/IMPLEMENTACAO-DF-001.md)
+
 ## Dependências
 
 As dependências do projeto estão em `requirements.txt`.
@@ -52,6 +59,7 @@ Todos os targets rodam dentro do container `backend`:
 | `make lint` | Verifica `ruff check` + `ruff format` (sem alterar arquivos) |
 | `make format` | Corrige com `ruff --fix` e formata com `ruff format` |
 | `make schema-validate` | Valida o schema OpenAPI (`spectacular --validate --fail-on-warn`) |
+| `make expire` | Libera reservas de estoque vencidas (`make expire ARGS=--dry-run` só lista) |
 | `make ci` | **Gate de PR:** `lint` + `test` + `schema-validate` |
 | `make install` | Reinstala `requirements.txt` no container |
 
@@ -73,6 +81,29 @@ O container já executa as migrações e cria o administrador automaticamente.
 - `DJANGO_SECRET_KEY`: chave secreta do Django.
 - `GOOGLE_CLIENT_ID`: client ID do OAuth do Google usado para validar `id_token`.
 - `ADMIN_NAME`, `ADMIN_PASS`, `ADMIN_EMAIL`: credenciais para o superusuário inicial.
+- `RESEND_API_KEY`, `DEFAULT_FROM_EMAIL`: envio de e-mails (veja [E-mails](#e-mails)).
+- `STOCK_RESERVATION_TTL_MINUTES`, `STOCK_RESERVATION_GRACE_SECONDS`, `RESERVATION_SWEEP_INTERVAL_SECONDS`: prazos da reserva de estoque (veja [Reserva de estoque](#reserva-de-estoque)).
+
+
+## Reserva de estoque
+
+Ao finalizar a compra, o pedido nasce `AWAITING_PAYMENT` e o estoque já é baixado, com prazo de `STOCK_RESERVATION_TTL_MINUTES` (padrão 30) em `reservation_expires_at`. Se o pagamento não for confirmado no prazo, o pedido é cancelado e o estoque devolvido.
+
+O projeto não tem fila de tarefas, então a liberação roda nas próprias requisições:
+
+- Ao abrir o detalhe do pedido (cliente ou admin).
+- Antes de validar o estoque no carrinho, na cotação e no checkout, só para as variações envolvidas.
+- Numa varredura em lote na listagem pública de produtos e no carrinho, no máximo uma vez a cada `RESERVATION_SWEEP_INTERVAL_SECONDS` (padrão 60) por processo. É ela que devolve ao catálogo um produto esgotado por reserva abandonada.
+
+A liberação automática espera `STOCK_RESERVATION_GRACE_SECONDS` (padrão 120) além do prazo, para não pegar quem está pagando no último instante. Pagamento confirmado depois da liberação mantém o pedido `CANCELED`, com o pagamento `PAID`.
+
+Para liberar sem depender de tráfego (por exemplo, num cron):
+
+```bash
+make expire                  # libera até 100 reservas vencidas
+make expire ARGS=--dry-run   # só lista o que seria liberado
+python manage.py expire_stale_orders --batch-size 200
+```
 
 ## Integração com os Correios
 
@@ -115,6 +146,54 @@ As variáveis de ambiente são definidas no painel do Railway, em **Variables**
   ```
 
   Após salvar, o Railway faz o redeploy automaticamente.
+
+## E-mails
+
+O backend envia e-mails pelo [Resend](https://resend.com) usando a API HTTPS
+(via `django-anymail`). Não usamos SMTP porque o Railway bloqueia SMTP de saída
+nos planos Free/Trial/Hobby.
+
+### Desenvolvimento e testes
+
+- Sem `RESEND_API_KEY`, nenhum e-mail é enviado: o conteúdo aparece no console
+  (logs do `docker compose`).
+- Os testes usam o backend em memória do Django; nada sai da máquina.
+
+### Configuração em produção (Railway)
+
+1. Crie uma conta no Resend e adicione o domínio da loja em **Domains**.
+2. Cadastre no DNS do domínio os registros SPF e DKIM indicados pelo Resend e
+   aguarde a verificação.
+3. Gere uma API key com permissão **Sending access**, restrita ao domínio.
+4. No Railway, em **Variables**, defina:
+   - `RESEND_API_KEY`: a chave gerada.
+   - `DEFAULT_FROM_EMAIL`: remetente, ex.: `Shio <nao-responda@seudominio.com.br>`
+     (precisa ser do domínio verificado).
+5. Após o deploy, valide o envio:
+
+```bash
+python manage.py enviar_email_teste seu-email@exemplo.com
+```
+
+Se a chave não estiver definida em produção, o log do boot mostra
+`RESEND_API_KEY ausente: e-mails não serão enviados, apenas exibidos no log.`
+
+### Enviando e-mail em uma nova funcionalidade
+
+Use sempre `send_email`; ele nunca lança exceção (falhas vão para o log e a
+função retorna `False`), então não interrompe a ação do usuário.
+
+```python
+from notifications.email import send_email
+
+send_email(
+    user.email, "Seu pedido foi confirmado", "pedido_confirmado", {"pedido": order}
+)
+```
+
+Crie o par de templates em `notifications/templates/emails/`
+(`pedido_confirmado.html` e `pedido_confirmado.txt`), estendendo
+`emails/base.html` e `emails/base.txt` e preenchendo `{% block content %}`.
 
 ## Google Auth
 

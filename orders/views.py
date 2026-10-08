@@ -1,23 +1,34 @@
 import datetime
 import logging
+from decimal import Decimal
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.db import transaction
-from django.db.models import Sum
-from django.http import Http404
-from django.utils import timezone
+from django.db import DatabaseError, transaction
+from django.db.models import Count, DecimalField, ExpressionWrapper, F, Q, Sum
+from django.db.models.functions import TruncDay, TruncMonth
+from django.http import Http404, HttpResponseRedirect
+from django.utils.decorators import method_decorator
 from drf_spectacular.utils import (
     OpenApiParameter,
+    OpenApiResponse,
     OpenApiTypes,
     extend_schema,
     inline_serializer,
 )
 from rest_framework import serializers, status
+from rest_framework.exceptions import ValidationError
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from authentication.permissions import IsStaffOrSuperUser
+from authentication.permissions import (
+    CanAccessAdminDashboard,
+    CanManageOrders,
+    user_has_admin_permission,
+)
 from products.models import ProductVariation
 
 from .correios import (
@@ -27,36 +38,192 @@ from .correios import (
     dispatch_order_and_get_tracking_code,
     get_order_tracking_data,
 )
+from .dashboard_aggregates import dashboard_detail_aggregates
+from .dashboard_drilldown import DETAIL_FILTERS, ORDER_METRICS, dashboard_order_queryset
+from .expiration import (
+    cart_variation_ids,
+    release_quietly,
+    sweep_expired_reservations,
+)
+from .metrics import (
+    METRICS_TIMEZONE,
+    is_recurring_customer,
+    metric_orders,
+    positive_sales,
+    refunds,
+    resolve_period,
+    sale_items,
+)
 from .models import (
-    Cart,
     CustomerOrder,
-    OrderItem,
     OrderStatus,
-    OrderStatusLog,
+    PaymentMethod,
     PaymentStatus,
 )
 from .serializers import (
     CartItemAddSerializer,
     CartItemUpdateSerializer,
     CartRepresentationSerializer,
+    CheckoutCalculationInputSerializer,
+    CheckoutCalculationSerializer,
+    CheckoutInputSerializer,
+    DashboardDetailSerializer,
     DashboardLowStockSerializer,
+    DashboardOrderDrillDownSerializer,
+    DashboardOrderPageSerializer,
     DashboardRecentOrderSerializer,
     OrderDetailSerializer,
     OrderStatusUpdateSerializer,
+    PaymentReturnSerializer,
+    PaymentWebhookSerializer,
 )
 from .services import (
     add_item_to_cart,
-    check_payment_status,
     clear_cart,
-    create_infinitepay_checkout,
+    complete_checkout_attempt,
+    confirm_infinitepay_payment,
+    create_shipping_quote,
     get_cart_data,
+    prepare_checkout_attempt,
+    release_if_expired,
     remove_item_from_cart,
+    restore_order_stock,
     update_item_quantity,
     update_status,
+    update_tracking_code,
 )
 
 User = get_user_model()
 logger = logging.getLogger(__name__)
+
+METRIC_PARAMETERS = [
+    OpenApiParameter(
+        "period", OpenApiTypes.STR, description="monthly (30 dias, padrão) ou annual"
+    ),
+    OpenApiParameter(
+        "start_date",
+        OpenApiTypes.DATE,
+        description="Início inclusivo em America/Sao_Paulo",
+    ),
+    OpenApiParameter(
+        "end_date", OpenApiTypes.DATE, description="Fim inclusivo em America/Sao_Paulo"
+    ),
+    OpenApiParameter("drop", OpenApiTypes.UUID, description="ID do drop"),
+    OpenApiParameter("category", OpenApiTypes.UUID, description="ID da categoria"),
+    OpenApiParameter("customer", OpenApiTypes.INT, description="ID inteiro do cliente"),
+    OpenApiParameter(
+        "search",
+        OpenApiTypes.STR,
+        description="Busca única por cliente/e-mail, produto, drop ou categoria",
+    ),
+]
+
+DETAIL_PARAMETERS = [
+    OpenApiParameter(
+        "period",
+        OpenApiTypes.STR,
+        enum=["monthly", "annual"],
+        description="monthly = 30 dias móveis (padrão); annual = 365 dias móveis.",
+    ),
+    OpenApiParameter(
+        "start_date",
+        OpenApiTypes.DATE,
+        description="Início inclusivo no fuso America/Sao_Paulo.",
+    ),
+    OpenApiParameter(
+        "end_date",
+        OpenApiTypes.DATE,
+        description="Fim inclusivo no fuso America/Sao_Paulo.",
+    ),
+    OpenApiParameter(
+        "drop",
+        OpenApiTypes.UUID,
+        description="ID do drop atual. Com categoria, exige o mesmo item.",
+    ),
+    OpenApiParameter(
+        "category",
+        OpenApiTypes.UUID,
+        description="ID da categoria atual. Com drop, exige o mesmo item.",
+    ),
+]
+
+DRILLDOWN_PARAMETERS = METRIC_PARAMETERS + [
+    OpenApiParameter(
+        "metric",
+        OpenApiTypes.STR,
+        enum=sorted(ORDER_METRICS),
+        description="População da métrica; all preserva o drill-down anterior.",
+    ),
+    OpenApiParameter(
+        "status",
+        OpenApiTypes.STR,
+        enum=OrderStatus.values,
+        description="Obrigatório para metric=status.",
+    ),
+    OpenApiParameter(
+        "payment_method",
+        OpenApiTypes.STR,
+        enum=PaymentMethod.values,
+        description="Obrigatório para metric=payment_method.",
+    ),
+    OpenApiParameter(
+        "product_id",
+        OpenApiTypes.UUID,
+        description=(
+            "Obrigatório para product_units/product_revenue, salvo unclassified=true."
+        ),
+    ),
+    OpenApiParameter(
+        "unclassified",
+        OpenApiTypes.BOOL,
+        description=(
+            "Seleciona itens sem produto, drop ou categoria atual em métricas de itens."
+        ),
+    ),
+    OpenApiParameter("page", OpenApiTypes.INT, description="Página, iniciando em 1."),
+]
+
+
+class DashboardDetailView(APIView):
+    """Agregados completos para a página administrativa de análise detalhada."""
+
+    permission_classes = [CanAccessAdminDashboard]
+
+    @extend_schema(
+        description=(
+            "Vendas válidas: pedido DELIVERED e pagamento PAID; reembolsos: "
+            "pagamento REFUNDED. Financeiro e séries usam payment.paid_at em "
+            "America/Sao_Paulo; receita líquida = total_amount das vendas válidas "
+            "menos total_amount dos reembolsos; ticket = líquido / vendas válidas "
+            "(zero sem vendas). Pedidos por status incluem todos os pedidos e usam "
+            "CustomerOrder.created_at. Drops e categorias selecionam pedidos que "
+            "tenham um mesmo item correspondente; rankings e distribuições somam "
+            "somente esses itens por quantity × unit_price, sem rateio de frete ou "
+            "desconto. Classificações históricas dependem dos vínculos atuais do "
+            "catálogo; itens sem vínculo aparecem como Sem classificação. "
+            "Cadastros usam User.created_at; total_registered é global e não recebe "
+            "filtro de catálogo. Recorrência exige compras válidas em dois drops "
+            "consecutivos no histórico filtrado. Estoque é saldo atual, independente "
+            "do período. Rankings têm até 10 produtos; attention tem até 50 "
+            "variações, enquanto as contagens abrangem todas. Valores monetários "
+            "são strings decimais em reais; contagens são unidades ou pedidos."
+        ),
+        parameters=DETAIL_PARAMETERS,
+        responses={
+            200: DashboardDetailSerializer,
+            400: OpenApiResponse(description="Período, data ou UUID inválido."),
+            401: OpenApiResponse(description="Autenticação necessária."),
+            403: OpenApiResponse(description="Acesso administrativo necessário."),
+        },
+    )
+    def get(self, request):
+        params = {
+            name: request.query_params[name]
+            for name in DETAIL_FILTERS
+            if request.query_params.get(name)
+        }
+        payload = DashboardDetailSerializer(dashboard_detail_aggregates(params)).data
+        return Response(payload)
 
 
 class AdminDashboardView(APIView):
@@ -66,10 +233,15 @@ class AdminDashboardView(APIView):
     Restrito a is_staff ou is_superuser.
     """
 
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanAccessAdminDashboard]
 
     @extend_schema(
-        description="Endpoint consolidado para o Dashboard Administrativo (UC05).",
+        description=(
+            "Dashboard comercial. Venda positiva exige pagamento PAID e pedido "
+            "DELIVERED; reembolsos subtraem CustomerOrder.total_amount. A competência "
+            "é payment.paid_at em America/Sao_Paulo."
+        ),
+        parameters=METRIC_PARAMETERS,
         responses={
             200: inline_serializer(
                 name="DashboardSummaryResponse",
@@ -79,6 +251,12 @@ class AdminDashboardView(APIView):
                         fields={
                             "period_days": serializers.IntegerField(),
                             "total_revenue": serializers.DecimalField(
+                                max_digits=10, decimal_places=2
+                            ),
+                            "gross_revenue": serializers.DecimalField(
+                                max_digits=10, decimal_places=2
+                            ),
+                            "refunds": serializers.DecimalField(
                                 max_digits=10, decimal_places=2
                             ),
                             "total_orders": serializers.IntegerField(),
@@ -92,8 +270,11 @@ class AdminDashboardView(APIView):
                         fields={
                             "total_registered": serializers.IntegerField(),
                             "new_in_period": serializers.IntegerField(),
+                            "recurring_customers": serializers.IntegerField(),
                         },
                     ),
+                    "period": serializers.DictField(),
+                    "series": serializers.ListField(child=serializers.DictField()),
                     "recent_orders": DashboardRecentOrderSerializer(many=True),
                     "low_stock_alerts": DashboardLowStockSerializer(many=True),
                 },
@@ -101,64 +282,220 @@ class AdminDashboardView(APIView):
         },
     )
     def get(self, request):
-        thirty_days_ago = timezone.now() - datetime.timedelta(days=30)
+        start, end, granularity = resolve_period(request.query_params)
+        orders = metric_orders(request.query_params, start, end)
+        sales = positive_sales(orders)
+        refunded = refunds(orders)
 
-        active_statuses = [
-            OrderStatus.PAID,
-            OrderStatus.PREPARING,
-            OrderStatus.SHIPPED,
-            OrderStatus.DELIVERED,
-        ]
-
-        valid_orders_period = CustomerOrder.objects.filter(
-            created_at__gte=thirty_days_ago,
-            status__in=active_statuses,
+        gross_revenue = sales.aggregate(total=Sum("total_amount"))["total"] or Decimal(
+            "0"
         )
-        total_revenue = (
-            valid_orders_period.aggregate(total=Sum("total_amount"))["total"] or 0
-        )
-        total_orders = valid_orders_period.count()
-        average_ticket = (
-            round(total_revenue / total_orders, 2) if total_orders > 0 else 0
-        )
+        refunded_revenue = refunded.aggregate(total=Sum("total_amount"))[
+            "total"
+        ] or Decimal("0")
+        total_revenue = gross_revenue - refunded_revenue
+        total_orders = sales.count()
+        average_ticket = total_revenue / total_orders if total_orders else Decimal("0")
 
         customer_filter = {"is_staff": False, "is_superuser": False}
-        total_clientes = User.objects.filter(**customer_filter).count()
-        novos_clientes = User.objects.filter(
-            **customer_filter,
-            created_at__gte=thirty_days_ago,
+        customers = User.objects.filter(**customer_filter)
+        if request.query_params.get("search"):
+            customers = customers.filter(id__in=orders.values("user_id"))
+        if request.query_params.get("customer"):
+            customers = customers.filter(id=request.query_params["customer"])
+        total_clientes = customers.count()
+        novos_clientes = customers.filter(
+            created_at__gte=start, created_at__lt=end
         ).count()
 
-        recent_orders_qs = (
-            CustomerOrder.objects.filter(status__in=active_statuses)
-            .select_related("user")
-            .order_by("-created_at")[:10]
+        recurring_clientes = sum(
+            1
+            for customer in customers
+            if is_recurring_customer(customer, request.query_params)
         )
+
+        recent_orders_qs = orders.select_related("user", "payment").order_by(
+            "-payment__paid_at"
+        )[:10]
         recent_orders = DashboardRecentOrderSerializer(recent_orders_qs, many=True).data
+
+        trunc = (
+            TruncMonth("payment__paid_at", tzinfo=METRICS_TIMEZONE)
+            if granularity == "month"
+            else TruncDay("payment__paid_at", tzinfo=METRICS_TIMEZONE)
+        )
+        positive_points = {
+            row["bucket"]: row
+            for row in sales.annotate(bucket=trunc)
+            .values("bucket")
+            .annotate(
+                total_orders=Count("id", distinct=True), revenue=Sum("total_amount")
+            )
+        }
+        refund_points = {
+            row["bucket"]: row["revenue"]
+            for row in refunded.annotate(bucket=trunc)
+            .values("bucket")
+            .annotate(revenue=Sum("total_amount"))
+        }
+        series = []
+        for bucket in sorted(set(positive_points) | set(refund_points)):
+            positive = positive_points.get(bucket, {})
+            net = (positive.get("revenue") or Decimal("0")) - (
+                refund_points.get(bucket) or Decimal("0")
+            )
+            series.append(
+                {
+                    "period": bucket.date().isoformat(),
+                    "total_orders": positive.get("total_orders", 0),
+                    "total_revenue": f"{net:.2f}",
+                }
+            )
 
         low_stock_qs = (
             ProductVariation.objects.filter(stock_quantity__lt=10)
             .select_related("product")
-            .order_by("stock_quantity")[:50]
+            .order_by("stock_quantity")
         )
+        search = request.query_params.get("search", "").strip()
+        if search:
+            low_stock_qs = low_stock_qs.filter(
+                Q(product__name__icontains=search)
+                | Q(product__drop__name__icontains=search)
+                | Q(product__category__name__icontains=search)
+            )
+        low_stock_qs = low_stock_qs[:50]
         low_stock_alerts = DashboardLowStockSerializer(low_stock_qs, many=True).data
 
         return Response(
             {
                 "sales_summary": {
-                    "period_days": 30,
-                    "total_revenue": total_revenue,
+                    "period_days": (end.date() - start.date()).days,
+                    "gross_revenue": gross_revenue,
+                    "refunds": refunded_revenue,
+                    "total_revenue": round(total_revenue, 2),
                     "total_orders": total_orders,
-                    "average_ticket": average_ticket,
+                    "average_ticket": round(average_ticket, 2),
                 },
                 "customers_summary": {
                     "total_registered": total_clientes,
                     "new_in_period": novos_clientes,
+                    "recurring_customers": recurring_clientes,
                 },
+                "period": {
+                    "start_date": start.date(),
+                    "end_date": (end - datetime.timedelta(microseconds=1)).date(),
+                    "granularity": granularity,
+                    "timezone": "America/Sao_Paulo",
+                },
+                "series": series,
                 "recent_orders": recent_orders,
                 "low_stock_alerts": low_stock_alerts,
             },
             status=status.HTTP_200_OK,
+        )
+
+
+class DashboardDrillDownView(APIView):
+    """Pedidos paginados que compõem o agregado selecionado."""
+
+    permission_classes = [CanAccessAdminDashboard]
+
+    @extend_schema(
+        description=(
+            "all mantém a lista comercial anterior e seus filtros customer/search. "
+            "valid_sales/gross_revenue usam vendas DELIVERED + PAID; refunds "
+            "usa pagamentos REFUNDED; net_revenue/average_ticket incluem ambos "
+            "os conjuntos que compõem o numerador. status requer status e usa "
+            "CustomerOrder.created_at, incluindo pedidos sem pagamento. "
+            "payment_method requer payment_method e usa apenas vendas válidas. "
+            "product_units/product_revenue requerem product_id; "
+            "drop_item_revenue requer drop; category_item_revenue requer category. "
+            "Em métricas de itens, unclassified=true seleciona itens sem o vínculo "
+            "atual correspondente, sem combinar com o ID da mesma dimensão. "
+            "metric_units e metric_item_revenue mostram a contribuição dos itens "
+            "selecionados por pedido; total_amount é o valor completo do pedido. "
+            "Drop e categoria juntos devem ocorrer no mesmo item. Métricas "
+            "comerciais usam payment.paid_at; status usa order.created_at. "
+            "customer e search também restringem os seletores, para preservar "
+            "os filtros do dashboard resumido. "
+            "Cadastros e estoque têm destinos próprios e não usam esta lista. "
+            "Ordenação estável por data decrescente e ID; 20 pedidos por página."
+        ),
+        parameters=DRILLDOWN_PARAMETERS,
+        responses={
+            200: DashboardOrderPageSerializer,
+            400: OpenApiResponse(
+                description="Métrica, seletor, data ou UUID inválido."
+            ),
+            401: OpenApiResponse(description="Autenticação necessária."),
+            403: OpenApiResponse(description="Acesso administrativo necessário."),
+            404: OpenApiResponse(description="Página inexistente."),
+        },
+    )
+    def get(self, request):
+        queryset, metric, date_basis = dashboard_order_queryset(request.query_params)
+        queryset = queryset.select_related("user", "payment")
+        paginator = PageNumberPagination()
+        page = paginator.paginate_queryset(queryset, request, view=self)
+        response = paginator.get_paginated_response(
+            DashboardOrderDrillDownSerializer(page, many=True).data
+        )
+        response.data["metric"] = metric
+        response.data["date_basis"] = date_basis
+        return response
+
+
+class DashboardDropRevenueView(APIView):
+    """Receita de itens por drop, deliberadamente sem frete e desconto."""
+
+    permission_classes = [CanAccessAdminDashboard]
+
+    @extend_schema(
+        description=(
+            "Soma quantity × unit_price dos OrderItem de vendas válidas. Frete e "
+            "desconto pertencem apenas à receita total e não são rateados por drop."
+        ),
+        parameters=METRIC_PARAMETERS,
+        responses={
+            200: inline_serializer(
+                name="DashboardDropRevenue",
+                many=True,
+                fields={
+                    "drop_id": serializers.UUIDField(),
+                    "drop_name": serializers.CharField(),
+                    "revenue": serializers.DecimalField(
+                        max_digits=14, decimal_places=2
+                    ),
+                },
+            )
+        },
+    )
+    def get(self, request):
+        start, end, _ = resolve_period(request.query_params)
+        item_total = ExpressionWrapper(
+            F("quantity") * F("unit_price"),
+            output_field=DecimalField(max_digits=14, decimal_places=2),
+        )
+        rows = (
+            sale_items(request.query_params, start, end)
+            .exclude(variation__product__drop__isnull=True)
+            .values(
+                "variation__product__drop_id",
+                "variation__product__drop__name",
+            )
+            .annotate(revenue=Sum(item_total))
+            .order_by("variation__product__drop__name")
+        )
+        return Response(
+            [
+                {
+                    "drop_id": row["variation__product__drop_id"],
+                    "drop_name": row["variation__product__drop__name"],
+                    "revenue": row["revenue"],
+                }
+                for row in rows
+            ]
         )
 
 
@@ -197,6 +534,7 @@ class UserOrderDetailView(APIView):
             )
         except CustomerOrder.DoesNotExist:
             return Response({"message": "Pedido não encontrado."}, status=404)
+        release_if_expired(order)
         return Response(OrderDetailSerializer(order).data, status=status.HTTP_200_OK)
 
 
@@ -206,7 +544,7 @@ class AdminOrderListView(APIView):
     Lista pedidos para o painel admin com filtro por `status`.
     """
 
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageOrders]
 
     @extend_schema(
         parameters=[
@@ -235,7 +573,7 @@ class AdminOrderDetailView(APIView):
     Recupera detalhes do pedido e permite atualização de status/tracking.
     """
 
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageOrders]
 
     @extend_schema(
         responses={200: OrderDetailSerializer},
@@ -250,6 +588,7 @@ class AdminOrderDetailView(APIView):
         except CustomerOrder.DoesNotExist:
             return Response({"message": "Pedido não encontrado."}, status=404)
 
+        release_if_expired(order)
         return Response(OrderDetailSerializer(order).data, status=status.HTTP_200_OK)
 
     @extend_schema(
@@ -287,17 +626,38 @@ class AdminOrderDetailView(APIView):
                 )
 
         # If shipping, require tracking code
-        if status_value == OrderStatus.SHIPPED and not tracking_code:
+        if status_value == OrderStatus.SHIPPED and not (
+            tracking_code or order.tracking_code
+        ):
             return Response(
                 {"message": "Tracking code obrigatório ao enviar pedido."}, status=400
             )
 
-        previous_status = order.status
-        order.status = status_value
-        if tracking_code:
-            order.tracking_code = tracking_code
+        if serializer.validated_data.get("physical_return_confirmed") and not (
+            order.status in (OrderStatus.SHIPPED, OrderStatus.DELIVERED)
+            or order.status_logs.filter(
+                new_status__in=[OrderStatus.SHIPPED, OrderStatus.DELIVERED]
+            ).exists()
+        ):
+            return Response(
+                {"message": "Retorno físico exige expedição anterior."}, status=400
+            )
 
-        order.save()
+        if order.status == OrderStatus.SHIPPED and status_value == OrderStatus.SHIPPED:
+            update_tracking_code(
+                order=order,
+                tracking_code=tracking_code,
+                changed_by=request.user,
+                comment=comment,
+            )
+        else:
+            update_status(
+                order=order,
+                new_status=status_value,
+                tracking_code=tracking_code,
+                changed_by=request.user,
+                comment=comment,
+            )
 
         if (
             status_value == OrderStatus.CANCELED
@@ -308,18 +668,49 @@ class AdminOrderDetailView(APIView):
                 order.payment.status = PaymentStatus.FAILED
                 order.payment.save()
 
-        OrderStatusLog.objects.create(
-            order=order,
-            changed_by=request.user,
-            previous_status=previous_status,
-            new_status=status_value,
-            tracking_code=tracking_code,
-            comment=comment,
-        )
+        if serializer.validated_data.get("physical_return_confirmed"):
+            restore_order_stock(order, changed_by=request.user, physical_return=True)
 
         return Response(OrderDetailSerializer(order).data, status=status.HTTP_200_OK)
 
 
+class CheckoutCalculationView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        summary="Calcular valores atuais da compra",
+        description=(
+            "Cria uma cotação com preços, frete e validade, sem criar pedido ou "
+            "reservar estoque.\n\n"
+            "`coupon_code` é opcional. Sem ele, aplica o cupom automático para o "
+            "qual o cliente for elegível (ex.: BEMVINDO10). Com ele, só esse cupom "
+            "é considerado; se não vale, responde 400 no formato "
+            '`{"coupon_code": ["Este cupom expirou."], "code": "coupon_expired"}`. '
+            "Códigos possíveis: coupon_not_found, coupon_inactive, "
+            "coupon_not_started, coupon_expired, coupon_first_purchase_only, "
+            "coupon_min_value, coupon_not_applicable, coupon_limit_reached e "
+            "coupon_user_limit_reached."
+        ),
+        request=CheckoutCalculationInputSerializer,
+        responses={
+            200: CheckoutCalculationSerializer,
+            400: OpenApiTypes.OBJECT,
+            503: OpenApiTypes.OBJECT,
+        },
+    )
+    def post(self, request):
+        serializer = CheckoutCalculationInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        release_quietly(variation_ids=cart_variation_ids(request))
+        calculation = create_shipping_quote(
+            request.user,
+            serializer.validated_data["address_id"],
+            serializer.validated_data["coupon_code"],
+        )
+        return Response(CheckoutCalculationSerializer(calculation).data)
+
+
+@method_decorator(transaction.non_atomic_requests, name="dispatch")
 class CheckoutAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -330,201 +721,125 @@ class CheckoutAPIView(APIView):
             "Gera o pedido (CustomerOrder), faz o snapshot do endereço de entrega e debita o estoque. "
             "Por fim, comunica-se com a API da InfinitePay para gerar o link de checkout.\n\n"
             "**Fluxo:**\n"
-            "1. Envie o `address_id` (UUID do endereço do perfil) e o `shipping_cost`.\n"
-            "2. O backend valida os itens e gera a cobrança.\n"
+            "1. Envie `address_id`, `shipping_quote_id` e `idempotency_key` (UUID da tentativa).\n"
+            "2. O backend valida a cotação e gera a cobrança com os valores confirmados.\n"
             "3. O utilizador é redirecionado para a `checkout_url` retornada."
         ),
-        request={
-            "application/json": {
-                "type": "object",
-                "properties": {
-                    "address_id": {
-                        "type": "string",
-                        "format": "uuid",
-                        "description": "UUID do endereço de entrega salvo no perfil",
-                    },
-                    "shipping_cost": {
-                        "type": "number",
-                        "format": "float",
-                        "description": "Valor calculado do frete (em Reais)",
-                    },
-                },
-                "required": ["address_id"],
-            }
-        },
+        request=CheckoutInputSerializer,
         responses={
             201: OpenApiTypes.OBJECT,
+            202: OpenApiTypes.OBJECT,
             400: OpenApiTypes.OBJECT,
+            409: OpenApiTypes.OBJECT,
             500: OpenApiTypes.OBJECT,
+            503: OpenApiTypes.OBJECT,
         },
     )
-    @transaction.atomic
     def post(self, request):
-        user = request.user
-        cart = (
-            Cart.objects.filter(user=user, status="ACTIVE")
-            .prefetch_related("items__variation__product")
-            .first()
-        )
-
-        if not cart or not cart.items.exists():
-            return Response(
-                {"success": False, "message": "Carrinho vazio."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        address_id = request.data.get("address_id")
-        if not address_id:
-            return Response(
-                {"success": False, "message": "Endereço não informado."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        address = user.addresses.filter(id=address_id).first()
-        if not address:
-            return Response(
-                {"success": False, "message": "Endereço inválido."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        subtotal = sum(item.quantity * item.unit_price for item in cart.items.all())
-        shipping_cost = request.data.get("shipping_cost", 0.00)
-        total_amount = float(subtotal) + float(shipping_cost)
-
-        order = CustomerOrder.objects.create(
-            user=user,
-            address=address,
-            subtotal=subtotal,
-            shipping_cost=shipping_cost,
-            total_amount=total_amount,
-            shipping_zip_code=address.zip_code,
-            shipping_street=address.street,
-            shipping_number=address.address_number,
-            shipping_complement=address.complement,
-            shipping_neighborhood=address.neighborhood,
-            shipping_city=address.city,
-            shipping_state=address.state,
-        )
-
-        for item in cart.items.all():
-            if item.variation.stock_quantity < item.quantity:
-                transaction.set_rollback(True)
-                return Response(
-                    {
-                        "success": False,
-                        "message": f"Estoque insuficiente para {item.variation.product.name}.",
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            item.variation.stock_quantity -= item.quantity
-            item.variation.save()
-
-            OrderItem.objects.create(
-                order=order,
-                variation=item.variation,
-                quantity=item.quantity,
-                unit_price=item.unit_price,
-                product_name=f"{item.variation.product.name} - {item.variation.size}",
-                sku_snapshot=item.variation.sku,
-            )
-
-        cart.status = "FINISHED"
-        cart.save()
-
+        serializer = CheckoutInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        # Antes da transação do checkout, que trava carrinho e variações.
+        release_quietly(variation_ids=cart_variation_ids(request))
         try:
-            checkout_url = create_infinitepay_checkout(order, request)
-            return Response(
-                {"success": True, "checkout_url": checkout_url},
-                status=status.HTTP_201_CREATED,
+            attempt, result = prepare_checkout_attempt(
+                request.user, **serializer.validated_data
             )
         except Exception:
-            transaction.set_rollback(True)
+            logger.exception("Falha ao preparar a tentativa de checkout.")
             return Response(
                 {
                     "success": False,
-                    "message": "Não foi possível iniciar o checkout da InfinitePay.",
+                    "message": "Não foi possível preparar o pedido. Reenvie a mesma tentativa.",
                 },
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
+        if attempt is not None:
+            result = complete_checkout_attempt(attempt, request)
+        body, response_status = result
+        headers = {"Retry-After": "3"} if response_status == 202 else {}
+        return Response(body, status=response_status, headers=headers)
 
 
 class PaymentSuccessRedirectView(APIView):
     permission_classes = [AllowAny]
+    authentication_classes = []
 
     @extend_schema(
-        summary="Confirmação de Pagamento (Redirect InfinitePay)",
+        summary="Retorno do pagamento",
         description=(
-            "Rota de fallback acessada pelo navegador do cliente após o pagamento na InfinitePay. "
-            "Recebe os parâmetros via query string, consulta o status real da transação no servidor "
-            "da InfinitePay e efetiva a baixa do pedido (muda status para PAID) caso aprovado.\n\n"
-            "⚠️ *Não envia token JWT. O front-end deve exibir uma tela de 'Processando' ao carregar esta rota.*"
+            "Redireciona o navegador para a consulta autenticada no frontend. "
+            "Esta rota nunca confirma nem altera o pagamento."
         ),
         parameters=[
             OpenApiParameter(
                 name="order_nsu",
-                type=str,
+                type=OpenApiTypes.UUID,
                 location=OpenApiParameter.QUERY,
-                description="UUID do pedido gerado no nosso sistema",
-            ),
-            OpenApiParameter(
-                name="transaction_nsu",
-                type=str,
-                location=OpenApiParameter.QUERY,
-                description="ID único da transação gerado pela InfinitePay",
-            ),
-            OpenApiParameter(
-                name="slug",
-                type=str,
-                location=OpenApiParameter.QUERY,
-                description="Código da fatura gerado pela InfinitePay",
+                description="UUID do pedido gerado no sistema",
             ),
         ],
-        responses={
-            200: OpenApiTypes.OBJECT,
-            400: OpenApiTypes.OBJECT,
-            404: OpenApiTypes.OBJECT,
-        },
+        responses={302: None, 400: OpenApiTypes.OBJECT},
     )
     def get(self, request):
-        order_nsu = request.query_params.get("order_nsu")
-        transaction_nsu = request.query_params.get("transaction_nsu")
-        slug = request.query_params.get("slug")
+        serializer = PaymentReturnSerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+        target = urlsplit(settings.INFINITEPAY_RETURN_URL)
+        query = urlencode({"order_nsu": str(serializer.validated_data["order_nsu"])})
+        return HttpResponseRedirect(
+            urlunsplit(target._replace(query=query, fragment=""))
+        )
 
-        if not all([order_nsu, transaction_nsu, slug]):
+
+@method_decorator(transaction.non_atomic_requests, name="dispatch")
+class InfinitePayWebhookView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    @extend_schema(
+        summary="Notificação de pagamento InfinitePay",
+        description=(
+            "Consulta a InfinitePay e valida a transação antes de atualizar o "
+            "pagamento. Respostas 400 permitem que o provedor reenvie a notificação."
+        ),
+        request=PaymentWebhookSerializer,
+        responses={200: OpenApiTypes.OBJECT, 400: OpenApiTypes.OBJECT},
+    )
+    def post(self, request):
+        serializer = PaymentWebhookSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            confirm_infinitepay_payment(**serializer.validated_data)
+        except ValidationError as exc:
+            detail = exc.detail
+            if isinstance(detail, (list, tuple)) and detail:
+                detail = detail[0]
+            elif isinstance(detail, dict) and detail:
+                detail = next(iter(detail.values()))
+                if isinstance(detail, (list, tuple)) and detail:
+                    detail = detail[0]
             return Response(
-                {"message": "Faltam parâmetros de validação."},
+                {"success": False, "message": str(detail)},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
-        try:
-            order = CustomerOrder.objects.get(id=order_nsu)
-        except CustomerOrder.DoesNotExist:
+        except DatabaseError:
+            logger.warning("Falha ao persistir confirmação de pagamento InfinitePay.")
             return Response(
-                {"message": "Pedido não encontrado."}, status=status.HTTP_404_NOT_FOUND
+                {
+                    "success": False,
+                    "message": "Falha temporária. Reenvie a notificação.",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
             )
-
-        if order.status != OrderStatus.PAID:
-            check_data = check_payment_status(order_nsu, transaction_nsu, slug)
-
-            if check_data and check_data.get("paid") is True:
-                order.payment.gateway_transaction_id = transaction_nsu
-                order.payment.status = PaymentStatus.PAID
-                order.payment.save()
-                order.status = OrderStatus.PAID
-                order.save()
-
-        if order.status == OrderStatus.PAID:
+        except Exception:
+            logger.exception("Falha inesperada ao confirmar pagamento InfinitePay.")
             return Response(
-                {"message": "Pagamento confirmado com sucesso!", "order_id": order_nsu}
+                {
+                    "success": False,
+                    "message": "Falha temporária. Reenvie a notificação.",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
             )
-
-        return Response(
-            {
-                "message": "Pagamento pendente ou em processamento.",
-                "order_id": order_nsu,
-            }
-        )
+        return Response({"success": True, "message": None})
 
 
 class OrderTrackingView(APIView):
@@ -533,7 +848,7 @@ class OrderTrackingView(APIView):
     def get_permissions(self):
         # PATCH must be restricted to admin users
         if self.request.method == "PATCH":
-            return [IsStaffOrSuperUser()]
+            return [CanManageOrders()]
         return [IsAuthenticated()]
 
     @extend_schema(
@@ -606,6 +921,7 @@ class OrderTrackingView(APIView):
             404: OpenApiTypes.OBJECT,
         },
     )
+    @transaction.atomic
     def patch(self, request, order_id):
         order = CustomerOrder.objects.filter(id=order_id).first()
         if order is None:
@@ -630,13 +946,20 @@ class OrderTrackingView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        update_status(
-            order=order,
-            new_status=OrderStatus.SHIPPED,
-            changed_by=request.user,
-            tracking_code=tracking_code,
-            comment="Código de rastreio registado.",
-        )
+        if order.status == OrderStatus.PREPARING:
+            update_status(
+                order=order,
+                new_status=OrderStatus.SHIPPED,
+                tracking_code=tracking_code,
+                changed_by=request.user,
+            )
+
+        elif order.status == OrderStatus.SHIPPED:
+            update_tracking_code(
+                order=order,
+                tracking_code=tracking_code,
+                changed_by=request.user,
+            )
 
         return Response(
             {
@@ -649,13 +972,13 @@ class OrderTrackingView(APIView):
         )
 
     def get_order_if_user_has_permission(self, user, order_id):
-        if getattr(user, "is_admin", False):
+        if user_has_admin_permission(user, "manage_orders"):
             return CustomerOrder.objects.filter(id=order_id).first()
         return CustomerOrder.objects.filter(id=order_id, user=user).first()
 
 
 class OrderDispatchView(APIView):
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageOrders]
 
     @extend_schema(
         tags=["Correios"],
@@ -677,7 +1000,7 @@ class OrderDispatchView(APIView):
     )
     def post(self, request, order_id):
         order = (
-            CustomerOrder.objects.select_related("user", "user__profile")
+            CustomerOrder.objects.select_related("user", "user__profile", "payment")
             .filter(id=order_id)
             .first()
         )
@@ -687,15 +1010,20 @@ class OrderDispatchView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        undispatchable_statuses = [
-            OrderStatus.DELIVERED,
-            OrderStatus.CANCELED,
-            OrderStatus.SHIPPED,
-        ]
-        if order.status in undispatchable_statuses:
+        if order.status != OrderStatus.PREPARING:
             return Response(
                 {
                     "message": f"Pedido com status '{order.status}' não pode ser despachado."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not hasattr(order, "payment") or order.payment.status != PaymentStatus.PAID:
+            return Response(
+                {
+                    "message": (
+                        "Pedido sem pagamento confirmado não pode ser despachado."
+                    )
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
@@ -737,13 +1065,6 @@ class OrderDispatchView(APIView):
             new_status=OrderStatus.SHIPPED,
             changed_by=request.user,
             tracking_code=tracking_code,
-            comment="Despacho automático via pré-postagem Correios.",
-        )
-
-        OrderStatusLog.objects.create(
-            order=order,
-            changed_by=request.user,
-            new_status=OrderStatus.SHIPPED,
             comment=f"Pedido despachado automaticamente via Correios. Código de rastreio: {tracking_code}",
         )
 
@@ -768,6 +1089,8 @@ class CartAPIView(APIView):
         responses={200: CartRepresentationSerializer},
     )
     def get(self, request):
+        release_quietly(variation_ids=cart_variation_ids(request))
+        sweep_expired_reservations()
         cart_data = get_cart_data(request)
         serializer = CartRepresentationSerializer(cart_data)
         return Response(serializer.data, status=status.HTTP_200_OK)
@@ -810,6 +1133,8 @@ class CartItemAddAPIView(APIView):
         variation_id = serializer.validated_data["variation_id"]
         quantity = serializer.validated_data["quantity"]
 
+        # Fora das transações do carrinho, para não inverter a ordem de travas.
+        release_quietly(variation_ids=[variation_id])
         try:
             add_item_to_cart(request, variation_id, quantity)
         except ValueError as e:
@@ -847,6 +1172,7 @@ class CartItemDetailAPIView(APIView):
 
         quantity = serializer.validated_data["quantity"]
 
+        release_quietly(variation_ids=[variation_id])
         try:
             update_item_quantity(request, variation_id, quantity)
         except ValueError as e:

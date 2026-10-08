@@ -1,34 +1,63 @@
 import logging
+import uuid
 
+from django.core.files.base import ContentFile
 from django.db import transaction
-from django.db.models import Max, Q, Sum
-from django.http import JsonResponse
+from django.db.models import Exists, Max, OuterRef, Sum
+from django.db.models.deletion import ProtectedError
 from django.shortcuts import get_object_or_404
-from django.utils import timezone
-from drf_spectacular.utils import OpenApiResponse, extend_schema
+from drf_spectacular.utils import (
+    OpenApiParameter,
+    OpenApiResponse,
+    OpenApiTypes,
+    extend_schema,
+)
 from rest_framework import status
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.exceptions import ValidationError
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from authentication.permissions import IsStaffOrSuperUser
+from authentication.permissions import (
+    CanManageCatalog,
+    CanManageDrops,
+    user_has_admin_permission,
+)
+from orders.expiration import sweep_expired_reservations
 
+from .availability import (
+    is_drop_visible,
+    is_product_visible,
+    visible_drops_queryset,
+    visible_products_queryset,
+)
+from .catalog import (
+    CatalogPagination,
+    RecommendationPagination,
+    catalog_filter_options,
+    filter_catalog,
+    recommend_products,
+)
 from .models import (
     Category,
     DropCampaign,
     Product,
     ProductImage,
     ProductVariation,
-    StockMovementKind,
 )
 from .serializers import (
+    CatalogFilterOptionsSerializer,
+    CatalogPageQuerySerializer,
     CategorySerializer,
     DropCampaignDetailSerializer,
     DropCampaignSerializer,
     ProductDetailSerializer,
+    ProductDuplicateSerializer,
     ProductImageSerializer,
+    ProductListQuerySerializer,
     ProductListSerializer,
     ProductVariationSerializer,
     ProductWriteSerializer,
@@ -38,6 +67,8 @@ from .serializers import (
 logger = logging.getLogger(__name__)
 
 
+@api_view(["GET"])
+@permission_classes([CanManageCatalog])
 def inventory_summary(request):
     products = Product.objects.all()
     data = []
@@ -51,7 +82,7 @@ def inventory_summary(request):
                 "total_stock": total_stock,
             }
         )
-    return JsonResponse({"inventory": data})
+    return Response({"inventory": data})
 
 
 # ─── Categories ───────────────────────────────────────────────────────────────
@@ -62,7 +93,7 @@ class CategoryListCreateView(APIView):
 
     def get_permissions(self):
         if self.request.method == "POST":
-            return [IsStaffOrSuperUser()]
+            return [CanManageCatalog()]
         return [AllowAny()]
 
     @extend_schema(
@@ -114,7 +145,7 @@ class CategoryDetailView(APIView):
     def get_permissions(self):
         if self.request.method == "GET":
             return [AllowAny()]
-        return [IsStaffOrSuperUser()]
+        return [CanManageCatalog()]
 
     def _get_object(self, pk):
         return get_object_or_404(Category, pk=pk)
@@ -179,13 +210,13 @@ class CategoryDetailView(APIView):
 
 
 class DropCampaignListCreateView(APIView):
-    """Listar drops (público, com filtro ?active=true) e criar (admin)."""
+    """Listar drops (público, visibilidade automática) e criar (admin)."""
 
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def get_permissions(self):
         if self.request.method == "POST":
-            return [IsStaffOrSuperUser()]
+            return [CanManageDrops()]
         return [AllowAny()]
 
     @extend_schema(
@@ -193,20 +224,44 @@ class DropCampaignListCreateView(APIView):
         summary="Listar drops",
         description=(
             "Lista paginada de campanhas de drop.\n\n"
-            "Parâmetro opcional `?active=true` retorna apenas drops com "
-            "`is_active=True` dentro do período `[launch_date, end_date]`."
+            "**Público** (não autenticado ou não-admin): aplica automaticamente a "
+            "política de visibilidade da issue #6 — retorna apenas drops com "
+            "`is_public=True`. Não é necessário (nem possível) desativar esse "
+            "filtro. Note que um drop Rascunho (`is_active=False`), Programado "
+            "(`launch_date` futuro), Encerrado (`end_date` passado) ou Esgotado "
+            "(`max_quantity` atingido) continua aparecendo aqui — esses estados "
+            "só afetam `is_sellable` (se dá para comprar), não a visibilidade. "
+            "Só `is_public=False` (Privado) é ocultado.\n\n"
+            "**Admin**: por padrão vê todos os drops (incluindo privados). Use "
+            "`?visible=true` para pré-visualizar exatamente o que o público vê."
         ),
+        parameters=[
+            OpenApiParameter(
+                name="visible",
+                type=OpenApiTypes.BOOL,
+                required=False,
+                description=(
+                    "Somente para admin. Quando `true`, aplica o mesmo filtro de "
+                    "visibilidade pública usado para utilizadores não-admin."
+                ),
+            ),
+        ],
         responses={200: DropCampaignSerializer(many=True)},
     )
     def get(self, request):
+        is_admin = user_has_admin_permission(
+            request.user, "manage_drops"
+        ) or user_has_admin_permission(request.user, "manage_catalog")
         queryset = DropCampaign.objects.all().order_by("-created_at")
-        if request.query_params.get("active", "").lower() == "true":
-            now = timezone.now()
-            queryset = (
-                queryset.filter(is_active=True)
-                .filter(Q(launch_date__isnull=True) | Q(launch_date__lte=now))
-                .filter(Q(end_date__isnull=True) | Q(end_date__gte=now))
-            )
+
+        if is_admin:
+            if request.query_params.get("visible", "").lower() == "true":
+                queryset = visible_drops_queryset(queryset)
+        else:
+            # Política da issue #6 aplicada automaticamente — sempre, sem
+            # depender de um parâmetro de query.
+            queryset = visible_drops_queryset(queryset)
+
         paginator = PageNumberPagination()
         page = paginator.paginate_queryset(queryset, request, view=self)
         serializer = DropCampaignSerializer(
@@ -256,7 +311,7 @@ class DropCampaignDetailView(APIView):
     def get_permissions(self):
         if self.request.method == "GET":
             return [AllowAny()]
-        return [IsStaffOrSuperUser()]
+        return [CanManageDrops()]
 
     def _get_object(self, pk):
         return get_object_or_404(DropCampaign, pk=pk)
@@ -264,13 +319,29 @@ class DropCampaignDetailView(APIView):
     @extend_schema(
         tags=["Drops"],
         summary="Detalhe do drop com produtos",
+        description=(
+            "Retorna o drop com os produtos aninhados.\n\n"
+            "Retorna 404 para utilizadores não-admin apenas quando `is_public=False` "
+            "(política da issue #6). Rascunho, Programado, Encerrado e Esgotado "
+            "continuam retornando 200 — esses estados só afetam `is_sellable`. "
+            "Admin sempre vê o drop, independente da visibilidade."
+        ),
         responses={
             200: DropCampaignDetailSerializer,
-            404: OpenApiResponse(description="Drop não encontrado."),
+            404: OpenApiResponse(
+                description="Drop não encontrado ou não visível ao público."
+            ),
         },
     )
     def get(self, request, pk):
         drop = self._get_object(pk)
+        is_admin = user_has_admin_permission(
+            request.user, "manage_drops"
+        ) or user_has_admin_permission(request.user, "manage_catalog")
+        if not is_admin and not is_drop_visible(drop):
+            return Response(
+                {"error": "Drop não encontrado."}, status=status.HTTP_404_NOT_FOUND
+            )
         return Response(
             DropCampaignDetailSerializer(drop, context={"request": request}).data
         )
@@ -328,7 +399,7 @@ class DropCampaignDetailView(APIView):
 class DropProductManageView(APIView):
     """Associar e desassociar um produto de um drop. Admin only."""
 
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageDrops]
     serializer_class = DropCampaignDetailSerializer
 
     def _get_drop(self, drop_id):
@@ -396,12 +467,27 @@ class DropProductManageView(APIView):
 # ─── Products ─────────────────────────────────────────────────────────────────
 
 
+class CatalogFilterOptionsView(APIView):
+    permission_classes = [AllowAny]
+
+    @extend_schema(
+        tags=["Products"],
+        summary="Opções de filtros do catálogo público",
+        description="Preços, tamanhos e cores de todos os produtos ativos, independentemente da página ou dos filtros selecionados.",
+        responses={200: CatalogFilterOptionsSerializer},
+    )
+    def get(self, request):
+        return Response(CatalogFilterOptionsSerializer(catalog_filter_options()).data)
+
+
 class ProductListCreateView(APIView):
     """Listar produtos (público, com filtros) e criar (admin)."""
 
+    pagination_class = CatalogPagination
+
     def get_permissions(self):
         if self.request.method == "POST":
-            return [IsStaffOrSuperUser()]
+            return [CanManageCatalog()]
         return [AllowAny()]
 
     def get_serializer_class(self):
@@ -415,42 +501,75 @@ class ProductListCreateView(APIView):
         tags=["Products"],
         summary="Listar produtos",
         description=(
-            "Lista paginada do catálogo. Endpoint público — só retorna produtos "
-            "com `is_active=True` para chamadas não autenticadas e clientes.\n\n"
-            "Filtros via query: `category={uuid}`, `drop={uuid}`, `search={text}` "
-            "(busca em name/description), `is_active=true|false` (só admin pode passar false).\n\n"
-            "Ordenação padrão: `-created_at`."
+            "Lista paginada do catálogo. Endpoint público — aplica automaticamente "
+            "a política de visibilidade da issue #6 (oculta produtos inativos e "
+            "vinculados a um drop privado, `is_public=False`; produtos de um drop "
+            "Rascunho, Programado, Encerrado ou Esgotado continuam aparecendo — "
+            "veja `is_sellable` para saber se dá pra comprar) e também exige ao "
+            "menos uma variação com `stock_quantity > 0` para chamadas não "
+            "autenticadas e clientes.\n\n"
+            "Categoria por slug; valores reconhecidos como UUID são sempre IDs legados. "
+            "Drop por UUID. Busca sem distinção de maiúsculas em name/description. "
+            "Cores exatas repetidas: `color=Preto&color=Azul`; tamanho e cor na mesma "
+            "variação. Preços inclusivos, não negativos, com até duas casas decimais. "
+            "Página inicial 1, tamanho padrão 20 e máximo 50 (valores maiores são limitados). "
+            "Parâmetros inválidos retornam 400; página inexistente retorna 404. "
+            "Nomes de cores conhecidos são normalizados. "
+            "Ordenação padrão -created_at, com id como desempate; preços e vendas "
+            "desempatam por -created_at e id. Vendas somam quantidades de pedidos PAID, "
+            "PREPARING, SHIPPED e DELIVERED.\n\n"
+            "**Admin**: por padrão vê todos os produtos, incluindo inativos e "
+            "vinculados a drops privados. `is_active=true|false` filtra por "
+            "atividade; `?visible=true` pré-visualiza exatamente o que o público vê."
         ),
-        responses={200: ProductListSerializer(many=True)},
+        parameters=[
+            ProductListQuerySerializer,
+            OpenApiParameter(
+                name="visible",
+                type=OpenApiTypes.BOOL,
+                required=False,
+                description=(
+                    "Somente admin. Quando `true`, aplica o mesmo filtro de "
+                    "visibilidade pública usado para utilizadores não-admin."
+                ),
+            ),
+        ],
+        responses={
+            200: ProductListSerializer(many=True),
+            400: OpenApiResponse(description="Parâmetros de consulta inválidos."),
+            404: OpenApiResponse(description="Página inexistente."),
+        },
     )
     def get(self, request):
+        # Reserva abandonada esconde o produto (estoque 0) até ser liberada.
+        sweep_expired_reservations()
+        # Evita tratar booleano ausente como checkbox HTML desmarcado.
+        params = request.query_params.dict()
+        if "color" in params:
+            params["color"] = request.query_params.getlist("color")
+        query = ProductListQuerySerializer(data=params)
+        query.is_valid(raise_exception=True)
         qs = Product.objects.select_related("category", "drop").prefetch_related(
             "variations", "images"
         )
 
-        is_admin = request.user.is_authenticated and getattr(
-            request.user, "is_admin", False
-        )
-        is_active_param = request.query_params.get("is_active")
-        if is_admin and is_active_param is not None:
-            qs = qs.filter(is_active=is_active_param.lower() == "true")
-        elif not is_admin:
-            qs = qs.filter(is_active=True)
+        is_admin = user_has_admin_permission(
+            request.user, "manage_catalog"
+        ) or user_has_admin_permission(request.user, "manage_drops")
+        is_active_param = query.validated_data.get("is_active")
+        if is_admin:
+            if is_active_param is not None:
+                qs = qs.filter(is_active=is_active_param)
+            if request.query_params.get("visible", "").lower() == "true":
+                qs = visible_products_queryset(qs)
+        else:
+            available = ProductVariation.objects.filter(
+                product_id=OuterRef("pk"), stock_quantity__gt=0
+            )
+            qs = visible_products_queryset(qs).filter(Exists(available))
 
-        category = request.query_params.get("category")
-        if category:
-            qs = qs.filter(category_id=category)
-
-        drop = request.query_params.get("drop")
-        if drop:
-            qs = qs.filter(drop_id=drop)
-
-        search = request.query_params.get("search")
-        if search:
-            qs = qs.filter(Q(name__icontains=search) | Q(description__icontains=search))
-
-        qs = qs.order_by("-created_at")
-        paginator = PageNumberPagination()
+        qs = filter_catalog(qs, query.validated_data, require_stock=not is_admin)
+        paginator = self.pagination_class()
         page = paginator.paginate_queryset(qs, request, view=self)
         serializer = ProductListSerializer(
             page, many=True, context={"request": request}
@@ -476,7 +595,9 @@ class ProductListCreateView(APIView):
         },
     )
     def post(self, request):
-        serializer = ProductWriteSerializer(data=request.data)
+        serializer = ProductWriteSerializer(
+            data=request.data, context={"request": request}
+        )
         if not serializer.is_valid():
             return Response(
                 {"error": "Dados inválidos.", "details": serializer.errors},
@@ -490,13 +611,51 @@ class ProductListCreateView(APIView):
         )
 
 
+class ProductRecommendationsView(APIView):
+    permission_classes = [AllowAny]
+    pagination_class = RecommendationPagination
+    serializer_class = ProductListSerializer
+
+    @extend_schema(
+        tags=["Products"],
+        summary="Recomendações para um produto",
+        description=(
+            "Produtos ativos com pelo menos uma variação em estoque, excluindo o atual. "
+            "Prioriza mesma categoria, depois mesmo drop (quando presentes), vendas "
+            "válidas, recência decrescente e ID crescente. Completa os resultados com "
+            "outros produtos disponíveis do catálogo. Vendas consideram quantidades "
+            "de pedidos PAID, PREPARING, SHIPPED e DELIVERED. "
+            "Página inicial 1, tamanho padrão 4 e máximo 50; valores maiores são limitados. "
+            "Produto de origem inativo ou inexistente retorna 404, inclusive para admin."
+        ),
+        parameters=[CatalogPageQuerySerializer],
+        responses={
+            200: ProductListSerializer(many=True),
+            400: OpenApiResponse(description="Parâmetros de paginação inválidos."),
+            404: OpenApiResponse(description="Produto ou página não encontrado."),
+        },
+    )
+    def get(self, request, pk):
+        query = CatalogPageQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        product = get_object_or_404(Product, pk=pk, is_active=True)
+        paginator = self.pagination_class()
+        page = paginator.paginate_queryset(
+            recommend_products(product), request, view=self
+        )
+        serializer = self.serializer_class(
+            page, many=True, context={"request": request}
+        )
+        return paginator.get_paginated_response(serializer.data)
+
+
 class ProductDetailView(APIView):
     """Detalhe (público — 404 se inactive p/ não-admin); update e delete (admin)."""
 
     def get_permissions(self):
         if self.request.method == "GET":
             return [AllowAny()]
-        return [IsStaffOrSuperUser()]
+        return [CanManageCatalog()]
 
     def get_serializer_class(self):
         return (
@@ -512,10 +671,12 @@ class ProductDetailView(APIView):
             ),
             pk=pk,
         )
-        is_admin = request.user.is_authenticated and getattr(
-            request.user, "is_admin", False
-        )
-        if not product.is_active and not (is_admin and allow_inactive_for_admin):
+        is_admin = user_has_admin_permission(
+            request.user, "manage_catalog"
+        ) or user_has_admin_permission(request.user, "manage_drops")
+        if is_admin and allow_inactive_for_admin:
+            return product
+        if not is_product_visible(product):
             raise Product.DoesNotExist
         return product
 
@@ -524,7 +685,9 @@ class ProductDetailView(APIView):
         summary="Detalhe do produto",
         description=(
             "Retorna o produto com variations, images, category e drop expandidos.\n\n"
-            "Retorna 404 se `is_active=False` para chamadas não autenticadas ou de clientes."
+            "Retorna 404 para não-admin quando `is_active=False` ou quando o "
+            "produto está vinculado a um drop privado (`is_public=False`, política "
+            "da issue #6). Admin sempre vê o produto."
         ),
         responses={
             200: ProductDetailSerializer,
@@ -561,7 +724,12 @@ class ProductDetailView(APIView):
     )
     def put(self, request, pk):
         product = get_object_or_404(Product, pk=pk)
-        serializer = ProductWriteSerializer(product, data=request.data)
+        serializer = ProductWriteSerializer(
+            product,
+            data=request.data,
+            partial=request.method == "PATCH",
+            context={"request": request},
+        )
         if not serializer.is_valid():
             return Response(
                 {"error": "Dados inválidos.", "details": serializer.errors},
@@ -583,10 +751,27 @@ class ProductDetailView(APIView):
             404: OpenApiResponse(description="Produto não encontrado."),
         },
     )
+    @extend_schema(
+        request=ProductWriteSerializer, responses={200: ProductDetailSerializer}
+    )
+    def patch(self, request, pk):
+        return self.put(request, pk)
+
     def delete(self, request, pk):
         product = get_object_or_404(Product, pk=pk)
+        if (
+            product.variations.filter(stock_movements__isnull=False).exists()
+            or product.variations.filter(orderitem__isnull=False).exists()
+            or product.variations.filter(opening_balance__isnull=False).exists()
+        ):
+            raise ValidationError("Produto com histórico deve ser desativado.")
         logger.info(f"Produto removido: {product.name} ({product.id})")
-        product.delete()
+        try:
+            product.delete()
+        except ProtectedError:
+            raise ValidationError(
+                "Produto com histórico deve ser desativado."
+            ) from None
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -596,7 +781,7 @@ class ProductDetailView(APIView):
 class ProductVariationCreateView(APIView):
     """Cria variação para um produto. Admin only."""
 
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageCatalog]
     serializer_class = ProductVariationSerializer
 
     @extend_schema(
@@ -614,7 +799,9 @@ class ProductVariationCreateView(APIView):
     )
     def post(self, request, pk):
         product = get_object_or_404(Product, pk=pk)
-        serializer = ProductVariationSerializer(data=request.data)
+        serializer = ProductVariationSerializer(
+            data=request.data, context={"request": request}
+        )
         if not serializer.is_valid():
             return Response(
                 {"error": "Dados inválidos.", "details": serializer.errors},
@@ -631,7 +818,7 @@ class ProductVariationCreateView(APIView):
 class ProductVariationDetailView(APIView):
     """Update e delete de variação. Admin only."""
 
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageCatalog]
     serializer_class = ProductVariationSerializer
 
     @extend_schema(
@@ -674,7 +861,20 @@ class ProductVariationDetailView(APIView):
     def delete(self, request, pk):
         variation = get_object_or_404(ProductVariation, pk=pk)
         logger.info(f"Variação removida: {variation.sku} ({variation.id})")
-        variation.delete()
+        with transaction.atomic():
+            Product.objects.select_for_update().get(pk=variation.product_id)
+            if (
+                variation.product.variations.count() <= 1
+                or variation.stock_movements.exists()
+                or variation.orderitem_set.exists()
+            ):
+                raise ValidationError(
+                    "Não é possível excluir a última variação ou uma variação com histórico."
+                )
+            try:
+                variation.delete()
+            except ProtectedError:
+                raise ValidationError("Variação possui histórico de estoque.") from None
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -685,7 +885,7 @@ class ProductImageCreateView(APIView):
     """Cria imagem com display_order automático = max+1."""
 
     parser_classes = [MultiPartParser, FormParser]
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageCatalog]
     serializer_class = ProductImageSerializer
 
     @extend_schema(
@@ -731,7 +931,7 @@ class ProductImageUpdateView(APIView):
     """Substitui o binário de uma imagem existente. display_order é preservado."""
 
     parser_classes = [MultiPartParser, FormParser]
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageCatalog]
     serializer_class = ProductImageSerializer
 
     @extend_schema(
@@ -772,7 +972,7 @@ class ProductImageUpdateView(APIView):
 class ProductImageDeleteView(APIView):
     """Remove uma imagem de produto. Admin only."""
 
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageCatalog]
     serializer_class = ProductImageSerializer
 
     @extend_schema(
@@ -799,7 +999,7 @@ class ProductImageDeleteView(APIView):
 class StockMovementListCreateView(APIView):
     """Histórico e registro de movimentações de estoque de uma variação."""
 
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageCatalog]
     serializer_class = StockMovementSerializer
 
     def _get_variation(self, variation_id, lock=False):
@@ -825,7 +1025,14 @@ class StockMovementListCreateView(APIView):
         paginator = PageNumberPagination()
         page = paginator.paginate_queryset(qs, request, view=self)
         serializer = StockMovementSerializer(page, many=True)
-        return paginator.get_paginated_response(serializer.data)
+        response = paginator.get_paginated_response(serializer.data)
+        opening = getattr(variation, "opening_balance", None)
+        response.data["opening_balance"] = (
+            {"balance": opening.balance, "created_at": opening.created_at}
+            if opening
+            else None
+        )
+        return response
 
     @extend_schema(
         tags=["Stock"],
@@ -859,11 +1066,6 @@ class StockMovementListCreateView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
             movement = serializer.save(variation=variation, created_by=request.user)
-            if movement.kind == StockMovementKind.ENTRADA:
-                variation.stock_quantity += movement.quantity
-            else:
-                variation.stock_quantity -= movement.quantity
-            variation.save(update_fields=["stock_quantity", "updated_at"])
 
         logger.info(
             f"StockMovement {movement.kind} {movement.quantity} na variação {variation.id}"
@@ -871,4 +1073,94 @@ class StockMovementListCreateView(APIView):
         return Response(
             StockMovementSerializer(movement).data,
             status=status.HTTP_201_CREATED,
+        )
+
+
+class ProductDuplicateView(APIView):
+    permission_classes = [CanManageCatalog]
+
+    @extend_schema(
+        request=ProductDuplicateSerializer,
+        responses={201: ProductDetailSerializer},
+        summary="Duplicar produto como rascunho",
+        description="Informe nome, custo e variações com source_id, novo SKU e novo estoque. Copia imagens independentemente; limpa promoção.",
+    )
+    @transaction.atomic
+    def post(self, request, pk):
+        input_serializer = ProductDuplicateSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+        request_data = input_serializer.validated_data
+        original = get_object_or_404(Product.objects.select_for_update(), pk=pk)
+        unknown = set(request_data) - {"name", "cost_price", "variations"}
+        if unknown:
+            raise ValidationError({k: "Campo desconhecido." for k in unknown})
+        originals = list(original.variations.order_by("id"))
+        rows = request_data.get("variations", [])
+        if not isinstance(rows, list) or len(rows) != len(originals):
+            raise ValidationError(
+                {"variations": "Informe todas as variações da origem."}
+            )
+        by_id = {str(v.pk): v for v in originals}
+        seen = set()
+        variations = []
+        for row in rows:
+            if not isinstance(row, dict) or set(row) - {
+                "source_id",
+                "sku",
+                "stock_quantity",
+            }:
+                raise ValidationError(
+                    {"variations": "Campos permitidos: source_id, sku, stock_quantity."}
+                )
+            source = str(row.get("source_id"))
+            if source not in by_id or source in seen:
+                raise ValidationError(
+                    {"variations": "Variação de origem inválida ou repetida."}
+                )
+            seen.add(source)
+            v = by_id[source]
+            variations.append(
+                {
+                    "size": v.size,
+                    "color": v.color,
+                    "sku": row.get("sku", ""),
+                    "stock_quantity": row.get("stock_quantity", 0),
+                }
+            )
+        data = {
+            "name": request_data.get("name") or f"{original.name} (cópia)",
+            "description": original.description,
+            "category": original.category_id,
+            "drop": original.drop_id,
+            "base_price": original.base_price,
+            "cost_price": request_data.get("cost_price", original.cost_price),
+            "is_active": False,
+            "variations": variations,
+        }
+        serializer = ProductWriteSerializer(data=data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        product = serializer.save()
+        copied = []
+        try:
+            for source_image in original.images.order_by("display_order", "created_at"):
+                image = ProductImage(
+                    product=product, display_order=source_image.display_order
+                )
+                with source_image.image.open("rb") as source:
+                    image.image.save(
+                        f"{uuid.uuid4().hex}.{source_image.image.name.rsplit('.', 1)[-1]}",
+                        ContentFile(source.read()),
+                        save=False,
+                    )
+                copied.append(image.image)
+                image.save()
+        except Exception:
+            for file in copied:
+                file.delete(save=False)
+            raise ValidationError(
+                "Não foi possível copiar as imagens; nenhum produto foi criado."
+            ) from None
+        return Response(
+            ProductDetailSerializer(product, context={"request": request}).data,
+            status=201,
         )

@@ -12,11 +12,15 @@ from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
+from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from rest_framework import status
 from rest_framework.test import APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import UserProfile, UserRole
+from orders.models import CustomerOrder, OrderStatus, Payment, PaymentStatus
+
+from .models import NewsletterSubscriber, UserProfile, UserRole
 from .services import GoogleAuthService, InvalidGoogleTokenException
 
 User = get_user_model()
@@ -196,6 +200,50 @@ class GoogleLoginViewTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
 
+class PasswordLoginViewTests(APITestCase):
+    """Garante que clientes e administradores usam o mesmo endpoint de login."""
+
+    url = "/api/auth/login/"
+
+    def setUp(self):
+        self.password = "SenhaSegura123!"
+        self.customer = User.objects.create_user(
+            email="customer-login@example.com",
+            name="Customer Login",
+            password=self.password,
+        )
+        self.admin = User.objects.create_user(
+            email="admin-login@example.com",
+            name="Admin Login",
+            password=self.password,
+            is_staff=True,
+        )
+
+    def test_usuario_comum_faz_login_pelo_endpoint_unico(self):
+        response = self.client.post(
+            self.url,
+            {"email": self.customer.email, "password": self.password},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("access", response.json())
+        self.assertIn("refresh", response.json())
+        self.assertFalse(response.json()["user"]["is_admin"])
+
+    def test_administrador_faz_login_pelo_mesmo_endpoint(self):
+        response = self.client.post(
+            self.url,
+            {"email": self.admin.email, "password": self.password},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("access", response.json())
+        self.assertIn("refresh", response.json())
+        self.assertTrue(response.json()["user"]["is_admin"])
+
+
 class MeViewTests(APITestCase):
     """Testes para o endpoint GET /api/auth/me/."""
 
@@ -344,6 +392,77 @@ class PermissionTests(TestCase):
         self.assertFalse(IsStaffOrSuperUser().has_permission(request, None))
 
 
+class CustomerCRMViewSetTests(APITestCase):
+    """Garante que métricas do CRM representem vendas, não tentativas de compra."""
+
+    url = "/api/auth/crm/customers/"
+
+    def setUp(self):
+        self.admin = User.objects.create_user(
+            email="crm-admin@example.com", name="CRM Admin", is_staff=True
+        )
+        UserProfile.objects.create(user=self.admin, role=UserRole.ADMIN)
+
+        self.customer = User.objects.create_user(
+            email="crm-customer@example.com", name="CRM Customer"
+        )
+        UserProfile.objects.create(user=self.customer, role=UserRole.CUSTOMER)
+        self.client.force_authenticate(user=self.admin)
+
+    def create_order(
+        self, status_value, total_amount, payment_status=PaymentStatus.PENDING
+    ):
+        order = CustomerOrder.objects.create(
+            user=self.customer,
+            status=status_value,
+            subtotal=total_amount,
+            total_amount=total_amount,
+            shipping_zip_code="70000-000",
+            shipping_street="Rua Teste",
+            shipping_number="1",
+            shipping_neighborhood="Centro",
+            shipping_city="Brasília",
+            shipping_state="DF",
+        )
+        Payment.objects.create(
+            order=order,
+            method="PIX",
+            status=payment_status,
+            total_amount=total_amount,
+        )
+        return order
+
+    def test_metricas_consideram_somente_status_aceitos_como_venda(self):
+        paid_order = self.create_order(
+            OrderStatus.DELIVERED, "120.00", PaymentStatus.PAID
+        )
+        self.create_order(OrderStatus.AWAITING_PAYMENT, "80.00")
+        self.create_order(OrderStatus.CANCELED, "60.00")
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        payload = response.json()
+        customer = payload[0] if isinstance(payload, list) else payload["results"][0]
+        self.assertEqual(customer["total_orders"], 1)
+        self.assertEqual(customer["total_spent"], "120.00")
+        self.assertEqual(
+            parse_datetime(customer["last_purchase_date"]), paid_order.payment.paid_at
+        )
+
+    def test_filtro_do_crm_pesquisa_somente_nome_ou_email(self):
+        other = User.objects.create_user(email="outra@example.com", name="Outra Pessoa")
+        UserProfile.objects.create(user=other, role=UserRole.CUSTOMER)
+
+        response = self.client.get(self.url, {"search": "CRM Customer"})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        payload = response.json()
+        customers = payload if isinstance(payload, list) else payload["results"]
+        self.assertEqual(len(customers), 1)
+        self.assertEqual(customers[0]["email"], "crm-customer@example.com")
+
+
 class LogoutViewTests(APITestCase):
     """Testes para o endpoint POST /api/auth/logout/."""
 
@@ -376,3 +495,111 @@ class LogoutViewTests(APITestCase):
         self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.access}")
         response = self.client.post(self.url, {}, format="json")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class NewsletterSubscriberModelTests(TestCase):
+    def test_cria_assinante_com_consentimento(self):
+        subscriber = NewsletterSubscriber.objects.create(
+            email="fan@shio.com", consent_lgpd=True
+        )
+        self.assertTrue(subscriber.consent_lgpd)
+        self.assertIsNotNone(subscriber.subscribed_at)
+
+    def test_email_e_unico(self):
+        NewsletterSubscriber.objects.create(email="dup@shio.com", consent_lgpd=True)
+        with self.assertRaises(Exception):
+            NewsletterSubscriber.objects.create(email="dup@shio.com", consent_lgpd=True)
+
+
+class NewsletterSubscribeAPITests(APITestCase):
+    def setUp(self):
+        self.url = "/api/auth/newsletter/subscribe/"
+
+    def test_inscricao_com_consentimento_retorna_201(self):
+        response = self.client.post(
+            self.url, {"email": "novo@shio.com", "consent_lgpd": True}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(
+            NewsletterSubscriber.objects.filter(email="novo@shio.com").exists()
+        )
+
+    def test_inscricao_sem_consentimento_retorna_400(self):
+        response = self.client.post(
+            self.url,
+            {"email": "semconsentimento@shio.com", "consent_lgpd": False},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(
+            NewsletterSubscriber.objects.filter(
+                email="semconsentimento@shio.com"
+            ).exists()
+        )
+
+    def test_email_invalido_retorna_400(self):
+        response = self.client.post(
+            self.url, {"email": "nao-e-email", "consent_lgpd": True}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_reinscricao_de_email_existente_retorna_200_sem_duplicar(self):
+        NewsletterSubscriber.objects.create(email="ja@shio.com", consent_lgpd=True)
+        response = self.client.post(
+            self.url, {"email": "ja@shio.com", "consent_lgpd": True}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            NewsletterSubscriber.objects.filter(email="ja@shio.com").count(), 1
+        )
+
+    def test_reinscricao_reativa_quem_havia_cancelado_mantendo_consentimento(self):
+        """Quem cancelou a inscrição (unsubscribed_at preenchido) mas manteve
+        consent_lgpd=True deve ser reativado ao se inscrever de novo."""
+        subscriber = NewsletterSubscriber.objects.create(
+            email="voltou@shio.com", consent_lgpd=True
+        )
+        subscriber.unsubscribed_at = timezone.now()
+        subscriber.save()
+
+        response = self.client.post(
+            self.url, {"email": "voltou@shio.com", "consent_lgpd": True}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        subscriber.refresh_from_db()
+        self.assertIsNone(subscriber.unsubscribed_at)
+        self.assertTrue(subscriber.consent_lgpd)
+
+    def test_reinscricao_de_quem_havia_revogado_consentimento_reativa(self):
+        subscriber = NewsletterSubscriber.objects.create(
+            email="revogou@shio.com", consent_lgpd=False
+        )
+        subscriber.unsubscribed_at = timezone.now()
+        subscriber.save()
+
+        response = self.client.post(
+            self.url, {"email": "revogou@shio.com", "consent_lgpd": True}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        subscriber.refresh_from_db()
+        self.assertTrue(subscriber.consent_lgpd)
+        self.assertIsNone(subscriber.unsubscribed_at)
+
+    def test_reinscricao_de_assinante_ativo_nao_faz_escrita_desnecessaria(self):
+        subscriber = NewsletterSubscriber.objects.create(
+            email="ativo@shio.com", consent_lgpd=True
+        )
+
+        with patch.object(NewsletterSubscriber, "save") as mock_save:
+            response = self.client.post(
+                self.url,
+                {"email": "ativo@shio.com", "consent_lgpd": True},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        mock_save.assert_not_called()
+        subscriber.refresh_from_db()
+        self.assertTrue(subscriber.consent_lgpd)

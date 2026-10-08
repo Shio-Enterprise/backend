@@ -2,6 +2,7 @@ import uuid
 
 from django.conf import settings
 from django.db import models
+from django.utils import timezone
 
 
 class OrderStatus(models.TextChoices):
@@ -14,6 +15,7 @@ class OrderStatus(models.TextChoices):
 
 
 class PaymentMethod(models.TextChoices):
+    UNKNOWN = "UNKNOWN", "Not confirmed"
     PIX = "PIX", "Pix"
     CREDIT_CARD = "CREDIT_CARD", "Credit Card"
     BOLETO = "BOLETO", "Boleto"
@@ -27,18 +29,91 @@ class PaymentStatus(models.TextChoices):
     REFUNDED = "REFUNDED", "Refunded"
 
 
+class CouponDiscountType(models.TextChoices):
+    PERCENTAGE = "PERCENTAGE", "Percentage"
+    FIXED_VALUE = "FIXED_VALUE", "Fixed Value"
+
+
+def normalize_coupon_code(code):
+    """Sem espaços e em maiúsculas: " verao 20" -> "VERAO20"."""
+    return "".join(str(code).split()).upper()
+
+
 class Coupon(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     code = models.CharField(max_length=50, unique=True)
-    discount_type = models.CharField(
-        max_length=20,
-        choices=[("PERCENTAGE", "Percentage"), ("FIXED_VALUE", "Fixed Value")],
-    )
+    description = models.CharField(max_length=255, blank=True)
+    discount_type = models.CharField(max_length=20, choices=CouponDiscountType.choices)
     discount_value = models.DecimalField(max_digits=10, decimal_places=2)
+    max_discount_amount = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True
+    )
+    # Comparado com o subtotal do carrinho inteiro, sem frete.
+    min_order_value = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True
+    )
+    starts_at = models.DateTimeField(null=True, blank=True)
     expiration_date = models.DateTimeField(null=True, blank=True)
+    # null = ilimitado.
+    max_uses_total = models.PositiveIntegerField(null=True, blank=True)
+    max_uses_per_user = models.PositiveIntegerField(null=True, blank=True)
+    first_purchase_only = models.BooleanField(default=False)
+    auto_apply = models.BooleanField(default=False)
+    # Sem drops nem categorias, o cupom vale para o carrinho inteiro.
+    drops = models.ManyToManyField(
+        "products.DropCampaign", blank=True, related_name="coupons"
+    )
+    categories = models.ManyToManyField(
+        "products.Category", blank=True, related_name="coupons"
+    )
+    partner = models.CharField(max_length=50, blank=True)
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            # Cobre também update() e bulk_create(), que não chamam save().
+            models.CheckConstraint(
+                check=models.Q(code__regex=r"^[A-Z0-9_-]+$"),
+                name="coupon_code_normalized",
+            ),
+            models.CheckConstraint(
+                check=models.Q(discount_value__gt=0),
+                name="coupon_discount_value_positive",
+            ),
+            models.CheckConstraint(
+                check=~models.Q(discount_type=CouponDiscountType.PERCENTAGE)
+                | models.Q(discount_value__lte=100),
+                name="coupon_percentage_at_most_100",
+            ),
+            models.CheckConstraint(
+                check=models.Q(max_discount_amount__isnull=True)
+                | models.Q(
+                    max_discount_amount__gt=0,
+                    discount_type=CouponDiscountType.PERCENTAGE,
+                ),
+                name="coupon_max_discount_only_percentage",
+            ),
+            models.CheckConstraint(
+                check=models.Q(min_order_value__isnull=True)
+                | models.Q(min_order_value__gt=0),
+                name="coupon_min_order_value_positive",
+            ),
+            models.CheckConstraint(
+                check=models.Q(starts_at__isnull=True)
+                | models.Q(expiration_date__isnull=True)
+                | models.Q(starts_at__lt=models.F("expiration_date")),
+                name="coupon_starts_before_expiration",
+            ),
+        ]
+
+    def __str__(self):
+        return self.code
+
+    def save(self, *args, **kwargs):
+        self.code = normalize_coupon_code(self.code)
+        super().save(*args, **kwargs)
 
 
 class Cart(models.Model):
@@ -68,6 +143,46 @@ class CartItem(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
 
+class ShippingQuote(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="shipping_quotes",
+    )
+    cart = models.ForeignKey(
+        Cart, on_delete=models.CASCADE, related_name="shipping_quotes"
+    )
+    address = models.ForeignKey(
+        "authentication.Address",
+        on_delete=models.CASCADE,
+        related_name="shipping_quotes",
+    )
+    snapshot = models.JSONField()
+    subtotal = models.DecimalField(max_digits=10, decimal_places=2)
+    shipping_cost = models.DecimalField(max_digits=10, decimal_places=2)
+    discount_amount = models.DecimalField(max_digits=10, decimal_places=2)
+    total_amount = models.DecimalField(max_digits=10, decimal_places=2)
+    prazo_dias = models.PositiveIntegerField(null=True, blank=True)
+    coupon_code = models.CharField(max_length=50, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    invalidated_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(
+                    subtotal__gte=0,
+                    shipping_cost__gte=0,
+                    discount_amount__gte=0,
+                    total_amount__gte=0,
+                ),
+                name="shipping_quote_nonnegative_amounts",
+            ),
+        ]
+
+
 class CustomerOrder(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(
@@ -76,7 +191,14 @@ class CustomerOrder(models.Model):
     address = models.ForeignKey(
         "authentication.Address", on_delete=models.SET_NULL, null=True, blank=True
     )
-    coupon = models.ForeignKey(Coupon, on_delete=models.SET_NULL, null=True, blank=True)
+    # PROTECT: apagar um cupom usado apagaria a origem das vendas.
+    coupon = models.ForeignKey(
+        Coupon,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="orders",
+    )
     status = models.CharField(
         max_length=50, choices=OrderStatus.choices, default=OrderStatus.AWAITING_PAYMENT
     )
@@ -86,6 +208,7 @@ class CustomerOrder(models.Model):
     discount_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     total_amount = models.DecimalField(max_digits=10, decimal_places=2)
     tracking_code = models.CharField(max_length=100, null=True, blank=True)
+    reservation_expires_at = models.DateTimeField(null=True, blank=True)
 
     shipping_zip_code = models.CharField(max_length=9)
     shipping_street = models.CharField(max_length=255)
@@ -97,6 +220,42 @@ class CustomerOrder(models.Model):
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+
+class CheckoutAttemptStatus(models.TextChoices):
+    PROCESSING = "PROCESSING", "Processing"
+    SUCCEEDED = "SUCCEEDED", "Succeeded"
+    UNCERTAIN = "UNCERTAIN", "Uncertain"
+
+
+class CheckoutAttempt(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT)
+    idempotency_key = models.UUIDField()
+    cart = models.OneToOneField(
+        Cart, on_delete=models.PROTECT, related_name="checkout_attempt"
+    )
+    shipping_quote = models.ForeignKey(ShippingQuote, on_delete=models.PROTECT)
+    address_id = models.UUIDField()
+    order = models.OneToOneField(
+        CustomerOrder, on_delete=models.PROTECT, related_name="checkout_attempt"
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=CheckoutAttemptStatus.choices,
+        default=CheckoutAttemptStatus.PROCESSING,
+    )
+    checkout_url = models.URLField(max_length=2048, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "idempotency_key"],
+                name="checkout_attempt_user_key_unique",
+            ),
+        ]
 
 
 class OrderItem(models.Model):
@@ -113,13 +272,24 @@ class OrderItem(models.Model):
     sku_snapshot = models.CharField(max_length=100, null=True, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            old = type(self).objects.get(pk=self.pk)
+            if old.unit_price != self.unit_price:
+                from django.core.exceptions import ValidationError
+
+                raise ValidationError("Preço contratado é imutável.")
+        super().save(*args, **kwargs)
+
 
 class Payment(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     order = models.OneToOneField(
         CustomerOrder, on_delete=models.CASCADE, related_name="payment"
     )
-    method = models.CharField(max_length=50, choices=PaymentMethod.choices)
+    method = models.CharField(
+        max_length=50, choices=PaymentMethod.choices, default=PaymentMethod.UNKNOWN
+    )
     status = models.CharField(
         max_length=50, choices=PaymentStatus.choices, default=PaymentStatus.PENDING
     )
@@ -131,9 +301,21 @@ class Payment(models.Model):
     gateway_transaction_id = models.CharField(
         max_length=255, unique=True, null=True, blank=True
     )
+    gateway_invoice_slug = models.CharField(max_length=255, blank=True)
     qrcode_pix = models.TextField(null=True, blank=True)
+    paid_at = models.DateTimeField(null=True, blank=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    def save(self, *args, **kwargs):
+        # `paid_at` representa a primeira confirmação e não acompanha mudanças
+        # posteriores de status (por exemplo, PAID -> REFUNDED).
+        if self.status == PaymentStatus.PAID and self.paid_at is None:
+            self.paid_at = timezone.now()
+            update_fields = kwargs.get("update_fields")
+            if update_fields is not None:
+                kwargs["update_fields"] = set(update_fields) | {"paid_at"}
+        super().save(*args, **kwargs)
 
 
 class OrderStatusLog(models.Model):

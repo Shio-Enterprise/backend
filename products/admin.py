@@ -12,7 +12,15 @@ from .models import (
 
 class ProductVariationInline(admin.TabularInline):
     model = ProductVariation
-    extra = 1
+    extra = 0
+    readonly_fields = ("sku", "stock_quantity")
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
     fields = ("size", "color", "sku", "stock_quantity")
 
 
@@ -30,12 +38,31 @@ class ProductAdmin(admin.ModelAdmin):
     search_fields = ("name", "description")
     inlines = [ProductVariationInline, ProductImageInline]
 
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
 
 @admin.register(ProductVariation)
 class ProductVariationAdmin(admin.ModelAdmin):
     list_display = ("product", "size", "color", "sku", "stock_quantity")
     search_fields = ("sku", "product__name")
     list_filter = ("size", "color")
+    readonly_fields = ("sku", "stock_quantity")
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(ProductImage)
@@ -90,4 +117,7 @@ class StockMovementAdmin(admin.ModelAdmin):
         return False
 
     def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
         return False

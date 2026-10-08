@@ -15,6 +15,8 @@ from pathlib import Path
 
 from decouple import config
 
+from notifications.backends import select_email_backend
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -40,10 +42,13 @@ INSTALLED_APPS = [
     "authentication",
     "products",
     "orders",
+    "reviews",
+    "notifications",
     "rest_framework",
     "rest_framework_simplejwt",
     "rest_framework_simplejwt.token_blacklist",
     "corsheaders",
+    "anymail",
     "drf_spectacular",
     "whitenoise.runserver_nostatic",
 ]
@@ -72,6 +77,7 @@ REST_FRAMEWORK = {
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 20,
+    "DEFAULT_THROTTLE_RATES": {"review_create": "20/hour"},
 }
 
 ROOT_URLCONF = "core.urls"
@@ -184,7 +190,28 @@ SIMPLE_JWT = {
 GOOGLE_CLIENT_ID = config("GOOGLE_CLIENT_ID")
 
 INFINITEPAY_HANDLE = config("INFINITEPAY_HANDLE", default="")
+INFINITEPAY_RETURN_URL = config(
+    "INFINITEPAY_RETURN_URL", default="http://localhost:5173/pix"
+)
+INFINITEPAY_WEBHOOK_URL = config("INFINITEPAY_WEBHOOK_URL", default="")
 
+STOCK_RESERVATION_TTL_MINUTES = config(
+    "STOCK_RESERVATION_TTL_MINUTES", default=30, cast=int
+)
+# A liberação automática só pega reservas vencidas há mais que isto, para não
+# liberar a de quem está concluindo o pagamento no último instante.
+STOCK_RESERVATION_GRACE_SECONDS = config(
+    "STOCK_RESERVATION_GRACE_SECONDS", default=120, cast=int
+)
+# Intervalo mínimo, por processo, entre varreduras de reservas vencidas
+# disparadas pelo catálogo e pelo carrinho.
+RESERVATION_SWEEP_INTERVAL_SECONDS = config(
+    "RESERVATION_SWEEP_INTERVAL_SECONDS", default=60, cast=int
+)
+SHIPPING_QUOTE_TTL_SECONDS = config("SHIPPING_QUOTE_TTL_SECONDS", default=900, cast=int)
+CHECKOUT_PROCESSING_TIMEOUT_SECONDS = config(
+    "CHECKOUT_PROCESSING_TIMEOUT_SECONDS", default=60, cast=int
+)
 CORREIOS_API_BASE_URL = config(
     "CORREIOS_API_BASE_URL", default="https://api.correios.com.br"
 )
@@ -207,6 +234,15 @@ CORREIOS_REMETENTE_COMPLEMENTO = config("CORREIOS_REMETENTE_COMPLEMENTO", defaul
 CORREIOS_REMETENTE_BAIRRO = config("CORREIOS_REMETENTE_BAIRRO", default="")
 CORREIOS_REMETENTE_CIDADE = config("CORREIOS_REMETENTE_CIDADE", default="")
 CORREIOS_REMETENTE_UF = config("CORREIOS_REMETENTE_UF", default="")
+
+# E-mail — Resend via django-anymail (API HTTPS; Railway Hobby bloqueia SMTP).
+# Sem RESEND_API_KEY, os e-mails vão para o console/log e nada é enviado.
+RESEND_API_KEY = config("RESEND_API_KEY", default="").strip()
+EMAIL_BACKEND = select_email_backend(RESEND_API_KEY)
+ANYMAIL = {"RESEND_API_KEY": RESEND_API_KEY}
+DEFAULT_FROM_EMAIL = config(
+    "DEFAULT_FROM_EMAIL", default="Shio <nao-responda@localhost>"
+)
 
 CORS_ALLOW_CREDENTIALS = True
 
@@ -239,6 +275,11 @@ LOGGING = {
     },
     "loggers": {
         "authentication": {
+            "handlers": ["console"],
+            "level": "INFO",
+            "propagate": True,
+        },
+        "notifications": {
             "handlers": ["console"],
             "level": "INFO",
             "propagate": True,
@@ -323,6 +364,9 @@ SPECTACULAR_SETTINGS = {
     "ENUM_NAME_OVERRIDES": {
         # 'NomeBonitoNoSwagger': 'caminho.do.seu.app.models.NomeDaClasseDeChoices'
         "OrderStatusEnum": "orders.models.OrderStatus",
+        "ReviewStatusEnum": "reviews.models.ReviewStatus",
         # Se tiver outro enum de status dando conflito, adicione aqui embaixo
     },
 }
+
+FRONTEND_URL = config("FRONTEND_URL", default="http://localhost:5173")
