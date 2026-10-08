@@ -17,10 +17,11 @@ from drf_spectacular.utils import (
     extend_schema,
     inline_serializer,
 )
-from rest_framework import serializers, status
+from rest_framework import serializers, status, viewsets
 from rest_framework.exceptions import ValidationError
 from rest_framework.pagination import PageNumberPagination
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated, IsAdminUser
+from authentication.permissions import IsStaffOrSuperUser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -55,12 +56,15 @@ from .metrics import (
     sale_items,
 )
 from .models import (
+    Coupon,
     CustomerOrder,
     OrderStatus,
     PaymentMethod,
     PaymentStatus,
 )
 from .serializers import (
+    CouponAdminSerializer,
+    CouponAdminSerializer,
     CartItemAddSerializer,
     CartItemUpdateSerializer,
     CartRepresentationSerializer,
@@ -1213,3 +1217,109 @@ class CartItemDetailAPIView(APIView):
         return Response(
             CartRepresentationSerializer(cart_data).data, status=status.HTTP_200_OK
         )
+
+
+
+from .coupons import valid_order_q
+from django.db.models import Count, Sum
+
+class CouponListCreateView(APIView):
+    permission_classes = [IsStaffOrSuperUser]
+
+    @extend_schema(responses=CouponAdminSerializer(many=True))
+    def get(self, request):
+        active = request.query_params.get('active')
+        search = request.query_params.get('search')
+        partner = request.query_params.get('partner')
+
+        qs = Coupon.objects.all()
+        if active == 'true':
+            qs = qs.filter(is_active=True)
+        elif active == 'false':
+            qs = qs.filter(is_active=False)
+        
+        if search:
+            qs = qs.filter(Q(code__icontains=search) | Q(description__icontains=search))
+        
+        if partner:
+            qs = qs.filter(partner=partner)
+
+        # Metrics
+        valid_orders = valid_order_q("orders__")
+        qs = qs.annotate(
+            uses_count=Count('orders', filter=valid_orders),
+            total_discount_given=Sum('orders__discount_amount', filter=valid_orders),
+            revenue=Sum('orders__total_amount', filter=valid_orders)
+        ).order_by('-created_at')
+
+        # Pagination using existing DRF pattern in project (PageNumberPagination is usually standard)
+        paginator = PageNumberPagination()
+        paginated_qs = paginator.paginate_queryset(qs, request)
+        serializer = CouponAdminSerializer(paginated_qs, many=True)
+        return paginator.get_paginated_response(serializer.data)
+
+    @extend_schema(request=CouponAdminSerializer, responses=CouponAdminSerializer)
+    def post(self, request):
+        serializer = CouponAdminSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        coupon = serializer.save()
+        
+        valid_orders = valid_order_q("orders__")
+        qs = Coupon.objects.annotate(
+            uses_count=Count('orders', filter=valid_orders),
+            total_discount_given=Sum('orders__discount_amount', filter=valid_orders),
+            revenue=Sum('orders__total_amount', filter=valid_orders)
+        ).get(id=coupon.id)
+
+        resp_serializer = CouponAdminSerializer(qs)
+        return Response(resp_serializer.data, status=status.HTTP_201_CREATED)
+
+
+class CouponDetailView(APIView):
+    permission_classes = [IsStaffOrSuperUser]
+
+    def get_object(self, pk):
+        valid_orders = valid_order_q("orders__")
+        qs = Coupon.objects.annotate(
+            uses_count=Count('orders', filter=valid_orders),
+            total_discount_given=Sum('orders__discount_amount', filter=valid_orders),
+            revenue=Sum('orders__total_amount', filter=valid_orders)
+        )
+        from django.shortcuts import get_object_or_404
+        return get_object_or_404(qs, pk=pk)
+
+    @extend_schema(responses=CouponAdminSerializer)
+    def get(self, request, uuid):
+        coupon = self.get_object(uuid)
+        serializer = CouponAdminSerializer(coupon)
+        return Response(serializer.data)
+
+    @extend_schema(request=CouponAdminSerializer, responses=CouponAdminSerializer)
+    def patch(self, request, uuid):
+        coupon = self.get_object(uuid)
+        serializer = CouponAdminSerializer(coupon, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        
+        # O code não pode mudar depois do primeiro uso.
+        if 'code' in request.data and coupon.uses_count > 0:
+            if request.data['code'].upper() != coupon.code:
+                from rest_framework.exceptions import ValidationError
+                raise ValidationError({"code": "Não é possível alterar o código de um cupom que já foi usado."})
+
+        serializer.save()
+        
+        coupon = self.get_object(uuid)
+        resp_serializer = CouponAdminSerializer(coupon)
+        return Response(resp_serializer.data)
+
+    @extend_schema(responses={200: dict, 204: None})
+    def delete(self, request, uuid):
+        coupon = self.get_object(uuid)
+        if coupon.uses_count > 0:
+            coupon.is_active = False
+            coupon.save()
+            return Response({"message": "Cupom desativado pois já possui usos."}, status=status.HTTP_200_OK)
+        else:
+            coupon.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+

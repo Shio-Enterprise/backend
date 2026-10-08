@@ -2,6 +2,8 @@ from django.urls import path
 
 from .correios_views import AgencySearchView, CepLookupView, ShippingOptionsView
 from .views import (
+    CouponListCreateView,
+    CouponDetailView,
     AdminDashboardView,
     AdminOrderDetailView,
     AdminOrderListView,
@@ -24,6 +26,10 @@ from .views import (
 app_name = "orders"
 
 urlpatterns = [
+
+    path("admin/coupons/", CouponListCreateView.as_view(), name="admin-coupons-list"),
+    path("admin/coupons/<uuid:uuid>/", CouponDetailView.as_view(), name="admin-coupons-detail"),
+
     path(
         "infinitepay/webhook/",
         InfinitePayWebhookView.as_view(),
@@ -83,3 +89,4 @@ urlpatterns = [
         name="cart_item_detail",
     ),
 ]
+
