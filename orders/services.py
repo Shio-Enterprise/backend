@@ -7,7 +7,7 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ImproperlyConfigured, ObjectDoesNotExist
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db import IntegrityError, models, transaction
+from django.db import IntegrityError, transaction
 from django.shortcuts import get_object_or_404
 from django.urls import reverse
 from django.utils import timezone
@@ -17,13 +17,12 @@ from orders.correios import (
     fetch_shipping_deadline_by_service_and_ceps,
     fetch_shipping_price_by_service_and_ceps,
 )
-from orders.coupons import valid_order_q
+from orders.coupons import resolve_coupon
 from orders.models import (
     Cart,
     CartItem,
     CheckoutAttempt,
     CheckoutAttemptStatus,
-    Coupon,
     CustomerOrder,
     OrderItem,
     OrderStatus,
@@ -67,7 +66,9 @@ class CheckoutShippingUnavailable(APIException):
     default_code = "shipping_unavailable"
 
 
-def _get_checkout_contents(user, address_id, cart_id=None, *, lock=False):
+def _get_checkout_contents(
+    user, address_id, cart_id=None, *, coupon_code="", lock=False
+):
     carts = Cart.objects.filter(user=user, status="ACTIVE")
     if lock:
         carts = carts.select_for_update()
@@ -144,7 +145,9 @@ def _get_checkout_contents(user, address_id, cart_id=None, *, lock=False):
             }
         )
 
-    coupon, discount = _compute_welcome_discount(user, subtotal, lock=lock)
+    # Por último: com lock=True, a trava do cupom vem depois de todas as
+    # outras (usuário, carrinho, produtos, drops, itens e endereço).
+    coupon_result = resolve_coupon(user, items, subtotal, coupon_code, lock=lock)
     destination = address.zip_code.replace("-", "").strip()
     if len(destination) != 8 or not destination.isdigit():
         raise ValidationError({"message": "CEP do endereço inválido."})
@@ -153,8 +156,16 @@ def _get_checkout_contents(user, address_id, cart_id=None, *, lock=False):
         "address": address,
         "items": items,
         "subtotal": subtotal,
-        "coupon": coupon,
-        "discount_amount": discount,
+        "coupon": coupon_result.coupon,
+        "discount_amount": coupon_result.discount,
+        "coupon_error": (
+            {
+                "code": coupon_result.error_code,
+                "message": coupon_result.error_message,
+            }
+            if coupon_result.error_code
+            else None
+        ),
         "shipping_parameters": {
             "origin": settings.CORREIOS_REMETENTE_CEP.replace("-", "").strip(),
             "destination": destination,
@@ -800,18 +811,17 @@ def get_cart_data(request):
     if request.user.is_authenticated:
         cart = Cart.objects.filter(user=request.user, status="ACTIVE").first()
         if not cart:
-            welcome_coupon, welcome_discount_amount = get_welcome_discount_preview(
-                request.user, Decimal("0.00")
-            )
+            auto_coupon = resolve_coupon(request.user, [], Decimal("0.00"))
             return {
                 "id": None,
                 "items": [],
                 "subtotal": Decimal("0.00"),
-                "eligible_for_welcome_discount": welcome_coupon is not None,
-                "welcome_discount_amount": welcome_discount_amount,
+                "eligible_for_welcome_discount": auto_coupon.coupon is not None,
+                "welcome_discount_amount": auto_coupon.discount,
             }
 
         items = []
+        coupon_items = []
         subtotal = Decimal("0.00")
         cart_items = cart.items.select_related(
             "variation", "variation__product", "variation__product__drop"
@@ -821,6 +831,9 @@ def get_cart_data(request):
 
             total_price = item.quantity * item.unit_price
             subtotal += total_price
+            coupon_items.append(
+                {"variation": item.variation, "total_price": total_price}
+            )
             items.append(
                 {
                     "variation_id": item.variation.id,
@@ -839,15 +852,15 @@ def get_cart_data(request):
                     "is_sellable": is_product_sellable(item.variation.product),
                 }
             )
-        welcome_coupon, welcome_discount_amount = get_welcome_discount_preview(
-            request.user, subtotal
-        )
+        # Prévia sem código digitado e sem trava: só o cupom automático. A
+        # aplicação que vale é a do checkout.
+        auto_coupon = resolve_coupon(request.user, coupon_items, subtotal)
         return {
             "id": cart.id,
             "items": items,
             "subtotal": subtotal,
-            "eligible_for_welcome_discount": welcome_coupon is not None,
-            "welcome_discount_amount": welcome_discount_amount,
+            "eligible_for_welcome_discount": auto_coupon.coupon is not None,
+            "welcome_discount_amount": auto_coupon.discount,
         }
     else:
         session_cart = request.session.get("cart", {})
@@ -1221,90 +1234,3 @@ def restore_order_stock(order, changed_by=None, physical_return=False):
             else "Cancelamento antes da expedição",
             reverses_movement=sale,
         )
-
-
-def _compute_welcome_discount(user, subtotal, *, lock=False):
-    """Lógica compartilhada de elegibilidade e cálculo do desconto de
-    boas-vindas, usada por get_welcome_discount e get_welcome_discount_preview.
-
-    Retorna (coupon, discount_amount) ou (None, Decimal('0.00')) se o usuário
-    não for elegível. NÃO adquire lock algum: quem precisa serializar contra
-    checkouts concorrentes (get_welcome_discount) deve travar a linha do
-    usuário ANTES de chamar esta função.
-
-    Só considera o cupom BEMVINDO10 se ele estiver ativo e não expirado, e
-    respeita o discount_type configurado (PERCENTAGE ou FIXED_VALUE), de modo
-    que uma edição da linha do cupom no admin não seja silenciosamente
-    ignorada.
-    """
-    if not user.is_authenticated:
-        return None, Decimal("0.00")
-
-    # Pedido cancelado (desistência ou reserva vencida) não é compra: o
-    # cliente continua tendo direito ao desconto de primeira compra.
-    has_previous_order = CustomerOrder.objects.filter(
-        valid_order_q(), user=user
-    ).exists()
-    if has_previous_order:
-        return None, Decimal("0.00")
-
-    coupons = Coupon.objects.all()
-    if lock:
-        coupons = coupons.select_for_update()
-    coupon = (
-        coupons.filter(code="BEMVINDO10", is_active=True)
-        .filter(
-            models.Q(expiration_date__isnull=True)
-            | models.Q(expiration_date__gt=timezone.now())
-        )
-        .first()
-    )
-    if not coupon:
-        return None, Decimal("0.00")
-
-    if coupon.discount_type == "FIXED_VALUE":
-        # Nunca deixa o desconto ultrapassar o subtotal (total negativo).
-        discount = min(coupon.discount_value, subtotal)
-    else:
-        discount = subtotal * (coupon.discount_value / Decimal("100"))
-
-    return coupon, normalize_money(min(subtotal, max(Decimal("0.00"), discount)))
-
-
-def get_welcome_discount(user, subtotal):
-    """Retorna (coupon, discount_amount) para o desconto de boas-vindas,
-    ou (None, Decimal('0.00')) se o usuário não for elegível.
-
-    Deve ser chamada dentro de uma transaction.atomic() (o caller,
-    CheckoutAPIView.post, já está decorado com @transaction.atomic).
-    Faz o lock da linha do usuário via select_for_update() antes de delegar a
-    checagem de elegibilidade a _compute_welcome_discount(): isso serializa
-    dois checkouts concorrentes do mesmo usuário — a segunda transação só
-    prossegue além do lock depois que a primeira commitar, e nesse ponto já
-    enxerga o pedido criado pela primeira, evitando aplicar o desconto duas
-    vezes.
-    """
-    if not user.is_authenticated:
-        return None, Decimal("0.00")
-
-    User = get_user_model()
-    User.objects.select_for_update().get(pk=user.pk)
-
-    return _compute_welcome_discount(user, subtotal)
-
-
-def get_welcome_discount_preview(user, subtotal):
-    """Versão somente-leitura de get_welcome_discount, para uso em contextos
-    que não estão dentro de uma transaction.atomic() (ex.: GET /cart/, uma
-    rota de leitura que apenas exibe uma prévia do desconto).
-
-    Mesma assinatura e retorno de get_welcome_discount — (coupon, discount) ou
-    (None, Decimal('0.00')) — e mesma lógica de elegibilidade (as duas delegam
-    a _compute_welcome_discount), mas SEM select_for_update(): não adquire lock
-    na linha do usuário, então não serializa contra checkouts concorrentes.
-    Isso é aceitável aqui porque esta função só alimenta uma prévia informativa
-    no carrinho; a aplicação real e segura contra corrida do desconto acontece
-    em get_welcome_discount, chamada por CheckoutAPIView.post dentro de
-    @transaction.atomic.
-    """
-    return _compute_welcome_discount(user, subtotal)

@@ -30,6 +30,7 @@ from rest_framework.test import APIClient, APITestCase, APITransactionTestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from authentication.models import Address, UserProfile, UserRole
+from orders.coupons import resolve_coupon
 from orders.models import (
     Cart,
     CartItem,
@@ -49,8 +50,6 @@ from orders.services import (
     CheckoutShippingUnavailable,
     create_infinitepay_checkout,
     create_shipping_quote,
-    get_welcome_discount,
-    get_welcome_discount_preview,
     prepare_checkout_attempt,
     update_status,
     validate_shipping_quote,
@@ -3824,191 +3823,80 @@ class WelcomeCouponSeedTests(APITestCase):
         self.assertTrue(coupon.is_active)
 
 
-class GetWelcomeDiscountConcurrencyTests(APITestCase):
-    """Cobre o risco de corrida entre dois checkouts concorrentes do mesmo
-    usuário que nunca comprou antes: ambos não podem aplicar o desconto de
-    boas-vindas (ver get_welcome_discount em orders/services.py).
+@override_settings(**SHIPPING_TEST_SETTINGS)
+class WelcomeCouponCheckoutLockTests(APITestCase):
+    """Dois checkouts simultâneos do mesmo cliente novo não podem levar o
+    desconto de primeira compra.
 
-    Nota sobre a estratégia de teste: o banco usado nos testes é SQLite em
-    memória. Nesse backend, `django.db.models.QuerySet.select_for_update()`
-    é essencialmente um no-op — a feature `has_select_for_update` é False
-    para o SQLite, então o Django nem adiciona a cláusula `FOR UPDATE` nem
-    valida que a chamada está dentro de uma transação (ver
-    django/db/models/sql/compiler.py, condição
-    `self.query.select_for_update and features.has_select_for_update`).
-    Ou seja: um teste com threads reais batendo no SQLite não provaria nada
-    sobre o `select_for_update` em si (ele não bloqueia lá) — só mostraria
-    uma peculiaridade de locking do SQLite, o que tornaria o teste flaky e
-    não relacionado ao comportamento real de produção (Postgres, onde
-    `SELECT ... FOR UPDATE` bloqueia de verdade e serializa as transações).
-
-    Por isso o teste abaixo prova, de forma determinística, que o lock
-    "governa" a checagem: dentro de uma única transaction.atomic() — a mesma
-    seção que, em Postgres, uma segunda transação concorrente só atravessaria
-    depois que a primeira commitasse — criamos o pedido da primeira "checkout"
-    e então chamamos get_welcome_discount() de novo, simulando a checagem que
-    a segunda transação concorrente faria ao ser liberada pelo lock. Ela deve
-    enxergar o pedido recém-criado e negar o desconto, confirmando que a
-    ordem lock -> checagem -> criação está correta e que, em um banco com
-    locking real, isso serializa as duas requisições concorrentes.
+    resolve_coupon não trava o usuário: quem serializa os checkouts de um
+    mesmo cliente é prepare_checkout_attempt, que trava a linha do usuário
+    antes de calcular o cupom. No SQLite dos testes select_for_update() não
+    bloqueia, então os testes abaixo provam a ordem (trava -> checagem) em
+    vez de disputar com threads.
     """
 
     def setUp(self):
         self.user = User.objects.create_user(
-            email="concorrencia@shio.com",
-            name="Concorrencia",
-            password="senha_forte_123",
+            email="concorrencia@shio.com", name="Concorrencia"
         )
+        self.address = make_address(self.user)
+        category = Category.objects.create(name="LockCat", slug="lock-cat")
+        product = Product.objects.create(
+            category=category, name="Jaqueta", description="x", base_price=200
+        )
+        self.variation = ProductVariation.objects.create(
+            product=product, size="M", sku="LOCK-M", stock_quantity=10
+        )
+        cart = Cart.objects.create(user=self.user, status="ACTIVE")
+        CartItem.objects.create(
+            cart=cart, variation=self.variation, quantity=1, unit_price=200
+        )
+        self.items = [{"variation": self.variation, "total_price": Decimal("200.00")}]
+        self.client.force_authenticate(user=self.user)
 
-    def test_lock_do_usuario_governa_checagem_de_primeira_compra(self):
+    def test_segunda_checagem_depois_da_trava_ve_o_primeiro_pedido(self):
         with transaction.atomic():
             User.objects.select_for_update().get(pk=self.user.pk)
 
-            coupon, discount = get_welcome_discount(self.user, Decimal("200.00"))
-            self.assertIsNotNone(coupon)
-            self.assertEqual(coupon.code, "BEMVINDO10")
-            self.assertEqual(discount, Decimal("20.00"))
-
+            first = resolve_coupon(self.user, self.items, Decimal("200.00"), lock=True)
+            self.assertEqual(first.coupon.code, "BEMVINDO10")
+            self.assertEqual(first.discount, Decimal("20.00"))
             CustomerOrder.objects.create(
                 user=self.user,
-                coupon=coupon,
+                coupon=first.coupon,
                 subtotal=Decimal("200.00"),
-                discount_amount=discount,
+                discount_amount=first.discount,
                 total_amount=Decimal("180.00"),
                 status=OrderStatus.AWAITING_PAYMENT,
             )
 
-            # Simula a segunda transação concorrente retomando após o lock:
-            # ela deve enxergar o pedido acabado de criar e não conceder
-            # desconto duplicado.
-            coupon2, discount2 = get_welcome_discount(self.user, Decimal("200.00"))
-            self.assertIsNone(coupon2)
-            self.assertEqual(discount2, Decimal("0.00"))
+            # O segundo checkout só passaria da trava depois do commit do
+            # primeiro e precisa enxergar o pedido criado.
+            second = resolve_coupon(self.user, self.items, Decimal("200.00"), lock=True)
+            self.assertIsNone(second.coupon)
+            self.assertEqual(second.discount, Decimal("0.00"))
 
-    def test_helper_bloqueia_linha_do_usuario_antes_de_checar_pedidos_anteriores(self):
-        """Prova, via SQL de fato executado, que get_welcome_discount adquire
-        o lock na linha do usuário (SELECT ... na tabela de usuário via
-        select_for_update) ANTES de consultar se ele já possui pedido. Essa
-        ordem é o que, em um banco com locking real (Postgres em produção),
-        serializa dois checkouts concorrentes do mesmo usuário — a segunda
-        transação bloqueia no lock até a primeira commitar. Diferente do
-        teste acima (que só confirma o resultado final e passaria mesmo sem
-        o lock, já que o SQLite ignora select_for_update), este teste
-        garante que uma remoção acidental do select_for_update() quebre o
-        CI, checando a ordem real das queries emitidas."""
-        User = get_user_model()
+    def test_checkout_trava_o_usuario_antes_de_checar_pedidos_anteriores(self):
+        """Se alguém remover a trava do usuário do checkout, este teste quebra
+        mesmo no SQLite, porque checa a ordem das consultas emitidas."""
+        payload = make_checkout_payload(self.client, self.address)
         user_table = User._meta.db_table
         order_table = CustomerOrder._meta.db_table
 
-        with transaction.atomic():
-            with CaptureQueriesContext(connection) as ctx:
-                get_welcome_discount(self.user, Decimal("200.00"))
-
-        queries = [q["sql"] for q in ctx.captured_queries]
-        user_query_index = next(
-            (i for i, sql in enumerate(queries) if user_table in sql), None
-        )
-        order_query_index = next(
-            (i for i, sql in enumerate(queries) if order_table in sql), None
-        )
-
-        self.assertIsNotNone(
-            user_query_index, "Esperava uma query de lock na tabela de usuário."
-        )
-        self.assertIsNotNone(
-            order_query_index,
-            "Esperava uma query checando pedidos anteriores do usuário.",
-        )
-        self.assertLess(
-            user_query_index,
-            order_query_index,
-            "O lock select_for_update na linha do usuário deve ocorrer antes "
-            "da checagem de pedidos anteriores (CustomerOrder.objects...exists()).",
-        )
-
-
-class WelcomeDiscountCouponRulesTests(APITestCase):
-    """Cobre as regras do cupom que antes eram ignoradas pelos helpers de
-    desconto: expiration_date e discount_type (PERCENTAGE vs FIXED_VALUE).
-    """
-
-    def setUp(self):
-        self.user = User.objects.create_user(
-            email="cupom@shio.com", name="Cupom", password="senha_forte_123"
-        )
-        self.coupon = Coupon.objects.get(code="BEMVINDO10")
-
-    def test_cupom_sem_expiracao_continua_valido(self):
-        coupon, discount = get_welcome_discount_preview(self.user, Decimal("200.00"))
-
-        self.assertIsNotNone(coupon)
-        self.assertEqual(discount, Decimal("20.00"))
-
-    def test_cupom_com_expiracao_futura_continua_valido(self):
-        self.coupon.expiration_date = timezone.now() + timedelta(days=1)
-        self.coupon.save()
-
-        coupon, discount = get_welcome_discount_preview(self.user, Decimal("200.00"))
-
-        self.assertIsNotNone(coupon)
-        self.assertEqual(discount, Decimal("20.00"))
-
-    def test_cupom_expirado_nao_concede_desconto(self):
-        self.coupon.expiration_date = timezone.now() - timedelta(days=1)
-        self.coupon.save()
-
-        coupon, discount = get_welcome_discount_preview(self.user, Decimal("200.00"))
-
-        self.assertIsNone(coupon)
-        self.assertEqual(discount, Decimal("0.00"))
-
-    def test_cupom_expirado_tambem_bloqueia_no_checkout(self):
-        """A versão com lock (usada no checkout) compartilha o mesmo helper,
-        então também precisa respeitar a expiração."""
-        self.coupon.expiration_date = timezone.now() - timedelta(days=1)
-        self.coupon.save()
-
-        with transaction.atomic():
-            coupon, discount = get_welcome_discount(self.user, Decimal("200.00"))
-
-        self.assertIsNone(coupon)
-        self.assertEqual(discount, Decimal("0.00"))
-
-    def test_cupom_fixed_value_aplica_valor_fixo(self):
-        # Alteração restrita a esta transação de teste (rollback no tearDown),
-        # simulando alguém editando o cupom pelo admin.
-        self.coupon.discount_type = "FIXED_VALUE"
-        self.coupon.discount_value = Decimal("30.00")
-        self.coupon.save()
-
-        coupon, discount = get_welcome_discount_preview(self.user, Decimal("200.00"))
-
-        self.assertIsNotNone(coupon)
-        self.assertEqual(discount, Decimal("30.00"))
-
-    def test_cupom_fixed_value_maior_que_subtotal_e_limitado_ao_subtotal(self):
-        self.coupon.discount_type = "FIXED_VALUE"
-        self.coupon.discount_value = Decimal("500.00")
-        self.coupon.save()
-
-        coupon, discount = get_welcome_discount_preview(self.user, Decimal("200.00"))
-
-        self.assertIsNotNone(coupon)
-        self.assertEqual(discount, Decimal("200.00"))
-
-    def test_preview_e_versao_com_lock_retornam_o_mesmo_resultado(self):
-        """Guarda contra drift entre os dois helpers públicos (ambos delegam a
-        _compute_welcome_discount)."""
-        preview_coupon, preview_discount = get_welcome_discount_preview(
-            self.user, Decimal("200.00")
-        )
-        with transaction.atomic():
-            locked_coupon, locked_discount = get_welcome_discount(
-                self.user, Decimal("200.00")
+        with CaptureQueriesContext(connection) as ctx:
+            prepare_checkout_attempt(
+                self.user,
+                uuid.UUID(payload["address_id"]),
+                uuid.UUID(payload["shipping_quote_id"]),
+                uuid.UUID(payload["idempotency_key"]),
             )
 
-        self.assertEqual(preview_coupon, locked_coupon)
-        self.assertEqual(preview_discount, locked_discount)
+        queries = [q["sql"] for q in ctx.captured_queries]
+        user_index = next(i for i, sql in enumerate(queries) if user_table in sql)
+        order_index = next(
+            i for i, sql in enumerate(queries) if f'"{order_table}"' in sql
+        )
+        self.assertLess(user_index, order_index)
 
 
 @override_settings(**SHIPPING_TEST_SETTINGS)

@@ -24,7 +24,6 @@ from orders.models import (
     OrderStatus,
     normalize_coupon_code,
 )
-from orders.services import get_welcome_discount, get_welcome_discount_preview
 from products.models import Category, DropCampaign, Product, ProductVariation
 
 User = get_user_model()
@@ -223,12 +222,21 @@ class WelcomeDiscountEligibilityTests(TestCase):
         self.user = User.objects.create_user(email="novo@shio.com", name="Novo")
 
     def assert_eligible(self, expected):
-        coupon, _ = get_welcome_discount_preview(self.user, Decimal("200.00"))
-        with transaction.atomic():
-            locked_coupon, _ = get_welcome_discount(self.user, Decimal("200.00"))
+        category = Category.objects.get_or_create(name="Boas-vindas", slug="bv")[0]
+        product = Product.objects.create(
+            name="Camiseta", description="x", base_price=200, category=category
+        )
+        variation = ProductVariation.objects.create(
+            product=product, size="M", sku=f"BV-{product.pk}", stock_quantity=1
+        )
+        items = [{"variation": variation, "total_price": Decimal("200.00")}]
 
-        self.assertEqual(coupon is not None, expected)
-        self.assertEqual(locked_coupon is not None, expected)
+        preview = resolve_coupon(self.user, items, Decimal("200.00"))
+        with transaction.atomic():
+            locked = resolve_coupon(self.user, items, Decimal("200.00"), lock=True)
+
+        self.assertEqual(preview.coupon is not None, expected)
+        self.assertEqual(locked.coupon is not None, expected)
 
     def test_cliente_sem_pedidos_e_elegivel(self):
         self.assert_eligible(True)
@@ -492,52 +500,6 @@ class ResolveCouponEmptyCartTests(ResolveCouponTestCase):
         self.items, self.subtotal = [], Decimal("0.00")
 
         self.assert_error(self.resolve("VERAO20"), "coupon_not_applicable")
-
-
-class ResolveCouponWelcomeEquivalenceTests(ResolveCouponTestCase):
-    """O modo automático precisa repetir o BEMVINDO10 de hoje, para que a
-    troca de _compute_welcome_discount por resolve_coupon não mude nada."""
-
-    def setUp(self):
-        super().setUp()
-        self.welcome = Coupon.objects.get(code="BEMVINDO10")
-        self.welcome.is_active = True
-        self.welcome.save()
-
-    def assert_equivalent(self):
-        old_coupon, old_discount = get_welcome_discount_preview(
-            self.user, self.subtotal
-        )
-        result = self.resolve()
-        self.assertEqual(result.coupon, old_coupon)
-        self.assertEqual(result.discount, old_discount)
-
-    def test_cliente_novo(self):
-        self.assert_equivalent()
-
-    def test_cliente_com_pedido_pago(self):
-        create_order(self.user)
-        self.assert_equivalent()
-
-    def test_cliente_com_pedido_cancelado(self):
-        create_order(self.user, order_status=OrderStatus.CANCELED)
-        self.assert_equivalent()
-
-    def test_cupom_inativo(self):
-        self.welcome.is_active = False
-        self.welcome.save()
-        self.assert_equivalent()
-
-    def test_cupom_expirado(self):
-        self.welcome.expiration_date = timezone.now() - timedelta(days=1)
-        self.welcome.save()
-        self.assert_equivalent()
-
-    def test_cupom_de_valor_fixo_maior_que_o_subtotal(self):
-        self.welcome.discount_type = CouponDiscountType.FIXED_VALUE
-        self.welcome.discount_value = Decimal("500.00")
-        self.welcome.save()
-        self.assert_equivalent()
 
 
 class ConcurrentCouponLastUseTests(TransactionTestCase):
