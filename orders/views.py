@@ -1224,29 +1224,29 @@ class CouponListCreateView(APIView):
 
     @extend_schema(responses=CouponAdminSerializer(many=True))
     def get(self, request):
-        active = request.query_params.get('active')
-        search = request.query_params.get('search')
-        partner = request.query_params.get('partner')
+        active = request.query_params.get("active")
+        search = request.query_params.get("search")
+        partner = request.query_params.get("partner")
 
         qs = Coupon.objects.all()
-        if active == 'true':
+        if active == "true":
             qs = qs.filter(is_active=True)
-        elif active == 'false':
+        elif active == "false":
             qs = qs.filter(is_active=False)
-        
+
         if search:
             qs = qs.filter(Q(code__icontains=search) | Q(description__icontains=search))
-        
+
         if partner:
             qs = qs.filter(partner=partner)
 
         # Metrics
         valid_orders = valid_order_q("orders__")
         qs = qs.annotate(
-            uses_count=Count('orders', filter=valid_orders),
-            total_discount_given=Sum('orders__discount_amount', filter=valid_orders),
-            revenue=Sum('orders__total_amount', filter=valid_orders)
-        ).order_by('-created_at')
+            uses_count=Count("orders", filter=valid_orders),
+            total_discount_given=Sum("orders__discount_amount", filter=valid_orders),
+            revenue=Sum("orders__total_amount", filter=valid_orders),
+        ).order_by("-created_at")
 
         # Pagination using existing DRF pattern in project (PageNumberPagination is usually standard)
         paginator = PageNumberPagination()
@@ -1259,12 +1259,12 @@ class CouponListCreateView(APIView):
         serializer = CouponAdminSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         coupon = serializer.save()
-        
+
         valid_orders = valid_order_q("orders__")
         qs = Coupon.objects.annotate(
-            uses_count=Count('orders', filter=valid_orders),
-            total_discount_given=Sum('orders__discount_amount', filter=valid_orders),
-            revenue=Sum('orders__total_amount', filter=valid_orders)
+            uses_count=Count("orders", filter=valid_orders),
+            total_discount_given=Sum("orders__discount_amount", filter=valid_orders),
+            revenue=Sum("orders__total_amount", filter=valid_orders),
         ).get(id=coupon.id)
 
         resp_serializer = CouponAdminSerializer(qs)
@@ -1277,11 +1277,12 @@ class CouponDetailView(APIView):
     def get_object(self, pk):
         valid_orders = valid_order_q("orders__")
         qs = Coupon.objects.annotate(
-            uses_count=Count('orders', filter=valid_orders),
-            total_discount_given=Sum('orders__discount_amount', filter=valid_orders),
-            revenue=Sum('orders__total_amount', filter=valid_orders)
+            uses_count=Count("orders", filter=valid_orders),
+            total_discount_given=Sum("orders__discount_amount", filter=valid_orders),
+            revenue=Sum("orders__total_amount", filter=valid_orders),
         )
         from django.shortcuts import get_object_or_404
+
         return get_object_or_404(qs, pk=pk)
 
     @extend_schema(responses=CouponAdminSerializer)
@@ -1295,15 +1296,20 @@ class CouponDetailView(APIView):
         coupon = self.get_object(uuid)
         serializer = CouponAdminSerializer(coupon, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
-        
+
         # O code não pode mudar depois do primeiro uso.
-        if 'code' in request.data and coupon.uses_count > 0:
-            if request.data['code'].upper() != coupon.code:
+        if "code" in request.data and coupon.uses_count > 0:
+            if request.data["code"].upper() != coupon.code:
                 from rest_framework.exceptions import ValidationError
-                raise ValidationError({"code": "Não é possível alterar o código de um cupom que já foi usado."})
+
+                raise ValidationError(
+                    {
+                        "code": "Não é possível alterar o código de um cupom que já foi usado."
+                    }
+                )
 
         serializer.save()
-        
+
         coupon = self.get_object(uuid)
         resp_serializer = CouponAdminSerializer(coupon)
         return Response(resp_serializer.data)
@@ -1314,8 +1320,10 @@ class CouponDetailView(APIView):
         if coupon.uses_count > 0:
             coupon.is_active = False
             coupon.save()
-            return Response({"message": "Cupom desativado pois já possui usos."}, status=status.HTTP_200_OK)
+            return Response(
+                {"message": "Cupom desativado pois já possui usos."},
+                status=status.HTTP_200_OK,
+            )
         else:
             coupon.delete()
             return Response(status=status.HTTP_204_NO_CONTENT)
-

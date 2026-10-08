@@ -9,24 +9,23 @@ from .models import Coupon, CouponDiscountType
 
 User = get_user_model()
 
+
 class AdminCouponViewSetTests(APITestCase):
     def setUp(self):
         Coupon.objects.all().delete()
         self.admin_user = User.objects.create_superuser(
-            email="admin@shio.com",
-            password="adminpassword"
+            email="admin@shio.com", password="adminpassword"
         )
         self.normal_user = User.objects.create_user(
-            email="user@shio.com",
-            password="userpassword"
+            email="user@shio.com", password="userpassword"
         )
         self.list_url = reverse("orders:admin-coupons-list")
-        
+
         self.coupon = Coupon.objects.create(
             code="TEST10",
             discount_type=CouponDiscountType.PERCENTAGE,
             discount_value=Decimal("10.00"),
-            is_active=True
+            is_active=True,
         )
         self.detail_url = reverse("orders:admin-coupons-detail", args=[self.coupon.id])
 
@@ -35,7 +34,9 @@ class AdminCouponViewSetTests(APITestCase):
         response = self.client.get(self.list_url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         # DRF test may paginate, DRF list uses response.data['results'] if paginated
-        results = response.data['results'] if 'results' in response.data else response.data
+        results = (
+            response.data["results"] if "results" in response.data else response.data
+        )
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["code"], "TEST10")
 
@@ -55,7 +56,7 @@ class AdminCouponViewSetTests(APITestCase):
             "discount_type": "FIXED_VALUE",
             "discount_value": "20.00",
             "max_uses_total": 50,
-            "is_active": True
+            "is_active": True,
         }
         response = self.client.post(self.list_url, payload)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
@@ -63,10 +64,7 @@ class AdminCouponViewSetTests(APITestCase):
 
     def test_admin_can_update_coupon(self):
         self.client.force_authenticate(user=self.admin_user)
-        payload = {
-            "is_active": False,
-            "max_uses_total": 100
-        }
+        payload = {"is_active": False, "max_uses_total": 100}
         response = self.client.patch(self.detail_url, payload)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.coupon.refresh_from_db()

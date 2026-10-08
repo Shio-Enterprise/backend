@@ -487,9 +487,15 @@ class CouponAdminSerializer(serializers.ModelSerializer):
         many=True, queryset=Category.objects.all(), required=False
     )
     uses_count = serializers.IntegerField(read_only=True, required=False)
-    remaining_uses = serializers.IntegerField(read_only=True, required=False, allow_null=True)
-    total_discount_given = serializers.DecimalField(read_only=True, max_digits=12, decimal_places=2, required=False)
-    revenue = serializers.DecimalField(read_only=True, max_digits=12, decimal_places=2, required=False)
+    remaining_uses = serializers.IntegerField(
+        read_only=True, required=False, allow_null=True
+    )
+    total_discount_given = serializers.DecimalField(
+        read_only=True, max_digits=12, decimal_places=2, required=False
+    )
+    revenue = serializers.DecimalField(
+        read_only=True, max_digits=12, decimal_places=2, required=False
+    )
 
     class Meta:
         model = Coupon
@@ -499,24 +505,24 @@ class CouponAdminSerializer(serializers.ModelSerializer):
     def to_representation(self, instance):
         rep = super().to_representation(instance)
         # Populate names for frontend
-        rep['drops_data'] = [
+        rep["drops_data"] = [
             {"id": str(d.id), "name": d.name} for d in instance.drops.all()
         ]
-        rep['categories_data'] = [
+        rep["categories_data"] = [
             {"id": str(c.id), "name": c.name} for c in instance.categories.all()
         ]
-        
+
         # Calculate remaining uses if applicable
         if instance.max_uses_total is not None:
-            uses = rep.get('uses_count', 0)
-            rep['remaining_uses'] = max(0, instance.max_uses_total - uses)
-            
+            uses = rep.get("uses_count", 0)
+            rep["remaining_uses"] = max(0, instance.max_uses_total - uses)
+
         return rep
 
     def validate(self, data):
         # We need to validate using both new data and existing instance data (if update)
         is_update = self.instance is not None
-        
+
         # Helper to get field value considering update logic
         def get_val(field):
             if field in data:
@@ -525,54 +531,76 @@ class CouponAdminSerializer(serializers.ModelSerializer):
                 return getattr(self.instance, field)
             return None
 
-        code = get_val('code')
+        code = get_val("code")
         if code:
             code = "".join(str(code).split()).upper()
             if not re.match(r"^[A-Z0-9_-]+$", code):
-                raise serializers.ValidationError({"code": "Código inválido. Use apenas letras, números, hífen e underline."})
-            
+                raise serializers.ValidationError(
+                    {
+                        "code": "Código inválido. Use apenas letras, números, hífen e underline."
+                    }
+                )
+
             # Check uniqueness
             qs = Coupon.objects.filter(code__iexact=code)
             if is_update:
                 qs = qs.exclude(id=self.instance.id)
             if qs.exists():
                 raise serializers.ValidationError({"code": "Este código já existe."})
-            
-            data['code'] = code
 
-        discount_type = get_val('discount_type')
-        discount_value = get_val('discount_value')
-        
+            data["code"] = code
+
+        discount_type = get_val("discount_type")
+        discount_value = get_val("discount_value")
+
         if discount_value is not None:
             if discount_value <= 0:
-                raise serializers.ValidationError({"discount_value": "O desconto deve ser maior que 0."})
+                raise serializers.ValidationError(
+                    {"discount_value": "O desconto deve ser maior que 0."}
+                )
             if discount_type == CouponDiscountType.PERCENTAGE and discount_value > 100:
-                raise serializers.ValidationError({"discount_value": "O desconto percentual não pode passar de 100%."})
+                raise serializers.ValidationError(
+                    {"discount_value": "O desconto percentual não pode passar de 100%."}
+                )
 
-        max_discount_amount = get_val('max_discount_amount')
+        max_discount_amount = get_val("max_discount_amount")
         if max_discount_amount is not None:
             if discount_type == CouponDiscountType.FIXED_VALUE:
-                raise serializers.ValidationError({"max_discount_amount": "Teto de desconto não se aplica a descontos de valor fixo."})
+                raise serializers.ValidationError(
+                    {
+                        "max_discount_amount": "Teto de desconto não se aplica a descontos de valor fixo."
+                    }
+                )
 
-        starts_at = get_val('starts_at')
-        expiration_date = get_val('expiration_date')
+        starts_at = get_val("starts_at")
+        expiration_date = get_val("expiration_date")
         if starts_at and expiration_date:
             if starts_at >= expiration_date:
-                raise serializers.ValidationError({"starts_at": "A data de início deve ser anterior à data de expiração."})
+                raise serializers.ValidationError(
+                    {
+                        "starts_at": "A data de início deve ser anterior à data de expiração."
+                    }
+                )
 
-        max_uses_total = get_val('max_uses_total')
-        max_uses_per_user = get_val('max_uses_per_user')
+        max_uses_total = get_val("max_uses_total")
+        max_uses_per_user = get_val("max_uses_per_user")
         if max_uses_total and max_uses_per_user:
             if max_uses_per_user > max_uses_total:
-                raise serializers.ValidationError({"max_uses_per_user": "O limite por usuário não pode ser maior que o limite total."})
+                raise serializers.ValidationError(
+                    {
+                        "max_uses_per_user": "O limite por usuário não pode ser maior que o limite total."
+                    }
+                )
 
-        auto_apply = get_val('auto_apply')
-        is_active = get_val('is_active')
+        auto_apply = get_val("auto_apply")
+        is_active = get_val("is_active")
         if auto_apply and is_active:
             qs = Coupon.objects.filter(auto_apply=True, is_active=True)
             if is_update:
                 qs = qs.exclude(id=self.instance.id)
             if qs.exists():
-                raise serializers.ValidationError({"auto_apply": "Já existe um cupom ativo com aplicação automática."})
+                raise serializers.ValidationError(
+                    {"auto_apply": "Já existe um cupom ativo com aplicação automática."}
+                )
 
         return data
