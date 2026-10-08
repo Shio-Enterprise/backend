@@ -372,11 +372,22 @@ def validate_shipping_quote(user, quote_id, cart_id, address_id, *, lock=False):
         )
     try:
         contents = _get_checkout_contents(
-            user, quote.address_id, quote.cart_id, lock=lock
+            user,
+            quote.address_id,
+            quote.cart_id,
+            coupon_code=quote.coupon_code,
+            lock=lock,
         )
         matches = quote.snapshot == _shipping_quote_snapshot(contents)
     except ValidationError:
-        matches = False
+        contents, matches = None, False
+    if contents is not None and contents["coupon_error"]:
+        # O cupom digitado deixou de valer depois da cotação (desativado,
+        # esgotado, vencido): erro específico em vez de "a compra mudou".
+        ShippingQuote.objects.filter(pk=quote.pk, invalidated_at__isnull=True).update(
+            invalidated_at=timezone.now()
+        )
+        raise_coupon_error(contents)
     if not matches:
         ShippingQuote.objects.filter(pk=quote.pk, invalidated_at__isnull=True).update(
             invalidated_at=timezone.now()
@@ -400,7 +411,10 @@ def checkout_from_shipping_quote(user, quote_id, address_id):
     quote = validate_shipping_quote(
         user, quote_id, cart.pk if cart else None, address_id, lock=True
     )
-    contents = _get_checkout_contents(user, address_id, quote.cart_id, lock=True)
+    # O pedido é criado com o cupom deste recálculo: precisa ser o da cotação.
+    contents = _get_checkout_contents(
+        user, address_id, quote.cart_id, coupon_code=quote.coupon_code, lock=True
+    )
     # A validação mantém os itens, produtos e endereço bloqueados até o commit.
     return {
         **contents,

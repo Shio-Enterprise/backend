@@ -643,6 +643,86 @@ class CouponQuoteTests(CouponCheckoutFlowTestCase):
         self.assertNotIn("code", response.json())
 
 
+@patch(
+    "orders.services.create_infinitepay_checkout",
+    return_value="https://pay.example.com/mock",
+)
+class CouponCheckoutRevalidationTests(CouponCheckoutFlowTestCase):
+    def checkout(self, quote_response):
+        return self.client.post(
+            CHECKOUT_URL,
+            {
+                "address_id": str(self.address.pk),
+                "shipping_quote_id": quote_response.data["shipping_quote_id"],
+                "idempotency_key": str(uuid.uuid4()),
+            },
+            format="json",
+        )
+
+    def test_pedido_sai_com_o_cupom_digitado_e_nao_com_o_automatico(self, _):
+        create_coupon(discount_value=Decimal("25.00"))
+        quote = self.quote("VERAO20")
+
+        response = self.checkout(quote)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        order = CustomerOrder.objects.get(user=self.user)
+        self.assertEqual(order.coupon.code, "VERAO20")
+        self.assertEqual(order.discount_amount, Decimal("50.00"))
+        self.assertEqual(order.total_amount, Decimal("165.00"))
+
+    def test_sem_codigo_o_pedido_sai_com_o_bemvindo10(self, _):
+        response = self.checkout(self.quote())
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        order = CustomerOrder.objects.get(user=self.user)
+        self.assertEqual(order.coupon.code, "BEMVINDO10")
+        self.assertEqual(order.discount_amount, Decimal("20.00"))
+
+    def test_cupom_desativado_depois_da_cotacao_barra_o_checkout(self, _):
+        coupon = create_coupon()
+        quote = self.quote("VERAO20")
+        Coupon.objects.filter(pk=coupon.pk).update(is_active=False)
+
+        response = self.checkout(quote)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.json(),
+            {
+                "coupon_code": ["Este cupom não está mais disponível."],
+                "code": "coupon_inactive",
+            },
+        )
+        self.assertFalse(CustomerOrder.objects.filter(user=self.user).exists())
+        shipping_quote = ShippingQuote.objects.get(pk=quote.data["shipping_quote_id"])
+        self.assertIsNotNone(shipping_quote.invalidated_at)
+
+    def test_cupom_esgotado_depois_da_cotacao_da_erro_especifico(self, _):
+        coupon = create_coupon(max_uses_total=1)
+        quote = self.quote("VERAO20")
+        other = User.objects.create_user(email="rapido@shio.com", name="Rápido")
+        create_order(other, coupon=coupon)
+
+        response = self.checkout(quote)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["code"], "coupon_limit_reached")
+        self.assertEqual(response.json()["coupon_code"], ["Este cupom esgotou."])
+
+    def test_cotacao_invalidada_pelo_cupom_nao_pode_ser_reusada(self, _):
+        coupon = create_coupon()
+        quote = self.quote("VERAO20")
+        Coupon.objects.filter(pk=coupon.pk).update(is_active=False)
+        self.checkout(quote)
+        Coupon.objects.filter(pk=coupon.pk).update(is_active=True)
+
+        response = self.checkout(quote)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("shipping_quote_id", response.json())
+
+
 class ConcurrentCouponLastUseTests(TransactionTestCase):
     """Duas compras disputando o último uso de um cupom: só uma pode levar.
 
