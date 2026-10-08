@@ -198,6 +198,11 @@ INFINITEPAY_WEBHOOK_URL = config("INFINITEPAY_WEBHOOK_URL", default="")
 STOCK_RESERVATION_TTL_MINUTES = config(
     "STOCK_RESERVATION_TTL_MINUTES", default=30, cast=int
 )
+# A liberação automática só pega reservas vencidas há mais que isto, para não
+# liberar a de quem está concluindo o pagamento no último instante.
+STOCK_RESERVATION_GRACE_SECONDS = config(
+    "STOCK_RESERVATION_GRACE_SECONDS", default=120, cast=int
+)
 SHIPPING_QUOTE_TTL_SECONDS = config("SHIPPING_QUOTE_TTL_SECONDS", default=900, cast=int)
 CHECKOUT_PROCESSING_TIMEOUT_SECONDS = config(
     "CHECKOUT_PROCESSING_TIMEOUT_SECONDS", default=60, cast=int
