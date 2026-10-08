@@ -59,6 +59,7 @@ Todos os targets rodam dentro do container `backend`:
 | `make lint` | Verifica `ruff check` + `ruff format` (sem alterar arquivos) |
 | `make format` | Corrige com `ruff --fix` e formata com `ruff format` |
 | `make schema-validate` | Valida o schema OpenAPI (`spectacular --validate --fail-on-warn`) |
+| `make expire` | Libera reservas de estoque vencidas (`make expire ARGS=--dry-run` só lista) |
 | `make ci` | **Gate de PR:** `lint` + `test` + `schema-validate` |
 | `make install` | Reinstala `requirements.txt` no container |
 
@@ -81,6 +82,28 @@ O container já executa as migrações e cria o administrador automaticamente.
 - `GOOGLE_CLIENT_ID`: client ID do OAuth do Google usado para validar `id_token`.
 - `ADMIN_NAME`, `ADMIN_PASS`, `ADMIN_EMAIL`: credenciais para o superusuário inicial.
 - `RESEND_API_KEY`, `DEFAULT_FROM_EMAIL`: envio de e-mails (veja [E-mails](#e-mails)).
+- `STOCK_RESERVATION_TTL_MINUTES`, `STOCK_RESERVATION_GRACE_SECONDS`, `RESERVATION_SWEEP_INTERVAL_SECONDS`: prazos da reserva de estoque (veja [Reserva de estoque](#reserva-de-estoque)).
+
+
+## Reserva de estoque
+
+Ao finalizar a compra, o pedido nasce `AWAITING_PAYMENT` e o estoque já é baixado, com prazo de `STOCK_RESERVATION_TTL_MINUTES` (padrão 30) em `reservation_expires_at`. Se o pagamento não for confirmado no prazo, o pedido é cancelado e o estoque devolvido.
+
+O projeto não tem fila de tarefas, então a liberação roda nas próprias requisições:
+
+- Ao abrir o detalhe do pedido (cliente ou admin).
+- Antes de validar o estoque no carrinho, na cotação e no checkout, só para as variações envolvidas.
+- Numa varredura em lote na listagem pública de produtos e no carrinho, no máximo uma vez a cada `RESERVATION_SWEEP_INTERVAL_SECONDS` (padrão 60) por processo. É ela que devolve ao catálogo um produto esgotado por reserva abandonada.
+
+A liberação automática espera `STOCK_RESERVATION_GRACE_SECONDS` (padrão 120) além do prazo, para não pegar quem está pagando no último instante. Pagamento confirmado depois da liberação mantém o pedido `CANCELED`, com o pagamento `PAID`.
+
+Para liberar sem depender de tráfego (por exemplo, num cron):
+
+```bash
+make expire                  # libera até 100 reservas vencidas
+make expire ARGS=--dry-run   # só lista o que seria liberado
+python manage.py expire_stale_orders --batch-size 200
+```
 
 ## Integração com os Correios
 

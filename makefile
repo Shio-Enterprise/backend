@@ -1,6 +1,6 @@
 DC_EXEC = docker compose exec backend 
 
-.PHONY: install test test-cov show-cov lint format migrate makemigrations run shell check schema-validate ci help ci-cov
+.PHONY: install test test-cov show-cov lint format migrate makemigrations run shell check schema-validate ci help ci-cov expire
 
 help:
 	@echo "Targets disponíveis:"
@@ -16,6 +16,7 @@ help:
 	@echo "  shell            Abre o Django shell interativo"
 	@echo "  check            Roda python manage.py check"
 	@echo "  schema-validate  Valida schema OpenAPI (CI gate)"
+	@echo "  expire           Libera reservas de estoque vencidas (ARGS=--dry-run)"
 	@echo "  ci               Roda lint + test + schema-validate (gate de PR)"
 	@echo "  ci-cov           Roda lint + test-cov + schema-validate + show-cov (gate de PR com coverage)"
 
@@ -53,6 +54,9 @@ shell:
 
 check:
 	$(DC_EXEC) python manage.py check
+
+expire:
+	$(DC_EXEC) python manage.py expire_stale_orders $(ARGS)
 
 schema-validate:
 	docker exec -it shio_api python manage.py spectacular --validate --fail-on-warn --file /tmp/schema.yaml

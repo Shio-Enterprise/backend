@@ -3,9 +3,11 @@ import time
 import uuid
 from datetime import timedelta
 from decimal import Decimal
+from io import StringIO
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.core.management import CommandError, call_command
 from django.db import connection
 from django.test import TransactionTestCase, override_settings, skipUnlessDBFeature
 from django.utils import timezone
@@ -504,3 +506,49 @@ class AutomaticReleaseTests(ReservationTestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertIsNotNone(response.json()["reservation_expires_at"])
+
+
+@override_settings(STOCK_RESERVATION_GRACE_SECONDS=120)
+class ExpireStaleOrdersCommandTests(ReservationTestCase):
+    def run_command(self, *args):
+        out = StringIO()
+        call_command("expire_stale_orders", *args, stdout=out)
+        return out.getvalue()
+
+    def test_dry_run_lista_e_nao_altera_nada(self):
+        order = self.create_reserved_order()
+
+        output = self.run_command("--dry-run")
+
+        self.assertIn(str(order.pk), output)
+        self.assertIn("1 reserva(s) seriam liberadas", output)
+        order.refresh_from_db()
+        self.assertEqual(order.status, OrderStatus.AWAITING_PAYMENT)
+        self.assert_stock(8)
+
+    def test_libera_e_informa_a_quantidade(self):
+        order = self.create_reserved_order()
+
+        output = self.run_command()
+
+        self.assertIn("1 reserva(s) liberadas", output)
+        order.refresh_from_db()
+        self.assertEqual(order.status, OrderStatus.CANCELED)
+        self.assert_stock(10)
+
+    def test_batch_size_limita_o_lote(self):
+        self.create_reserved_order()
+        self.create_reserved_order()
+
+        self.assertIn("1 reserva(s) liberadas", self.run_command("--batch-size", "1"))
+        self.assertIn("1 reserva(s) liberadas", self.run_command("--batch-size", "1"))
+        self.assertIn("Nenhuma reserva vencida", self.run_command())
+
+    def test_sem_reservas_vencidas(self):
+        self.create_reserved_order(expires_in=timedelta(minutes=10))
+
+        self.assertIn("Nenhuma reserva vencida", self.run_command())
+
+    def test_batch_size_invalido(self):
+        with self.assertRaises(CommandError):
+            self.run_command("--batch-size", "0")
