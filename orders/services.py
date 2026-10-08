@@ -458,8 +458,10 @@ def create_infinitepay_checkout(order, request):
         items_data.append(
             {
                 "quantity": 1,
-                "price": -int(order.discount_amount * 100),
-                "description": "Desconto de boas-vindas",
+                "price": -money_to_cents(order.discount_amount),
+                "description": (
+                    f"Cupom {order.coupon.code}" if order.coupon else "Desconto"
+                ),
             }
         )
 

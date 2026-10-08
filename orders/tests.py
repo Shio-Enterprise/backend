@@ -4069,11 +4069,12 @@ class CreateInfinitePayCheckoutPayloadTests(APITestCase):
         )
         self.factory = RequestFactory()
 
-    def make_order(self, discount_amount):
+    def make_order(self, discount_amount, coupon=None):
         subtotal = Decimal("200.00")
         shipping_cost = Decimal("15.00")
         order = CustomerOrder.objects.create(
             user=self.user,
+            coupon=coupon,
             subtotal=subtotal,
             shipping_cost=shipping_cost,
             discount_amount=discount_amount,
@@ -4125,9 +4126,7 @@ class CreateInfinitePayCheckoutPayloadTests(APITestCase):
         payload = self.call_service(order)
 
         descriptions = [item["description"] for item in payload["items"]]
-        self.assertEqual(
-            descriptions, ["Tênis Teste", "Frete", "Desconto de boas-vindas"]
-        )
+        self.assertEqual(descriptions, ["Tênis Teste", "Frete", "Desconto"])
 
         discount_line = payload["items"][-1]
         self.assertEqual(discount_line["quantity"], 1)
@@ -4136,6 +4135,21 @@ class CreateInfinitePayCheckoutPayloadTests(APITestCase):
         # Os preços por produto continuam íntegros (itemização correta no recibo).
         self.assertEqual(payload["items"][0]["price"], 10000)
         self.assertEqual(payload["items"][0]["quantity"], 2)
+
+    def test_linha_de_desconto_mostra_o_codigo_do_cupom(self):
+        coupon = Coupon.objects.create(
+            code="VERAO20", discount_type="PERCENTAGE", discount_value=20
+        )
+        order = self.make_order(Decimal("40.00"), coupon=coupon)
+
+        payload = self.call_service(order)
+
+        self.assertEqual(payload["items"][-1]["description"], "Cupom VERAO20")
+        self.assertEqual(payload["items"][-1]["price"], -4000)
+        total_cobrado = sum(
+            item["price"] * item["quantity"] for item in payload["items"]
+        )
+        self.assertEqual(total_cobrado, int(order.total_amount * 100))
 
     def test_payload_sem_desconto_nao_ganha_linha_de_desconto(self):
         order = self.make_order(Decimal("0.00"))
