@@ -26,7 +26,6 @@ from authentication.permissions import (
     CanManageDrops,
     user_has_admin_permission,
 )
-
 from orders.expiration import sweep_expired_reservations
 
 from .availability import (
