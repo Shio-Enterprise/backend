@@ -35,7 +35,9 @@ class IsStaffOrSuperUser(permissions.BasePermission):
 
 class AdminPermissionRequired(permissions.BasePermission):
     codename = None
-    message = "Acesso negado. A sua conta não possui a permissão administrativa necessária."
+    message = (
+        "Acesso negado. A sua conta não possui a permissão administrativa necessária."
+    )
 
     def has_permission(self, request, view):
         if not self.codename:

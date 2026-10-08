@@ -248,10 +248,9 @@ class DropCampaignListCreateView(APIView):
         responses={200: DropCampaignSerializer(many=True)},
     )
     def get(self, request):
-        is_admin = (
-            user_has_admin_permission(request.user, "manage_drops")
-            or user_has_admin_permission(request.user, "manage_catalog")
-        )
+        is_admin = user_has_admin_permission(
+            request.user, "manage_drops"
+        ) or user_has_admin_permission(request.user, "manage_catalog")
         queryset = DropCampaign.objects.all().order_by("-created_at")
 
         if is_admin:
@@ -335,10 +334,9 @@ class DropCampaignDetailView(APIView):
     )
     def get(self, request, pk):
         drop = self._get_object(pk)
-        is_admin = (
-            user_has_admin_permission(request.user, "manage_drops")
-            or user_has_admin_permission(request.user, "manage_catalog")
-        )
+        is_admin = user_has_admin_permission(
+            request.user, "manage_drops"
+        ) or user_has_admin_permission(request.user, "manage_catalog")
         if not is_admin and not is_drop_visible(drop):
             return Response(
                 {"error": "Drop não encontrado."}, status=status.HTTP_404_NOT_FOUND
@@ -552,10 +550,9 @@ class ProductListCreateView(APIView):
             "variations", "images"
         )
 
-        is_admin = (
-            user_has_admin_permission(request.user, "manage_catalog")
-            or user_has_admin_permission(request.user, "manage_drops")
-        )
+        is_admin = user_has_admin_permission(
+            request.user, "manage_catalog"
+        ) or user_has_admin_permission(request.user, "manage_drops")
         is_active_param = query.validated_data.get("is_active")
         if is_admin:
             if is_active_param is not None:
@@ -671,10 +668,9 @@ class ProductDetailView(APIView):
             ),
             pk=pk,
         )
-        is_admin = (
-            user_has_admin_permission(request.user, "manage_catalog")
-            or user_has_admin_permission(request.user, "manage_drops")
-        )
+        is_admin = user_has_admin_permission(
+            request.user, "manage_catalog"
+        ) or user_has_admin_permission(request.user, "manage_drops")
         if is_admin and allow_inactive_for_admin:
             return product
         if not is_product_visible(product):

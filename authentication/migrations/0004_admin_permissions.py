@@ -1,7 +1,6 @@
 from django.db import migrations
 from django.db.models import Q
 
-
 PERMISSIONS = [
     ("access_admin_dashboard", "Acessar dashboard administrativo"),
     ("manage_catalog", "Gerenciar catálogo e estoque"),
@@ -39,9 +38,7 @@ def create_and_assign_permissions(apps, schema_editor):
         "user_id", flat=True
     )
     admins = User.objects.filter(
-        Q(is_staff=True)
-        | Q(is_superuser=True)
-        | Q(pk__in=admin_profile_user_ids)
+        Q(is_staff=True) | Q(is_superuser=True) | Q(pk__in=admin_profile_user_ids)
     ).distinct()
 
     through = User.user_permissions.through

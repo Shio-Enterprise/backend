@@ -5,7 +5,10 @@ from django.contrib.auth.models import AbstractUser
 from django.db import models
 from django.utils.translation import gettext_lazy as _
 
-from .admin_permissions import ADMIN_PERMISSION_DEFINITIONS, assign_default_admin_permissions
+from .admin_permissions import (
+    ADMIN_PERMISSION_DEFINITIONS,
+    assign_default_admin_permissions,
+)
 
 
 class UserManager(BaseUserManager):
@@ -101,7 +104,10 @@ class User(AbstractUser):
         was_staff = False
         if self.pk:
             was_staff = (
-                type(self).objects.filter(pk=self.pk).values_list("is_staff", flat=True).first()
+                type(self)
+                .objects.filter(pk=self.pk)
+                .values_list("is_staff", flat=True)
+                .first()
                 or False
             )
         super().save(*args, **kwargs)
@@ -147,7 +153,10 @@ class UserProfile(models.Model):
         previous_role = None
         if self.pk:
             previous_role = (
-                type(self).objects.filter(pk=self.pk).values_list("role", flat=True).first()
+                type(self)
+                .objects.filter(pk=self.pk)
+                .values_list("role", flat=True)
+                .first()
             )
         super().save(*args, **kwargs)
         if self.role == UserRole.ADMIN and previous_role != UserRole.ADMIN:
