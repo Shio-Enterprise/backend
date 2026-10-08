@@ -6,7 +6,7 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
-from authentication.permissions import IsStaffOrSuperUser
+from authentication.permissions import CanManageCatalog
 from products.models import Product
 
 from .models import ProductReview, ReviewStatus
@@ -205,7 +205,7 @@ def get_review_for_admin(review_id):
 
 
 class AdminReviewListView(APIView):
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageCatalog]
 
     @extend_schema(
         parameters=[AdminReviewListQuerySerializer],
@@ -231,7 +231,7 @@ class AdminReviewListView(APIView):
 
 
 class AdminReviewRemoveView(APIView):
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageCatalog]
 
     @extend_schema(
         request=RemovalInputSerializer,
@@ -252,7 +252,7 @@ class AdminReviewRemoveView(APIView):
 
 
 class AdminReviewRestoreView(APIView):
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageCatalog]
 
     @extend_schema(
         request=None,
@@ -269,7 +269,7 @@ class AdminReviewRestoreView(APIView):
 
 
 class AdminReviewReplyView(APIView):
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageCatalog]
 
     @extend_schema(
         request=ReplyInputSerializer,
