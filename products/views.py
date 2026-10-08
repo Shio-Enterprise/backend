@@ -189,7 +189,6 @@ class WishlistDeleteView(APIView):
 
 @api_view(["GET"])
 @permission_classes([CanManageCatalog])
-
 def inventory_summary(request):
     products = Product.objects.all()
     data = []
