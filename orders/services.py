@@ -31,6 +31,7 @@ from orders.models import (
     PaymentMethod,
     PaymentStatus,
     ShippingQuote,
+    normalize_coupon_code,
 )
 from orders.money import money_to_cents, normalize_money
 from products.availability import (
@@ -271,6 +272,7 @@ def _shipping_quote_snapshot(contents):
         "coupon": (
             {
                 "id": str(contents["coupon"].pk),
+                "code": contents["coupon"].code,
                 "type": contents["coupon"].discount_type,
                 "value": str(contents["coupon"].discount_value),
                 "expiration": str(contents["coupon"].expiration_date),
@@ -282,18 +284,40 @@ def _shipping_quote_snapshot(contents):
     }
 
 
-def create_shipping_quote(user, address_id):
-    """Persiste o cálculo do servidor sem criar pedido ou reservar estoque."""
+def raise_coupon_error(contents):
+    """Recusa a compra quando o cupom digitado não vale.
+
+    O código do erro vai explícito no corpo, porque o DRF não serializa o
+    `code=` do ValidationError: {"coupon_code": [mensagem], "code": "..."}.
+    """
+    error = contents["coupon_error"]
+    if error:
+        raise ValidationError(
+            {"coupon_code": [error["message"]], "code": error["code"]},
+            code=error["code"],
+        )
+
+
+def create_shipping_quote(user, address_id, coupon_code=""):
+    """Persiste o cálculo do servidor sem criar pedido ou reservar estoque.
+
+    Com `coupon_code`, só esse cupom é considerado; se ele não vale, a
+    cotação é recusada em vez de sair sem desconto.
+    """
     ttl = settings.SHIPPING_QUOTE_TTL_SECONDS
     if isinstance(ttl, bool) or not isinstance(ttl, int) or ttl <= 0:
         raise ImproperlyConfigured(
             "SHIPPING_QUOTE_TTL_SECONDS deve ser inteiro positivo."
         )
 
-    contents = _get_checkout_contents(user, address_id)
+    coupon_code = normalize_coupon_code(coupon_code or "")
+    contents = _get_checkout_contents(user, address_id, coupon_code=coupon_code)
+    raise_coupon_error(contents)
     snapshot = _shipping_quote_snapshot(contents)
     calculation = _calculate_checkout(contents)
-    current = _get_checkout_contents(user, address_id, contents["cart"].id)
+    current = _get_checkout_contents(
+        user, address_id, contents["cart"].id, coupon_code=coupon_code
+    )
     if snapshot != _shipping_quote_snapshot(current):
         raise ValidationError(
             {
@@ -311,6 +335,7 @@ def create_shipping_quote(user, address_id):
         discount_amount=calculation["discount_amount"],
         total_amount=calculation["total_amount"],
         prazo_dias=calculation["prazo_dias"],
+        coupon_code=coupon_code,
         expires_at=timezone.now() + timedelta(seconds=ttl),
     )
 

@@ -421,7 +421,9 @@ class CartItemUpdateSerializer(serializers.Serializer):
     quantity = serializers.IntegerField(min_value=1)
 
 
-class CheckoutCalculationInputSerializer(serializers.Serializer):
+class _CheckoutBaseInputSerializer(serializers.Serializer):
+    """Base da cotação e do checkout: recusa qualquer campo não declarado."""
+
     address_id = serializers.UUIDField()
 
     def to_internal_value(self, data):
@@ -437,13 +439,26 @@ class CheckoutCalculationInputSerializer(serializers.Serializer):
         return super().to_internal_value(data)
 
 
-class CheckoutInputSerializer(CheckoutCalculationInputSerializer):
+class CheckoutCalculationInputSerializer(_CheckoutBaseInputSerializer):
+    # Só a cotação recebe o código; o checkout usa o que ficou gravado nela.
+    coupon_code = serializers.CharField(
+        required=False, allow_blank=True, max_length=50, default=""
+    )
+
+
+class CheckoutInputSerializer(_CheckoutBaseInputSerializer):
     shipping_quote_id = serializers.UUIDField()
     idempotency_key = serializers.UUIDField()
 
 
 class CheckoutQuoteItemSerializer(CartItemRepresentationSerializer):
     stock_quantity = serializers.IntegerField(required=False)
+
+
+class CheckoutCouponSerializer(serializers.Serializer):
+    code = serializers.CharField()
+    type = serializers.CharField()
+    value = serializers.DecimalField(max_digits=10, decimal_places=2)
 
 
 class CheckoutCalculationSerializer(serializers.Serializer):
@@ -455,4 +470,6 @@ class CheckoutCalculationSerializer(serializers.Serializer):
     subtotal = serializers.DecimalField(max_digits=10, decimal_places=2)
     shipping_cost = serializers.DecimalField(max_digits=10, decimal_places=2)
     discount_amount = serializers.DecimalField(max_digits=10, decimal_places=2)
+    # Cupom aplicado (digitado ou automático), ou null.
+    coupon = CheckoutCouponSerializer(source="snapshot.coupon", allow_null=True)
     total_amount = serializers.DecimalField(max_digits=10, decimal_places=2)

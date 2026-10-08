@@ -1,16 +1,26 @@
 import threading
 import time
+import uuid
 from datetime import timedelta
 from decimal import Decimal
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import AnonymousUser
 from django.db import IntegrityError, connection, transaction
 from django.db.models import Count, ProtectedError
-from django.test import TestCase, TransactionTestCase, skipUnlessDBFeature
+from django.test import (
+    TestCase,
+    TransactionTestCase,
+    override_settings,
+    skipUnlessDBFeature,
+)
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
+from rest_framework import status
+from rest_framework.test import APITestCase
 
+from authentication.models import Address
 from orders.coupons import (
     COUPON_ERROR_MESSAGES,
     count_coupon_uses,
@@ -18,10 +28,13 @@ from orders.coupons import (
     valid_order_q,
 )
 from orders.models import (
+    Cart,
+    CartItem,
     Coupon,
     CouponDiscountType,
     CustomerOrder,
     OrderStatus,
+    ShippingQuote,
     normalize_coupon_code,
 )
 from products.models import Category, DropCampaign, Product, ProductVariation
@@ -500,6 +513,134 @@ class ResolveCouponEmptyCartTests(ResolveCouponTestCase):
         self.items, self.subtotal = [], Decimal("0.00")
 
         self.assert_error(self.resolve("VERAO20"), "coupon_not_applicable")
+
+
+QUOTE_URL = "/api/orders/checkout/calculate/"
+CHECKOUT_URL = "/api/orders/checkout/"
+SHIPPING_SETTINGS = {
+    "CORREIOS_REMETENTE_CEP": "70000000",
+    "CORREIOS_CODIGO_SERVICO": "03220",
+    "CORREIOS_PESO_PADRAO_GRAMAS": "300",
+}
+
+
+@override_settings(**SHIPPING_SETTINGS)
+class CouponCheckoutFlowTestCase(APITestCase):
+    """Base dos testes do cupom pela API: carrinho de R$ 200 e frete de R$ 15."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(email="api@shio.com", name="Cliente")
+        self.address = Address.objects.create(
+            user=self.user,
+            zip_code="71000000",
+            street="Rua",
+            address_number="1",
+            neighborhood="Centro",
+            city="Brasília",
+            state="DF",
+        )
+        category = Category.objects.create(name="Fluxo", slug="fluxo")
+        product = Product.objects.create(
+            name="Jaqueta", description="x", base_price=200, category=category
+        )
+        self.variation = ProductVariation.objects.create(
+            product=product, size="M", sku="FLUXO-M", stock_quantity=10
+        )
+        cart = Cart.objects.create(user=self.user, status="ACTIVE")
+        CartItem.objects.create(
+            cart=cart, variation=self.variation, quantity=1, unit_price=200
+        )
+        self.client.force_authenticate(user=self.user)
+
+    def quote(self, coupon_code=None):
+        payload = {"address_id": str(self.address.pk)}
+        if coupon_code is not None:
+            payload["coupon_code"] = coupon_code
+        with (
+            patch(
+                "orders.services.fetch_shipping_price_by_service_and_ceps",
+                return_value={"pcFinal": "15,00"},
+            ),
+            patch(
+                "orders.services.fetch_shipping_deadline_by_service_and_ceps",
+                return_value={"prazoEntrega": 3},
+            ),
+        ):
+            return self.client.post(QUOTE_URL, payload, format="json")
+
+
+class CouponQuoteTests(CouponCheckoutFlowTestCase):
+    def test_sem_codigo_aplica_o_bemvindo10(self):
+        response = self.quote()
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["discount_amount"], "20.00")
+        self.assertEqual(response.data["coupon"]["code"], "BEMVINDO10")
+        self.assertEqual(ShippingQuote.objects.get().coupon_code, "")
+
+    def test_codigo_valido_substitui_o_automatico(self):
+        create_coupon(discount_value=Decimal("25.00"))
+
+        response = self.quote(" verao20 ")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["discount_amount"], "50.00")
+        self.assertEqual(response.data["total_amount"], "165.00")
+        self.assertEqual(
+            response.data["coupon"],
+            {"code": "VERAO20", "type": "PERCENTAGE", "value": "25.00"},
+        )
+        self.assertEqual(ShippingQuote.objects.get().coupon_code, "VERAO20")
+
+    def test_sem_cupom_aplicavel_devolve_coupon_nulo(self):
+        create_order(self.user)
+
+        response = self.quote()
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNone(response.data["coupon"])
+        self.assertEqual(response.data["discount_amount"], "0.00")
+
+    def test_codigo_vazio_e_o_mesmo_que_sem_codigo(self):
+        response = self.quote("")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["coupon"]["code"], "BEMVINDO10")
+
+    def test_codigo_invalido_recusa_a_cotacao_com_o_codigo_do_erro(self):
+        response = self.quote("NAOEXISTE")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.json(),
+            {"coupon_code": ["Cupom não encontrado."], "code": "coupon_not_found"},
+        )
+        self.assertFalse(ShippingQuote.objects.exists())
+
+    def test_cupom_expirado_informa_o_motivo(self):
+        create_coupon(expiration_date=timezone.now() - timedelta(days=1))
+
+        response = self.quote("VERAO20")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["code"], "coupon_expired")
+        self.assertEqual(response.json()["coupon_code"], ["Este cupom expirou."])
+
+    def test_checkout_recusa_coupon_code(self):
+        response = self.client.post(
+            CHECKOUT_URL,
+            {
+                "address_id": str(self.address.pk),
+                "shipping_quote_id": str(uuid.uuid4()),
+                "idempotency_key": str(uuid.uuid4()),
+                "coupon_code": "VERAO20",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("coupon_code", response.json())
+        self.assertNotIn("code", response.json())
 
 
 class ConcurrentCouponLastUseTests(TransactionTestCase):
