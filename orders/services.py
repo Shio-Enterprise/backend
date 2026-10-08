@@ -1,5 +1,5 @@
 from datetime import timedelta
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import Decimal
 from uuid import UUID
 
 import requests
@@ -7,7 +7,7 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ImproperlyConfigured, ObjectDoesNotExist
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db import IntegrityError, models, transaction
+from django.db import IntegrityError, transaction
 from django.shortcuts import get_object_or_404
 from django.urls import reverse
 from django.utils import timezone
@@ -17,12 +17,12 @@ from orders.correios import (
     fetch_shipping_deadline_by_service_and_ceps,
     fetch_shipping_price_by_service_and_ceps,
 )
+from orders.coupons import resolve_coupon
 from orders.models import (
     Cart,
     CartItem,
     CheckoutAttempt,
     CheckoutAttemptStatus,
-    Coupon,
     CustomerOrder,
     OrderItem,
     OrderStatus,
@@ -31,7 +31,9 @@ from orders.models import (
     PaymentMethod,
     PaymentStatus,
     ShippingQuote,
+    normalize_coupon_code,
 )
+from orders.money import money_to_cents, normalize_money
 from products.availability import (
     get_drop_sold_quantity,
     is_product_open_for_sale,
@@ -59,31 +61,15 @@ ALLOWED_TRANSITIONS = {
 }
 
 
-def normalize_money(value):
-    """Valida reais e arredonda centavos sem passar por ponto flutuante."""
-    try:
-        amount = Decimal(str(value).replace(",", "."))
-        if not amount.is_finite() or amount < 0:
-            raise ValueError("Valor monetário inválido.")
-        amount = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        if amount > Decimal("99999999.99"):
-            raise ValueError("Valor monetário acima do limite.")
-        return amount
-    except (InvalidOperation, TypeError) as exc:
-        raise ValueError("Valor monetário inválido.") from exc
-
-
-def money_to_cents(value):
-    return int(normalize_money(value) * Decimal("100"))
-
-
 class CheckoutShippingUnavailable(APIException):
     status_code = 503
     default_detail = "Serviço de cálculo de frete temporariamente indisponível."
     default_code = "shipping_unavailable"
 
 
-def _get_checkout_contents(user, address_id, cart_id=None, *, lock=False):
+def _get_checkout_contents(
+    user, address_id, cart_id=None, *, coupon_code="", lock=False
+):
     carts = Cart.objects.filter(user=user, status="ACTIVE")
     if lock:
         carts = carts.select_for_update()
@@ -160,7 +146,8 @@ def _get_checkout_contents(user, address_id, cart_id=None, *, lock=False):
             }
         )
 
-    coupon, discount = _compute_welcome_discount(user, subtotal, lock=lock)
+    # A trava do cupom é sempre a última, para não inverter a ordem de locks.
+    coupon_result = resolve_coupon(user, items, subtotal, coupon_code, lock=lock)
     destination = address.zip_code.replace("-", "").strip()
     if len(destination) != 8 or not destination.isdigit():
         raise ValidationError({"message": "CEP do endereço inválido."})
@@ -169,8 +156,16 @@ def _get_checkout_contents(user, address_id, cart_id=None, *, lock=False):
         "address": address,
         "items": items,
         "subtotal": subtotal,
-        "coupon": coupon,
-        "discount_amount": discount,
+        "coupon": coupon_result.coupon,
+        "discount_amount": coupon_result.discount,
+        "coupon_error": (
+            {
+                "code": coupon_result.error_code,
+                "message": coupon_result.error_message,
+            }
+            if coupon_result.error_code
+            else None
+        ),
         "shipping_parameters": {
             "origin": settings.CORREIOS_REMETENTE_CEP.replace("-", "").strip(),
             "destination": destination,
@@ -276,6 +271,7 @@ def _shipping_quote_snapshot(contents):
         "coupon": (
             {
                 "id": str(contents["coupon"].pk),
+                "code": contents["coupon"].code,
                 "type": contents["coupon"].discount_type,
                 "value": str(contents["coupon"].discount_value),
                 "expiration": str(contents["coupon"].expiration_date),
@@ -287,7 +283,17 @@ def _shipping_quote_snapshot(contents):
     }
 
 
-def create_shipping_quote(user, address_id):
+def raise_coupon_error(contents):
+    # "code" vai explícito no corpo: o DRF não serializa o code= do erro.
+    error = contents["coupon_error"]
+    if error:
+        raise ValidationError(
+            {"coupon_code": [error["message"]], "code": error["code"]},
+            code=error["code"],
+        )
+
+
+def create_shipping_quote(user, address_id, coupon_code=""):
     """Persiste o cálculo do servidor sem criar pedido ou reservar estoque."""
     ttl = settings.SHIPPING_QUOTE_TTL_SECONDS
     if isinstance(ttl, bool) or not isinstance(ttl, int) or ttl <= 0:
@@ -295,10 +301,14 @@ def create_shipping_quote(user, address_id):
             "SHIPPING_QUOTE_TTL_SECONDS deve ser inteiro positivo."
         )
 
-    contents = _get_checkout_contents(user, address_id)
+    coupon_code = normalize_coupon_code(coupon_code or "")
+    contents = _get_checkout_contents(user, address_id, coupon_code=coupon_code)
+    raise_coupon_error(contents)
     snapshot = _shipping_quote_snapshot(contents)
     calculation = _calculate_checkout(contents)
-    current = _get_checkout_contents(user, address_id, contents["cart"].id)
+    current = _get_checkout_contents(
+        user, address_id, contents["cart"].id, coupon_code=coupon_code
+    )
     if snapshot != _shipping_quote_snapshot(current):
         raise ValidationError(
             {
@@ -316,6 +326,7 @@ def create_shipping_quote(user, address_id):
         discount_amount=calculation["discount_amount"],
         total_amount=calculation["total_amount"],
         prazo_dias=calculation["prazo_dias"],
+        coupon_code=coupon_code,
         expires_at=timezone.now() + timedelta(seconds=ttl),
     )
 
@@ -352,11 +363,21 @@ def validate_shipping_quote(user, quote_id, cart_id, address_id, *, lock=False):
         )
     try:
         contents = _get_checkout_contents(
-            user, quote.address_id, quote.cart_id, lock=lock
+            user,
+            quote.address_id,
+            quote.cart_id,
+            coupon_code=quote.coupon_code,
+            lock=lock,
         )
         matches = quote.snapshot == _shipping_quote_snapshot(contents)
     except ValidationError:
-        matches = False
+        contents, matches = None, False
+    if contents is not None and contents["coupon_error"]:
+        # Cupom deixou de valer após a cotação: erro específico, não "a compra mudou".
+        ShippingQuote.objects.filter(pk=quote.pk, invalidated_at__isnull=True).update(
+            invalidated_at=timezone.now()
+        )
+        raise_coupon_error(contents)
     if not matches:
         ShippingQuote.objects.filter(pk=quote.pk, invalidated_at__isnull=True).update(
             invalidated_at=timezone.now()
@@ -380,7 +401,10 @@ def checkout_from_shipping_quote(user, quote_id, address_id):
     quote = validate_shipping_quote(
         user, quote_id, cart.pk if cart else None, address_id, lock=True
     )
-    contents = _get_checkout_contents(user, address_id, quote.cart_id, lock=True)
+    # O pedido é criado com o cupom deste recálculo: precisa ser o da cotação.
+    contents = _get_checkout_contents(
+        user, address_id, quote.cart_id, coupon_code=quote.coupon_code, lock=True
+    )
     # A validação mantém os itens, produtos e endereço bloqueados até o commit.
     return {
         **contents,
@@ -424,8 +448,10 @@ def create_infinitepay_checkout(order, request):
         items_data.append(
             {
                 "quantity": 1,
-                "price": -int(order.discount_amount * 100),
-                "description": "Desconto de boas-vindas",
+                "price": -money_to_cents(order.discount_amount),
+                "description": (
+                    f"Cupom {order.coupon.code}" if order.coupon else "Desconto"
+                ),
             }
         )
 
@@ -505,7 +531,11 @@ def checkout_attempt_result(attempt):
         "status": attempt.status,
     }
     if attempt.status == CheckoutAttemptStatus.SUCCEEDED:
-        return {**body, "checkout_url": attempt.checkout_url}, 201
+        return {
+            **body,
+            "checkout_url": attempt.checkout_url,
+            "reservation_expires_at": attempt.order.reservation_expires_at,
+        }, 201
     if attempt.status == CheckoutAttemptStatus.UNCERTAIN:
         return {
             **body,
@@ -816,18 +846,17 @@ def get_cart_data(request):
     if request.user.is_authenticated:
         cart = Cart.objects.filter(user=request.user, status="ACTIVE").first()
         if not cart:
-            welcome_coupon, welcome_discount_amount = get_welcome_discount_preview(
-                request.user, Decimal("0.00")
-            )
+            auto_coupon = resolve_coupon(request.user, [], Decimal("0.00"))
             return {
                 "id": None,
                 "items": [],
                 "subtotal": Decimal("0.00"),
-                "eligible_for_welcome_discount": welcome_coupon is not None,
-                "welcome_discount_amount": welcome_discount_amount,
+                "eligible_for_welcome_discount": auto_coupon.coupon is not None,
+                "welcome_discount_amount": auto_coupon.discount,
             }
 
         items = []
+        coupon_items = []
         subtotal = Decimal("0.00")
         cart_items = cart.items.select_related(
             "variation", "variation__product", "variation__product__drop"
@@ -837,6 +866,9 @@ def get_cart_data(request):
 
             total_price = item.quantity * item.unit_price
             subtotal += total_price
+            coupon_items.append(
+                {"variation": item.variation, "total_price": total_price}
+            )
             items.append(
                 {
                     "variation_id": item.variation.id,
@@ -855,15 +887,13 @@ def get_cart_data(request):
                     "is_sellable": is_product_sellable(item.variation.product),
                 }
             )
-        welcome_coupon, welcome_discount_amount = get_welcome_discount_preview(
-            request.user, subtotal
-        )
+        auto_coupon = resolve_coupon(request.user, coupon_items, subtotal)
         return {
             "id": cart.id,
             "items": items,
             "subtotal": subtotal,
-            "eligible_for_welcome_discount": welcome_coupon is not None,
-            "welcome_discount_amount": welcome_discount_amount,
+            "eligible_for_welcome_discount": auto_coupon.coupon is not None,
+            "welcome_discount_amount": auto_coupon.discount,
         }
     else:
         session_cart = request.session.get("cart", {})
@@ -1120,17 +1150,37 @@ def merge_session_cart_to_db(request, user):
             pass
 
 
+def _reservation_expired(order, now):
+    return (
+        order.status == OrderStatus.AWAITING_PAYMENT
+        and order.reservation_expires_at is not None
+        and order.reservation_expires_at < now
+    )
+
+
 def release_if_expired(order):
-    if order.status != OrderStatus.AWAITING_PAYMENT:
-        return
+    """Cancela o pedido e devolve o estoque se a reserva venceu.
 
-    if not order.reservation_expires_at:
-        return
+    Retorna True só quando esta chamada liberou. Trava o pedido antes do
+    pagamento, na mesma ordem do webhook, e decide pelo estado já travado.
+    """
+    now = timezone.now()
+    if not _reservation_expired(order, now):
+        return False
 
-    if order.reservation_expires_at >= timezone.now():
-        return
+    with transaction.atomic():
+        locked = CustomerOrder.objects.select_for_update().get(pk=order.pk)
+        paid = Payment.objects.filter(order=locked, status=PaymentStatus.PAID).exists()
+        released = _reservation_expired(locked, now) and not paid
+        if released:
+            update_status(
+                locked, OrderStatus.CANCELED, comment="Reserva de estoque expirada."
+            )
 
-    update_status(order, OrderStatus.CANCELED, comment="Reserva de estoque expirada.")
+    # A view serializa a instância recebida logo em seguida.
+    if released or locked.status != order.status:
+        order.refresh_from_db()
+    return released
 
 
 @transaction.atomic
@@ -1237,86 +1287,3 @@ def restore_order_stock(order, changed_by=None, physical_return=False):
             else "Cancelamento antes da expedição",
             reverses_movement=sale,
         )
-
-
-def _compute_welcome_discount(user, subtotal, *, lock=False):
-    """Lógica compartilhada de elegibilidade e cálculo do desconto de
-    boas-vindas, usada por get_welcome_discount e get_welcome_discount_preview.
-
-    Retorna (coupon, discount_amount) ou (None, Decimal('0.00')) se o usuário
-    não for elegível. NÃO adquire lock algum: quem precisa serializar contra
-    checkouts concorrentes (get_welcome_discount) deve travar a linha do
-    usuário ANTES de chamar esta função.
-
-    Só considera o cupom BEMVINDO10 se ele estiver ativo e não expirado, e
-    respeita o discount_type configurado (PERCENTAGE ou FIXED_VALUE), de modo
-    que uma edição da linha do cupom no admin não seja silenciosamente
-    ignorada.
-    """
-    if not user.is_authenticated:
-        return None, Decimal("0.00")
-
-    has_previous_order = CustomerOrder.objects.filter(user=user).exists()
-    if has_previous_order:
-        return None, Decimal("0.00")
-
-    coupons = Coupon.objects.all()
-    if lock:
-        coupons = coupons.select_for_update()
-    coupon = (
-        coupons.filter(code="BEMVINDO10", is_active=True)
-        .filter(
-            models.Q(expiration_date__isnull=True)
-            | models.Q(expiration_date__gt=timezone.now())
-        )
-        .first()
-    )
-    if not coupon:
-        return None, Decimal("0.00")
-
-    if coupon.discount_type == "FIXED_VALUE":
-        # Nunca deixa o desconto ultrapassar o subtotal (total negativo).
-        discount = min(coupon.discount_value, subtotal)
-    else:
-        discount = subtotal * (coupon.discount_value / Decimal("100"))
-
-    return coupon, normalize_money(min(subtotal, max(Decimal("0.00"), discount)))
-
-
-def get_welcome_discount(user, subtotal):
-    """Retorna (coupon, discount_amount) para o desconto de boas-vindas,
-    ou (None, Decimal('0.00')) se o usuário não for elegível.
-
-    Deve ser chamada dentro de uma transaction.atomic() (o caller,
-    CheckoutAPIView.post, já está decorado com @transaction.atomic).
-    Faz o lock da linha do usuário via select_for_update() antes de delegar a
-    checagem de elegibilidade a _compute_welcome_discount(): isso serializa
-    dois checkouts concorrentes do mesmo usuário — a segunda transação só
-    prossegue além do lock depois que a primeira commitar, e nesse ponto já
-    enxerga o pedido criado pela primeira, evitando aplicar o desconto duas
-    vezes.
-    """
-    if not user.is_authenticated:
-        return None, Decimal("0.00")
-
-    User = get_user_model()
-    User.objects.select_for_update().get(pk=user.pk)
-
-    return _compute_welcome_discount(user, subtotal)
-
-
-def get_welcome_discount_preview(user, subtotal):
-    """Versão somente-leitura de get_welcome_discount, para uso em contextos
-    que não estão dentro de uma transaction.atomic() (ex.: GET /cart/, uma
-    rota de leitura que apenas exibe uma prévia do desconto).
-
-    Mesma assinatura e retorno de get_welcome_discount — (coupon, discount) ou
-    (None, Decimal('0.00')) — e mesma lógica de elegibilidade (as duas delegam
-    a _compute_welcome_discount), mas SEM select_for_update(): não adquire lock
-    na linha do usuário, então não serializa contra checkouts concorrentes.
-    Isso é aceitável aqui porque esta função só alimenta uma prévia informativa
-    no carrinho; a aplicação real e segura contra corrida do desconto acontece
-    em get_welcome_discount, chamada por CheckoutAPIView.post dentro de
-    @transaction.atomic.
-    """
-    return _compute_welcome_discount(user, subtotal)

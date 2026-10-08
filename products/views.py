@@ -27,6 +27,8 @@ from authentication.permissions import (
     user_has_admin_permission,
 )
 
+from orders.expiration import sweep_expired_reservations
+
 from .availability import (
     is_drop_visible,
     is_product_visible,
@@ -540,6 +542,8 @@ class ProductListCreateView(APIView):
         },
     )
     def get(self, request):
+        # Reserva abandonada esconde o produto (estoque 0) até ser liberada.
+        sweep_expired_reservations()
         # Evita tratar booleano ausente como checkbox HTML desmarcado.
         params = request.query_params.dict()
         if "color" in params:
