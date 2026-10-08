@@ -17,12 +17,22 @@ from .views import (
     ProductVariationCreateView,
     ProductVariationDetailView,
     StockMovementListCreateView,
+    WishlistDeleteView,
+    WishlistIdsView,
+    WishlistListCreateView,
     inventory_summary,
 )
 
 app_name = "products"
 
 urlpatterns = [
+    path("wishlist/", WishlistListCreateView.as_view(), name="wishlist-list-create"),
+    path("wishlist/ids/", WishlistIdsView.as_view(), name="wishlist-ids"),
+    path(
+        "wishlist/<uuid:product_id>/",
+        WishlistDeleteView.as_view(),
+        name="wishlist-delete",
+    ),
     path(
         "products/<uuid:pk>/duplicate/",
         ProductDuplicateView.as_view(),
