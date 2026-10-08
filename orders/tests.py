@@ -189,6 +189,7 @@ class CheckoutAPITests(APITestCase):
         self.assertEqual(order.status, OrderStatus.AWAITING_PAYMENT)
         self.assertEqual(order.total_amount, Decimal("215.00"))
         self.assertEqual(order.discount_amount, Decimal("0.00"))
+        self.assertEqual(order.payment.method, PaymentMethod.UNKNOWN)
 
     @patch("orders.services.requests.post")
     def test_promocao_e_boas_vindas_coincidem_na_cotacao_pedido_e_gateway(
@@ -1450,7 +1451,11 @@ class ShippingQuoteTests(APITestCase):
         self.assertEqual(response.data["address"]["street"], self.address.street)
 
 
-class PaymentSuccessRedirectTests(APITestCase):
+@override_settings(
+    INFINITEPAY_HANDLE="loja-teste",
+    INFINITEPAY_RETURN_URL="https://loja.example/pix",
+)
+class PaymentWebhookTests(APITestCase):
     def setUp(self):
         self.user = User.objects.create_user(email="testador2@shio.com", password="123")
 
@@ -1469,72 +1474,282 @@ class PaymentSuccessRedirectTests(APITestCase):
 
         self.payment = Payment.objects.create(
             order=self.order,
-            method="CREDIT_CARD",
+            method=PaymentMethod.UNKNOWN,
             status=PaymentStatus.PROCESSING,
             total_amount=100.00,
         )
 
-        self.url = "/api/orders/pagamento-sucesso/"
+        self.webhook_url = "/api/orders/infinitepay/webhook/"
+        self.return_url = "/api/orders/pagamento-sucesso/"
+        self.payload = {
+            "order_nsu": str(self.order.id),
+            "transaction_nsu": "TRANS123",
+            "invoice_slug": "FATURA123",
+        }
+        self.verified = {
+            "success": True,
+            "paid": True,
+            "amount": 10000,
+            "paid_amount": 10010,
+            "installments": 1,
+            "capture_method": "pix",
+        }
 
-    @patch("orders.views.check_payment_status")
-    def test_pagamento_confirmado_pela_infinitepay(self, mock_check_payment):
-        """Deve atualizar o pedido para PAID se o gateway confirmar."""
-        mock_check_payment.return_value = {"paid": True}
-
-        response = self.client.get(
-            self.url,
-            {
-                "order_nsu": str(self.order.id),
-                "transaction_nsu": "TRANS123",
-                "slug": "FATURA123",
-            },
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-
+    def assert_pending(self):
         self.order.refresh_from_db()
         self.payment.refresh_from_db()
+        self.assertEqual(self.order.status, OrderStatus.AWAITING_PAYMENT)
+        self.assertEqual(self.payment.status, PaymentStatus.PROCESSING)
+        self.assertEqual(self.payment.method, PaymentMethod.UNKNOWN)
+        self.assertIsNone(self.payment.gateway_transaction_id)
+        self.assertEqual(self.order.status_logs.count(), 0)
 
+    @patch("orders.services.check_payment_status")
+    def test_webhook_confirma_pix_com_dados_verificados(self, mock_check):
+        mock_check.return_value = self.verified
+
+        response = self.client.post(self.webhook_url, self.payload, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.order.refresh_from_db()
+        self.payment.refresh_from_db()
         self.assertEqual(self.order.status, OrderStatus.PAID)
         self.assertEqual(self.payment.status, PaymentStatus.PAID)
+        self.assertEqual(self.payment.method, PaymentMethod.PIX)
         self.assertEqual(self.payment.gateway_transaction_id, "TRANS123")
+        self.assertEqual(self.payment.gateway_invoice_slug, "FATURA123")
+        self.assertEqual(self.payment.installments, 1)
+        self.assertIsNotNone(self.payment.paid_at)
+        self.assertEqual(self.order.status_logs.count(), 1)
+        mock_check.assert_called_once_with(str(self.order.id), "TRANS123", "FATURA123")
 
-    @patch("orders.views.check_payment_status")
-    def test_pagamento_nao_confirmado_mantem_pendente(self, mock_check_payment):
-        """Deve ignorar fraude se o gateway informar que não foi pago."""
-        mock_check_payment.return_value = {"paid": False}
+    @patch("orders.services.check_payment_status")
+    def test_webhook_registra_cartao_e_parcelas_do_gateway(self, mock_check):
+        mock_check.return_value = {
+            **self.verified,
+            "capture_method": "credit_card",
+            "installments": 3,
+        }
 
-        response = self.client.get(
-            self.url,
+        response = self.client.post(self.webhook_url, self.payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.payment.refresh_from_db()
+        self.assertEqual(self.payment.method, PaymentMethod.CREDIT_CARD)
+        self.assertEqual(self.payment.installments, 3)
+        self.assertEqual(self.payment.total_amount, Decimal("100.00"))
+
+    @patch("orders.services.check_payment_status")
+    def test_respostas_pendentes_incompletas_ou_adulteradas_nao_confirmam(
+        self, mock_check
+    ):
+        invalid = [{}, {"paid": True}, {**self.verified, "paid": False}]
+        for field, values in {
+            "success": [False, "true", 1],
+            "paid": [False, "true", 1],
+            "amount": [9999, 10001, "10000", True, None],
+            "paid_amount": [9999, "10010", True, None],
+            "installments": [0, 2147483648, "1", True, None, 2],
+            "capture_method": ["boleto", "PIX", None, []],
+            "order_nsu": [str(uuid.uuid4())],
+            "transaction_nsu": ["OUTRA"],
+            "invoice_slug": ["OUTRA"],
+            "slug": ["OUTRA"],
+            "handle": ["outro-vendedor"],
+        }.items():
+            invalid.extend({**self.verified, field: value} for value in values)
+
+        for data in invalid:
+            with self.subTest(data=data):
+                mock_check.return_value = data
+                response = self.client.post(
+                    self.webhook_url, self.payload, format="json"
+                )
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assert_pending()
+
+    @patch("orders.services.check_payment_status")
+    def test_payload_do_webhook_nao_define_valor_metodo_ou_parcelas(self, mock_check):
+        mock_check.return_value = self.verified
+
+        response = self.client.post(
+            self.webhook_url,
             {
-                "order_nsu": str(self.order.id),
-                "transaction_nsu": "FRAUDE123",
-                "slug": "FATURA123",
+                **self.payload,
+                "paid": True,
+                "amount": 1,
+                "capture_method": "credit_card",
+                "installments": 12,
             },
+            format="json",
         )
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.payment.refresh_from_db()
+        self.assertEqual(self.payment.method, PaymentMethod.PIX)
+        self.assertEqual(self.payment.installments, 1)
+        self.assertEqual(self.payment.total_amount, Decimal("100.00"))
 
+    @patch("orders.services.check_payment_status")
+    def test_webhook_repetido_e_notificacao_antiga_sao_idempotentes(self, mock_check):
+        mock_check.return_value = self.verified
+        first = self.client.post(self.webhook_url, self.payload, format="json")
+        self.assertEqual(first.status_code, status.HTTP_200_OK)
+        self.payment.refresh_from_db()
+        first_paid_at = self.payment.paid_at
+        first_updated_at = self.payment.updated_at
+
+        repeated = self.client.post(self.webhook_url, self.payload, format="json")
+        self.assertEqual(repeated.status_code, status.HTTP_200_OK)
+        self.payment.refresh_from_db()
+        self.assertEqual(self.payment.paid_at, first_paid_at)
+        self.assertEqual(self.payment.updated_at, first_updated_at)
+        self.assertEqual(self.order.status_logs.count(), 1)
+
+        self.payment.status = PaymentStatus.REFUNDED
+        self.payment.save(update_fields=["status", "updated_at"])
+        old_notification = self.client.post(
+            self.webhook_url, self.payload, format="json"
+        )
+        self.assertEqual(old_notification.status_code, status.HTTP_200_OK)
+        self.payment.refresh_from_db()
+        self.assertEqual(self.payment.status, PaymentStatus.REFUNDED)
+        self.assertEqual(self.payment.paid_at, first_paid_at)
+        self.assertEqual(self.order.status_logs.count(), 1)
+
+    @patch("orders.services.check_payment_status")
+    def test_pagamento_tardio_nao_reativa_pedido_cancelado(self, mock_check):
+        mock_check.return_value = self.verified
+        self.order.status = OrderStatus.CANCELED
+        self.order.save(update_fields=["status", "updated_at"])
+        self.payment.status = PaymentStatus.FAILED
+        self.payment.save(update_fields=["status", "updated_at"])
+
+        response = self.client.post(self.webhook_url, self.payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.order.refresh_from_db()
-        self.assertEqual(self.order.status, OrderStatus.AWAITING_PAYMENT)
+        self.payment.refresh_from_db()
+        self.assertEqual(self.order.status, OrderStatus.CANCELED)
+        self.assertEqual(self.payment.status, PaymentStatus.PAID)
+        self.assertEqual(self.order.status_logs.count(), 0)
 
-    def test_parametros_faltando_retorna_400(self):
-        """Deve retornar erro se a query string estiver incompleta."""
-        response = self.client.get(self.url, {"order_nsu": str(self.order.id)})
+    @patch("orders.services.check_payment_status")
+    def test_transacao_nao_pode_ser_associada_a_dois_pedidos(self, mock_check):
+        mock_check.return_value = self.verified
+        self.assertEqual(
+            self.client.post(self.webhook_url, self.payload, format="json").status_code,
+            status.HTTP_200_OK,
+        )
+        second_order = CustomerOrder.objects.create(
+            user=self.user,
+            subtotal=100,
+            total_amount=100,
+            status=OrderStatus.AWAITING_PAYMENT,
+            shipping_zip_code="000",
+            shipping_street="X",
+            shipping_number="2",
+            shipping_neighborhood="Y",
+            shipping_city="Z",
+            shipping_state="DF",
+        )
+        second_payment = Payment.objects.create(
+            order=second_order,
+            status=PaymentStatus.PROCESSING,
+            total_amount=100,
+        )
+
+        response = self.client.post(
+            self.webhook_url,
+            {**self.payload, "order_nsu": str(second_order.id)},
+            format="json",
+        )
+
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        second_order.refresh_from_db()
+        second_payment.refresh_from_db()
+        self.assertEqual(second_order.status, OrderStatus.AWAITING_PAYMENT)
+        self.assertEqual(second_payment.status, PaymentStatus.PROCESSING)
+        self.assertIsNone(second_payment.gateway_transaction_id)
 
-    def test_pedido_nao_encontrado_retorna_404(self):
-        """Deve retornar 404 para um UUID inexistente."""
-        fake_uuid = str(uuid.uuid4())
-        response = self.client.get(
-            self.url,
-            {
-                "order_nsu": fake_uuid,
+    @patch("orders.services.requests.post")
+    def test_consulta_gateway_usa_identificadores_e_bloqueia_redirecionamento(
+        self, mock_post
+    ):
+        mock_post.return_value.status_code = 200
+        mock_post.return_value.json.return_value = self.verified
+
+        response = self.client.post(self.webhook_url, self.payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        mock_post.assert_called_once_with(
+            "https://api.checkout.infinitepay.io/payment_check",
+            json={
+                "handle": "loja-teste",
+                "order_nsu": str(self.order.id),
                 "transaction_nsu": "TRANS123",
                 "slug": "FATURA123",
             },
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+            allow_redirects=False,
         )
-        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    @patch("orders.services.check_payment_status")
+    def test_retorno_do_navegador_apenas_redireciona(self, mock_check):
+        response = self.client.get(
+            self.return_url,
+            {
+                **self.payload,
+                "paid": "true",
+                "capture_method": "pix",
+                "slug": "FATURA123",
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertEqual(
+            response.url, f"https://loja.example/pix?order_nsu={self.order.id}"
+        )
+        mock_check.assert_not_called()
+        self.assert_pending()
+
+        for params in ({}, {"order_nsu": "invalido"}):
+            with self.subTest(params=params):
+                invalid = self.client.get(self.return_url, params)
+                self.assertEqual(invalid.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @patch("orders.services.requests.post")
+    def test_falha_na_consulta_permite_reenvio_sem_confirmar(self, mock_post):
+        for code in (302, 400, 500, 503):
+            with self.subTest(code=code):
+                mock_post.reset_mock()
+                mock_post.return_value.status_code = code
+                response = self.client.post(
+                    self.webhook_url, self.payload, format="json"
+                )
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assert_pending()
+
+        mock_post.return_value.status_code = 200
+        mock_post.return_value.json.return_value = self.verified
+        retry = self.client.post(self.webhook_url, self.payload, format="json")
+        self.assertEqual(retry.status_code, status.HTTP_200_OK)
+
+    @patch("orders.services.check_payment_status")
+    def test_parametros_invalidos_e_pedido_ausente_retorna_400(self, mock_check):
+        for payload in (
+            {},
+            {**self.payload, "order_nsu": "invalido"},
+            {**self.payload, "transaction_nsu": ""},
+            {**self.payload, "invoice_slug": "x" * 256},
+            {**self.payload, "order_nsu": str(uuid.uuid4())},
+        ):
+            with self.subTest(payload=payload):
+                response = self.client.post(self.webhook_url, payload, format="json")
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        mock_check.assert_not_called()
+        self.assert_pending()
 
 
 class OrderTrackingViewTests(APITestCase):
@@ -3834,7 +4049,7 @@ class InfinitePayCardSimulationTests(APITestCase):
         )
 
         self.checkout_url = "/api/orders/checkout/"
-        self.success_url = "/api/orders/pagamento-sucesso/"
+        self.webhook_url = "/api/orders/infinitepay/webhook/"
 
     @staticmethod
     def _fake_gateway_post(links_response, payment_check_response):
@@ -3873,6 +4088,7 @@ class InfinitePayCardSimulationTests(APITestCase):
         order = CustomerOrder.objects.get(user=self.user)
         self.assertEqual(order.status, OrderStatus.AWAITING_PAYMENT)
         self.assertEqual(order.payment.status, PaymentStatus.PROCESSING)
+        self.assertEqual(order.payment.method, PaymentMethod.UNKNOWN)
         return order
 
     @patch("orders.services.requests.post")
@@ -3882,16 +4098,25 @@ class InfinitePayCardSimulationTests(APITestCase):
         order = self._fazer_checkout(mock_post)
 
         mock_post.side_effect = self._fake_gateway_post(
-            links_response={}, payment_check_response={"paid": True}
+            links_response={},
+            payment_check_response={
+                "success": True,
+                "paid": True,
+                "amount": int(order.total_amount * 100),
+                "paid_amount": int(order.total_amount * 100),
+                "installments": 1,
+                "capture_method": "credit_card",
+            },
         )
 
-        response = self.client.get(
-            self.success_url,
+        response = self.client.post(
+            self.webhook_url,
             {
                 "order_nsu": str(order.id),
                 "transaction_nsu": "CARTAO_TESTE_APROVADO",
-                "slug": "FATURA_TESTE",
+                "invoice_slug": "FATURA_TESTE",
             },
+            format="json",
         )
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
@@ -3899,6 +4124,7 @@ class InfinitePayCardSimulationTests(APITestCase):
         order.refresh_from_db()
         self.assertEqual(order.status, OrderStatus.PAID)
         self.assertEqual(order.payment.status, PaymentStatus.PAID)
+        self.assertEqual(order.payment.method, PaymentMethod.CREDIT_CARD)
         self.assertEqual(order.payment.gateway_transaction_id, "CARTAO_TESTE_APROVADO")
 
     @patch("orders.services.requests.post")
@@ -3908,19 +4134,28 @@ class InfinitePayCardSimulationTests(APITestCase):
         order = self._fazer_checkout(mock_post)
 
         mock_post.side_effect = self._fake_gateway_post(
-            links_response={}, payment_check_response={"paid": False}
-        )
-
-        response = self.client.get(
-            self.success_url,
-            {
-                "order_nsu": str(order.id),
-                "transaction_nsu": "CARTAO_TESTE_RECUSADO",
-                "slug": "FATURA_TESTE",
+            links_response={},
+            payment_check_response={
+                "success": True,
+                "paid": False,
+                "amount": int(order.total_amount * 100),
+                "paid_amount": 0,
+                "installments": 1,
+                "capture_method": "credit_card",
             },
         )
 
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response = self.client.post(
+            self.webhook_url,
+            {
+                "order_nsu": str(order.id),
+                "transaction_nsu": "CARTAO_TESTE_RECUSADO",
+                "invoice_slug": "FATURA_TESTE",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
         order.refresh_from_db()
         self.assertEqual(order.status, OrderStatus.AWAITING_PAYMENT)
@@ -4027,3 +4262,19 @@ class CreateInfinitePayCheckoutPayloadTests(APITestCase):
             item["price"] * item["quantity"] for item in payload["items"]
         )
         self.assertEqual(total_cobrado, int(order.total_amount * 100))
+
+    @override_settings(
+        INFINITEPAY_WEBHOOK_URL="https://api.shio.test/webhooks/infinitepay"
+    )
+    def test_payload_informa_webhook_e_retorno_do_backend(self):
+        order = self.make_order(Decimal("0.00"))
+
+        payload = self.call_service(order)
+
+        self.assertEqual(
+            payload["webhook_url"], "https://api.shio.test/webhooks/infinitepay"
+        )
+        self.assertEqual(
+            payload["redirect_url"],
+            "http://testserver/api/orders/pagamento-sucesso/",
+        )

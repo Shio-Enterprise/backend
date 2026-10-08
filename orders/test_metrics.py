@@ -13,6 +13,7 @@ from rest_framework.test import APITestCase
 from authentication.models import UserProfile, UserRole
 from products.models import Category, DropCampaign, Product, ProductVariation
 
+from .metrics import created_orders, metric_orders, sale_items
 from .models import (
     CustomerOrder,
     OrderItem,
@@ -317,6 +318,56 @@ class O7MetricsTestCase(APITestCase):
         self.assertEqual(revenue[str(drop_b.id)], Decimal("40.00"))
         summary = self.client.get(self.dashboard_url).json()["sales_summary"]
         self.assertEqual(Decimal(summary["total_revenue"]), Decimal("110.00"))
+
+    def test_filtros_combinados_exigem_o_mesmo_item_sem_duplicar_pedido(self):
+        drop_a = DropCampaign.objects.create(name="Drop A", slug="drop-a-combinado")
+        drop_b = DropCampaign.objects.create(name="Drop B", slug="drop-b-combinado")
+        category_a = Category.objects.create(name="Categoria A", slug="categoria-a")
+        category_b = Category.objects.create(name="Categoria B", slug="categoria-b")
+        variation_a = self.create_product(name="A", drop=drop_a, category=category_a)
+        variation_b = self.create_product(name="B", drop=drop_b, category=category_b)
+        variation_match = self.create_product(
+            name="Correspondente", drop=drop_a, category=category_b
+        )
+
+        mixed_order = self.create_order(total="100.00")
+        self.add_item(mixed_order, variation_a)
+        self.add_item(mixed_order, variation_b)
+        matching_order = self.create_order(total="30.00")
+        self.add_item(matching_order, variation_match, unit_price="10.00")
+        self.add_item(matching_order, variation_match, unit_price="20.00")
+
+        filters = {"drop": str(drop_a.id), "category": str(category_b.id)}
+        self.assertEqual(
+            set(metric_orders(filters).values_list("id", flat=True)),
+            {matching_order.id},
+        )
+        self.assertEqual(sale_items(filters).count(), 2)
+
+        combined = self.client.get(self.dashboard_url, filters).json()["sales_summary"]
+        self.assertEqual(combined["total_orders"], 1)
+        self.assertEqual(Decimal(combined["gross_revenue"]), Decimal("30.00"))
+        drop_only = self.client.get(
+            self.dashboard_url, {"drop": str(drop_a.id)}
+        ).json()["sales_summary"]
+        self.assertEqual(drop_only["total_orders"], 2)
+        self.assertEqual(Decimal(drop_only["gross_revenue"]), Decimal("130.00"))
+        item_revenue = self.client.get(self.drop_revenue_url, filters).json()
+        self.assertEqual(len(item_revenue), 1)
+        self.assertEqual(Decimal(item_revenue[0]["revenue"]), Decimal("30.00"))
+
+    def test_pedidos_por_criacao_incluem_pendentes_sem_paid_at(self):
+        pending = self.create_order(
+            order_status=OrderStatus.AWAITING_PAYMENT,
+            payment_status=PaymentStatus.PENDING,
+        )
+        sold = self.create_order(total="20.00")
+
+        self.assertEqual(
+            set(created_orders({}).values_list("id", flat=True)),
+            {pending.id, sold.id},
+        )
+        self.assertEqual(set(metric_orders({}).values_list("id", flat=True)), {sold.id})
 
     def test_reembolso_afeta_serie_temporal_e_total_gasto_do_crm(self):
         paid_at = timezone.now().astimezone(SAO_PAULO) - datetime.timedelta(hours=1)
