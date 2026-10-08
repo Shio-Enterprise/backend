@@ -1121,17 +1121,37 @@ def merge_session_cart_to_db(request, user):
             pass
 
 
+def _reservation_expired(order, now):
+    return (
+        order.status == OrderStatus.AWAITING_PAYMENT
+        and order.reservation_expires_at is not None
+        and order.reservation_expires_at < now
+    )
+
+
 def release_if_expired(order):
-    if order.status != OrderStatus.AWAITING_PAYMENT:
-        return
+    """Cancela o pedido e devolve o estoque se a reserva venceu.
 
-    if not order.reservation_expires_at:
-        return
+    Retorna True só quando esta chamada liberou. Trava o pedido antes do
+    pagamento, na mesma ordem do webhook, e decide pelo estado já travado.
+    """
+    now = timezone.now()
+    if not _reservation_expired(order, now):
+        return False
 
-    if order.reservation_expires_at >= timezone.now():
-        return
+    with transaction.atomic():
+        locked = CustomerOrder.objects.select_for_update().get(pk=order.pk)
+        paid = Payment.objects.filter(order=locked, status=PaymentStatus.PAID).exists()
+        released = _reservation_expired(locked, now) and not paid
+        if released:
+            update_status(
+                locked, OrderStatus.CANCELED, comment="Reserva de estoque expirada."
+            )
 
-    update_status(order, OrderStatus.CANCELED, comment="Reserva de estoque expirada.")
+    # A view serializa a instância recebida logo em seguida.
+    if released or locked.status != order.status:
+        order.refresh_from_db()
+    return released
 
 
 @transaction.atomic
