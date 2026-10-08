@@ -36,6 +36,11 @@ from .correios import (
 )
 from .dashboard_aggregates import dashboard_detail_aggregates
 from .dashboard_drilldown import DETAIL_FILTERS, ORDER_METRICS, dashboard_order_queryset
+from .expiration import (
+    cart_variation_ids,
+    release_quietly,
+    sweep_expired_reservations,
+)
 from .metrics import (
     METRICS_TIMEZONE,
     is_recurring_customer,
@@ -681,6 +686,7 @@ class CheckoutCalculationView(APIView):
     def post(self, request):
         serializer = CheckoutCalculationInputSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        release_quietly(variation_ids=cart_variation_ids(request))
         calculation = create_shipping_quote(
             request.user, serializer.validated_data["address_id"]
         )
@@ -715,6 +721,8 @@ class CheckoutAPIView(APIView):
     def post(self, request):
         serializer = CheckoutInputSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        # Antes da transação do checkout, que trava carrinho e variações.
+        release_quietly(variation_ids=cart_variation_ids(request))
         try:
             attempt, result = prepare_checkout_attempt(
                 request.user, **serializer.validated_data
@@ -1064,6 +1072,8 @@ class CartAPIView(APIView):
         responses={200: CartRepresentationSerializer},
     )
     def get(self, request):
+        release_quietly(variation_ids=cart_variation_ids(request))
+        sweep_expired_reservations()
         cart_data = get_cart_data(request)
         serializer = CartRepresentationSerializer(cart_data)
         return Response(serializer.data, status=status.HTTP_200_OK)
@@ -1106,6 +1116,8 @@ class CartItemAddAPIView(APIView):
         variation_id = serializer.validated_data["variation_id"]
         quantity = serializer.validated_data["quantity"]
 
+        # Fora das transações do carrinho, para não inverter a ordem de travas.
+        release_quietly(variation_ids=[variation_id])
         try:
             add_item_to_cart(request, variation_id, quantity)
         except ValueError as e:
@@ -1143,6 +1155,7 @@ class CartItemDetailAPIView(APIView):
 
         quantity = serializer.validated_data["quantity"]
 
+        release_quietly(variation_ids=[variation_id])
         try:
             update_item_quantity(request, variation_id, quantity)
         except ValueError as e:

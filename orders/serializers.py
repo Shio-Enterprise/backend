@@ -360,6 +360,7 @@ class OrderDetailSerializer(serializers.ModelSerializer):
             "id",
             "user",
             "status",
+            "reservation_expires_at",
             "subtotal",
             "shipping_cost",
             "discount_amount",
