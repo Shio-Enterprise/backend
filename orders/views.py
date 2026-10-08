@@ -24,7 +24,11 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from authentication.permissions import IsStaffOrSuperUser
+from authentication.permissions import (
+    CanAccessAdminDashboard,
+    CanManageOrders,
+    user_has_admin_permission,
+)
 from products.models import ProductVariation
 
 from .correios import (
@@ -183,7 +187,7 @@ DRILLDOWN_PARAMETERS = METRIC_PARAMETERS + [
 class DashboardDetailView(APIView):
     """Agregados completos para a página administrativa de análise detalhada."""
 
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanAccessAdminDashboard]
 
     @extend_schema(
         description=(
@@ -229,7 +233,7 @@ class AdminDashboardView(APIView):
     Restrito a is_staff ou is_superuser.
     """
 
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanAccessAdminDashboard]
 
     @extend_schema(
         description=(
@@ -395,7 +399,7 @@ class AdminDashboardView(APIView):
 class DashboardDrillDownView(APIView):
     """Pedidos paginados que compõem o agregado selecionado."""
 
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanAccessAdminDashboard]
 
     @extend_schema(
         description=(
@@ -445,7 +449,7 @@ class DashboardDrillDownView(APIView):
 class DashboardDropRevenueView(APIView):
     """Receita de itens por drop, deliberadamente sem frete e desconto."""
 
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanAccessAdminDashboard]
 
     @extend_schema(
         description=(
@@ -540,7 +544,7 @@ class AdminOrderListView(APIView):
     Lista pedidos para o painel admin com filtro por `status`.
     """
 
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageOrders]
 
     @extend_schema(
         parameters=[
@@ -569,7 +573,7 @@ class AdminOrderDetailView(APIView):
     Recupera detalhes do pedido e permite atualização de status/tracking.
     """
 
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageOrders]
 
     @extend_schema(
         responses={200: OrderDetailSerializer},
@@ -844,7 +848,7 @@ class OrderTrackingView(APIView):
     def get_permissions(self):
         # PATCH must be restricted to admin users
         if self.request.method == "PATCH":
-            return [IsStaffOrSuperUser()]
+            return [CanManageOrders()]
         return [IsAuthenticated()]
 
     @extend_schema(
@@ -968,13 +972,13 @@ class OrderTrackingView(APIView):
         )
 
     def get_order_if_user_has_permission(self, user, order_id):
-        if getattr(user, "is_admin", False):
+        if user_has_admin_permission(user, "manage_orders"):
             return CustomerOrder.objects.filter(id=order_id).first()
         return CustomerOrder.objects.filter(id=order_id, user=user).first()
 
 
 class OrderDispatchView(APIView):
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageOrders]
 
     @extend_schema(
         tags=["Correios"],

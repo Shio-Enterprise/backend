@@ -200,6 +200,50 @@ class GoogleLoginViewTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
 
+class PasswordLoginViewTests(APITestCase):
+    """Garante que clientes e administradores usam o mesmo endpoint de login."""
+
+    url = "/api/auth/login/"
+
+    def setUp(self):
+        self.password = "SenhaSegura123!"
+        self.customer = User.objects.create_user(
+            email="customer-login@example.com",
+            name="Customer Login",
+            password=self.password,
+        )
+        self.admin = User.objects.create_user(
+            email="admin-login@example.com",
+            name="Admin Login",
+            password=self.password,
+            is_staff=True,
+        )
+
+    def test_usuario_comum_faz_login_pelo_endpoint_unico(self):
+        response = self.client.post(
+            self.url,
+            {"email": self.customer.email, "password": self.password},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("access", response.json())
+        self.assertIn("refresh", response.json())
+        self.assertFalse(response.json()["user"]["is_admin"])
+
+    def test_administrador_faz_login_pelo_mesmo_endpoint(self):
+        response = self.client.post(
+            self.url,
+            {"email": self.admin.email, "password": self.password},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("access", response.json())
+        self.assertIn("refresh", response.json())
+        self.assertTrue(response.json()["user"]["is_admin"])
+
+
 class MeViewTests(APITestCase):
     """Testes para o endpoint GET /api/auth/me/."""
 

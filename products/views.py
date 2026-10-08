@@ -5,7 +5,6 @@ from django.core.files.base import ContentFile
 from django.db import transaction
 from django.db.models import Exists, Max, OuterRef, Sum
 from django.db.models.deletion import ProtectedError
-from django.http import JsonResponse
 from django.shortcuts import get_object_or_404
 from drf_spectacular.utils import (
     OpenApiParameter,
@@ -14,6 +13,7 @@ from drf_spectacular.utils import (
     extend_schema,
 )
 from rest_framework import status
+from rest_framework.decorators import api_view, permission_classes
 from rest_framework.exceptions import ValidationError
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
@@ -21,7 +21,11 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from authentication.permissions import IsStaffOrSuperUser
+from authentication.permissions import (
+    CanManageCatalog,
+    CanManageDrops,
+    user_has_admin_permission,
+)
 from orders.expiration import sweep_expired_reservations
 
 from .availability import (
@@ -63,6 +67,8 @@ from .serializers import (
 logger = logging.getLogger(__name__)
 
 
+@api_view(["GET"])
+@permission_classes([CanManageCatalog])
 def inventory_summary(request):
     products = Product.objects.all()
     data = []
@@ -76,7 +82,7 @@ def inventory_summary(request):
                 "total_stock": total_stock,
             }
         )
-    return JsonResponse({"inventory": data})
+    return Response({"inventory": data})
 
 
 # ─── Categories ───────────────────────────────────────────────────────────────
@@ -87,7 +93,7 @@ class CategoryListCreateView(APIView):
 
     def get_permissions(self):
         if self.request.method == "POST":
-            return [IsStaffOrSuperUser()]
+            return [CanManageCatalog()]
         return [AllowAny()]
 
     @extend_schema(
@@ -139,7 +145,7 @@ class CategoryDetailView(APIView):
     def get_permissions(self):
         if self.request.method == "GET":
             return [AllowAny()]
-        return [IsStaffOrSuperUser()]
+        return [CanManageCatalog()]
 
     def _get_object(self, pk):
         return get_object_or_404(Category, pk=pk)
@@ -210,7 +216,7 @@ class DropCampaignListCreateView(APIView):
 
     def get_permissions(self):
         if self.request.method == "POST":
-            return [IsStaffOrSuperUser()]
+            return [CanManageDrops()]
         return [AllowAny()]
 
     @extend_schema(
@@ -243,9 +249,9 @@ class DropCampaignListCreateView(APIView):
         responses={200: DropCampaignSerializer(many=True)},
     )
     def get(self, request):
-        is_admin = request.user.is_authenticated and getattr(
-            request.user, "is_admin", False
-        )
+        is_admin = user_has_admin_permission(
+            request.user, "manage_drops"
+        ) or user_has_admin_permission(request.user, "manage_catalog")
         queryset = DropCampaign.objects.all().order_by("-created_at")
 
         if is_admin:
@@ -305,7 +311,7 @@ class DropCampaignDetailView(APIView):
     def get_permissions(self):
         if self.request.method == "GET":
             return [AllowAny()]
-        return [IsStaffOrSuperUser()]
+        return [CanManageDrops()]
 
     def _get_object(self, pk):
         return get_object_or_404(DropCampaign, pk=pk)
@@ -329,9 +335,9 @@ class DropCampaignDetailView(APIView):
     )
     def get(self, request, pk):
         drop = self._get_object(pk)
-        is_admin = request.user.is_authenticated and getattr(
-            request.user, "is_admin", False
-        )
+        is_admin = user_has_admin_permission(
+            request.user, "manage_drops"
+        ) or user_has_admin_permission(request.user, "manage_catalog")
         if not is_admin and not is_drop_visible(drop):
             return Response(
                 {"error": "Drop não encontrado."}, status=status.HTTP_404_NOT_FOUND
@@ -393,7 +399,7 @@ class DropCampaignDetailView(APIView):
 class DropProductManageView(APIView):
     """Associar e desassociar um produto de um drop. Admin only."""
 
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageDrops]
     serializer_class = DropCampaignDetailSerializer
 
     def _get_drop(self, drop_id):
@@ -481,7 +487,7 @@ class ProductListCreateView(APIView):
 
     def get_permissions(self):
         if self.request.method == "POST":
-            return [IsStaffOrSuperUser()]
+            return [CanManageCatalog()]
         return [AllowAny()]
 
     def get_serializer_class(self):
@@ -547,9 +553,9 @@ class ProductListCreateView(APIView):
             "variations", "images"
         )
 
-        is_admin = request.user.is_authenticated and getattr(
-            request.user, "is_admin", False
-        )
+        is_admin = user_has_admin_permission(
+            request.user, "manage_catalog"
+        ) or user_has_admin_permission(request.user, "manage_drops")
         is_active_param = query.validated_data.get("is_active")
         if is_admin:
             if is_active_param is not None:
@@ -649,7 +655,7 @@ class ProductDetailView(APIView):
     def get_permissions(self):
         if self.request.method == "GET":
             return [AllowAny()]
-        return [IsStaffOrSuperUser()]
+        return [CanManageCatalog()]
 
     def get_serializer_class(self):
         return (
@@ -665,9 +671,9 @@ class ProductDetailView(APIView):
             ),
             pk=pk,
         )
-        is_admin = request.user.is_authenticated and getattr(
-            request.user, "is_admin", False
-        )
+        is_admin = user_has_admin_permission(
+            request.user, "manage_catalog"
+        ) or user_has_admin_permission(request.user, "manage_drops")
         if is_admin and allow_inactive_for_admin:
             return product
         if not is_product_visible(product):
@@ -775,7 +781,7 @@ class ProductDetailView(APIView):
 class ProductVariationCreateView(APIView):
     """Cria variação para um produto. Admin only."""
 
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageCatalog]
     serializer_class = ProductVariationSerializer
 
     @extend_schema(
@@ -812,7 +818,7 @@ class ProductVariationCreateView(APIView):
 class ProductVariationDetailView(APIView):
     """Update e delete de variação. Admin only."""
 
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageCatalog]
     serializer_class = ProductVariationSerializer
 
     @extend_schema(
@@ -879,7 +885,7 @@ class ProductImageCreateView(APIView):
     """Cria imagem com display_order automático = max+1."""
 
     parser_classes = [MultiPartParser, FormParser]
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageCatalog]
     serializer_class = ProductImageSerializer
 
     @extend_schema(
@@ -925,7 +931,7 @@ class ProductImageUpdateView(APIView):
     """Substitui o binário de uma imagem existente. display_order é preservado."""
 
     parser_classes = [MultiPartParser, FormParser]
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageCatalog]
     serializer_class = ProductImageSerializer
 
     @extend_schema(
@@ -966,7 +972,7 @@ class ProductImageUpdateView(APIView):
 class ProductImageDeleteView(APIView):
     """Remove uma imagem de produto. Admin only."""
 
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageCatalog]
     serializer_class = ProductImageSerializer
 
     @extend_schema(
@@ -993,7 +999,7 @@ class ProductImageDeleteView(APIView):
 class StockMovementListCreateView(APIView):
     """Histórico e registro de movimentações de estoque de uma variação."""
 
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageCatalog]
     serializer_class = StockMovementSerializer
 
     def _get_variation(self, variation_id, lock=False):
@@ -1071,7 +1077,7 @@ class StockMovementListCreateView(APIView):
 
 
 class ProductDuplicateView(APIView):
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageCatalog]
 
     @extend_schema(
         request=ProductDuplicateSerializer,

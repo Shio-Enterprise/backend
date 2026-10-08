@@ -4,6 +4,7 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     AddressDetailView,
     AddressListCreateView,
+    AdminAccountViewSet,
     CustomerCRMViewSet,
     GoogleLoginView,
     LogoutView,
@@ -20,6 +21,7 @@ app_name = "authentication"
 
 router = DefaultRouter()
 router.register(r"crm/customers", CustomerCRMViewSet, basename="crm-customers")
+router.register(r"admins", AdminAccountViewSet, basename="admins")
 
 urlpatterns = [
     # POST - Registo de novo utilizador

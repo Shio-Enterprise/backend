@@ -11,6 +11,7 @@ from django.db.models import (
     IntegerField,
     Max,
     OuterRef,
+    Q,
     Subquery,
     Sum,
     Value,
@@ -23,7 +24,8 @@ from drf_spectacular.utils import (
     OpenApiResponse,
     extend_schema,
 )
-from rest_framework import filters, status, viewsets
+from rest_framework import filters, mixins, status, viewsets
+from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -33,10 +35,12 @@ from authentication.signals import google_login_completed
 from notifications.email import send_email
 from orders.models import CustomerOrder, OrderStatus, PaymentStatus
 
-from .models import NewsletterSubscriber
-from .permissions import IsStaffOrSuperUser
+from .admin_permissions import serialized_permission_definitions
+from .models import NewsletterSubscriber, UserRole
+from .permissions import CanManageAdminPermissions, CanManageCustomers
 from .serializers import (
     AddressSerializer,
+    AdminAccountSerializer,
     CustomerCRMDetailSerializer,
     CustomerCRMSerializer,
     GoogleAuthSerializer,
@@ -533,7 +537,7 @@ class AddressDetailView(APIView):
 class CustomerCRMViewSet(viewsets.ReadOnlyModelViewSet):
     """UC07 – Gerenciar Clientes (CRM)"""
 
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageCustomers]
     filter_backends = [
         filters.OrderingFilter,
         filters.SearchFilter,
@@ -596,6 +600,39 @@ class CustomerCRMViewSet(viewsets.ReadOnlyModelViewSet):
         if self.action == "retrieve":
             return CustomerCRMDetailSerializer
         return CustomerCRMSerializer
+
+
+class AdminAccountViewSet(
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.UpdateModelMixin,
+    viewsets.GenericViewSet,
+):
+    """Lista administradores e gerencia as permissões funcionais do painel."""
+
+    permission_classes = [CanManageAdminPermissions]
+    serializer_class = AdminAccountSerializer
+    pagination_class = None
+    http_method_names = ["get", "patch", "head", "options"]
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ["name", "email"]
+    ordering_fields = ["name", "email", "created_at"]
+    ordering = ["name", "email"]
+
+    def get_queryset(self):
+        return (
+            User.objects.filter(
+                Q(is_staff=True)
+                | Q(is_superuser=True)
+                | Q(profile__role=UserRole.ADMIN)
+            )
+            .distinct()
+            .order_by(*self.ordering)
+        )
+
+    @action(detail=False, methods=["get"], url_path="permissions")
+    def permissions(self, request):
+        return Response({"results": serialized_permission_definitions()})
 
 
 class NewsletterSubscribeView(APIView):
