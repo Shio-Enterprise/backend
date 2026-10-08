@@ -1,12 +1,14 @@
 import re
+
 from django.contrib.auth import get_user_model
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
-from products.models import ProductVariation, Category, DropCampaign
-from .models import CouponDiscountType
+from products.models import Category, DropCampaign, ProductVariation
 
 from .models import (
+    Coupon,
+    CouponDiscountType,
     CustomerOrder,
     OrderItem,
     OrderStatus,
@@ -14,7 +16,6 @@ from .models import (
     Payment,
     PaymentMethod,
     PaymentStatus,
-    Coupon,
 )
 
 User = get_user_model()

@@ -17,17 +17,17 @@ from drf_spectacular.utils import (
     extend_schema,
     inline_serializer,
 )
-from rest_framework import serializers, status, viewsets
+from rest_framework import serializers, status
 from rest_framework.exceptions import ValidationError
 from rest_framework.pagination import PageNumberPagination
-from rest_framework.permissions import AllowAny, IsAuthenticated, IsAdminUser
-from authentication.permissions import IsStaffOrSuperUser
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from authentication.permissions import (
     CanAccessAdminDashboard,
     CanManageOrders,
+    IsStaffOrSuperUser,
     user_has_admin_permission,
 )
 from products.models import ProductVariation
@@ -39,6 +39,7 @@ from .correios import (
     dispatch_order_and_get_tracking_code,
     get_order_tracking_data,
 )
+from .coupons import valid_order_q
 from .dashboard_aggregates import dashboard_detail_aggregates
 from .dashboard_drilldown import DETAIL_FILTERS, ORDER_METRICS, dashboard_order_queryset
 from .expiration import (
@@ -63,14 +64,13 @@ from .models import (
     PaymentStatus,
 )
 from .serializers import (
-    CouponAdminSerializer,
-    CouponAdminSerializer,
     CartItemAddSerializer,
     CartItemUpdateSerializer,
     CartRepresentationSerializer,
     CheckoutCalculationInputSerializer,
     CheckoutCalculationSerializer,
     CheckoutInputSerializer,
+    CouponAdminSerializer,
     DashboardDetailSerializer,
     DashboardLowStockSerializer,
     DashboardOrderDrillDownSerializer,
@@ -1218,10 +1218,6 @@ class CartItemDetailAPIView(APIView):
             CartRepresentationSerializer(cart_data).data, status=status.HTTP_200_OK
         )
 
-
-
-from .coupons import valid_order_q
-from django.db.models import Count, Sum
 
 class CouponListCreateView(APIView):
     permission_classes = [IsStaffOrSuperUser]

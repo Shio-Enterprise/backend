@@ -2,8 +2,6 @@ from django.urls import path
 
 from .correios_views import AgencySearchView, CepLookupView, ShippingOptionsView
 from .views import (
-    CouponListCreateView,
-    CouponDetailView,
     AdminDashboardView,
     AdminOrderDetailView,
     AdminOrderListView,
@@ -12,6 +10,8 @@ from .views import (
     CartItemDetailAPIView,
     CheckoutAPIView,
     CheckoutCalculationView,
+    CouponDetailView,
+    CouponListCreateView,
     DashboardDetailView,
     DashboardDrillDownView,
     DashboardDropRevenueView,
