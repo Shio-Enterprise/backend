@@ -1,9 +1,18 @@
 from django.contrib.auth import get_user_model
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from products.models import ProductVariation
 
-from .models import CustomerOrder, OrderItem, OrderStatus, OrderStatusLog, Payment
+from .models import (
+    CustomerOrder,
+    OrderItem,
+    OrderStatus,
+    OrderStatusLog,
+    Payment,
+    PaymentMethod,
+    PaymentStatus,
+)
 
 User = get_user_model()
 
@@ -42,6 +51,191 @@ class DashboardLowStockSerializer(serializers.ModelSerializer):
     class Meta:
         model = ProductVariation
         fields = ["id", "product_name", "size", "sku", "stock_quantity"]
+
+
+class DashboardPeriodSerializer(serializers.Serializer):
+    start_date = serializers.DateField()
+    end_date = serializers.DateField()
+    granularity = serializers.ChoiceField(choices=["day", "month"])
+    timezone = serializers.CharField()
+
+
+class DashboardFinancialSerializer(serializers.Serializer):
+    gross_revenue = serializers.DecimalField(max_digits=20, decimal_places=2)
+    refunds = serializers.DecimalField(max_digits=20, decimal_places=2)
+    net_revenue = serializers.DecimalField(max_digits=20, decimal_places=2)
+    average_ticket = serializers.DecimalField(max_digits=20, decimal_places=2)
+    valid_sales = serializers.IntegerField()
+
+
+class DashboardSalesPointSerializer(serializers.Serializer):
+    period = serializers.DateField()
+    gross_revenue = serializers.DecimalField(max_digits=20, decimal_places=2)
+    refunds = serializers.DecimalField(max_digits=20, decimal_places=2)
+    net_revenue = serializers.DecimalField(max_digits=20, decimal_places=2)
+    valid_sales = serializers.IntegerField()
+
+
+class DashboardProductRankingRowSerializer(serializers.Serializer):
+    product_id = serializers.UUIDField()
+    product_name = serializers.CharField()
+    units = serializers.IntegerField()
+    revenue = serializers.DecimalField(max_digits=20, decimal_places=2)
+
+
+class DashboardUnclassifiedItemsSerializer(serializers.Serializer):
+    units = serializers.IntegerField()
+    revenue = serializers.DecimalField(max_digits=20, decimal_places=2)
+
+
+class DashboardProductRankingsSerializer(serializers.Serializer):
+    by_units = DashboardProductRankingRowSerializer(many=True)
+    by_revenue = DashboardProductRankingRowSerializer(many=True)
+    unclassified = DashboardUnclassifiedItemsSerializer()
+
+
+class DashboardDropRevenueRowSerializer(serializers.Serializer):
+    drop_id = serializers.UUIDField(allow_null=True)
+    name = serializers.CharField()
+    units = serializers.IntegerField()
+    revenue = serializers.DecimalField(max_digits=20, decimal_places=2)
+
+
+class DashboardCategoryRevenueRowSerializer(serializers.Serializer):
+    category_id = serializers.UUIDField(allow_null=True)
+    name = serializers.CharField()
+    units = serializers.IntegerField()
+    revenue = serializers.DecimalField(max_digits=20, decimal_places=2)
+
+
+class DashboardItemRevenueSerializer(serializers.Serializer):
+    by_drop = DashboardDropRevenueRowSerializer(many=True)
+    by_category = DashboardCategoryRevenueRowSerializer(many=True)
+    basis = serializers.CharField()
+
+
+class DashboardStatusRowSerializer(serializers.Serializer):
+    status = serializers.ChoiceField(choices=OrderStatus.choices)
+    orders = serializers.IntegerField()
+
+
+class DashboardOrdersByStatusSerializer(serializers.Serializer):
+    date_basis = serializers.CharField()
+    rows = DashboardStatusRowSerializer(many=True)
+
+
+class DashboardPaymentMethodRowSerializer(serializers.Serializer):
+    method = serializers.ChoiceField(choices=PaymentMethod.choices)
+    valid_sales = serializers.IntegerField()
+    gross_revenue = serializers.DecimalField(max_digits=20, decimal_places=2)
+
+
+class DashboardCustomersSerializer(serializers.Serializer):
+    total_registered = serializers.IntegerField()
+    new_in_period = serializers.IntegerField()
+    recurring_customers = serializers.IntegerField()
+
+
+class DashboardStockAttentionSerializer(serializers.Serializer):
+    variation_id = serializers.UUIDField()
+    product_id = serializers.UUIDField()
+    product_name = serializers.CharField()
+    size = serializers.CharField()
+    color = serializers.CharField(allow_blank=True)
+    sku = serializers.CharField()
+    stock_quantity = serializers.IntegerField()
+    admin_path = serializers.CharField()
+
+
+class DashboardStockSerializer(serializers.Serializer):
+    low_count = serializers.IntegerField()
+    out_count = serializers.IntegerField()
+    attention = DashboardStockAttentionSerializer(many=True)
+
+
+class DashboardDetailSerializer(serializers.Serializer):
+    period = DashboardPeriodSerializer()
+    financial = DashboardFinancialSerializer()
+    sales_series = DashboardSalesPointSerializer(many=True)
+    product_rankings = DashboardProductRankingsSerializer()
+    item_revenue = DashboardItemRevenueSerializer()
+    orders_by_status = DashboardOrdersByStatusSerializer()
+    sales_by_payment_method = DashboardPaymentMethodRowSerializer(many=True)
+    customers = DashboardCustomersSerializer()
+    stock = DashboardStockSerializer()
+
+
+class DashboardOrderDrillDownSerializer(serializers.ModelSerializer):
+    customer_name = serializers.SerializerMethodField()
+    payment_status = serializers.CharField(
+        source="payment.status", read_only=True, allow_null=True, default=None
+    )
+    payment_method = serializers.CharField(
+        source="payment.method", read_only=True, allow_null=True, default=None
+    )
+    paid_at = serializers.DateTimeField(
+        source="payment.paid_at", read_only=True, allow_null=True, default=None
+    )
+    revenue_value = serializers.SerializerMethodField()
+    metric_units = serializers.SerializerMethodField()
+    metric_item_revenue = serializers.SerializerMethodField()
+    admin_path = serializers.SerializerMethodField()
+
+    class Meta:
+        model = CustomerOrder
+        fields = [
+            "id",
+            "customer_name",
+            "total_amount",
+            "status",
+            "payment_status",
+            "payment_method",
+            "paid_at",
+            "created_at",
+            "revenue_value",
+            "metric_units",
+            "metric_item_revenue",
+            "admin_path",
+        ]
+
+    def get_customer_name(self, obj) -> str:
+        return getattr(obj.user, "name", None) or obj.user.email
+
+    @extend_schema_field(serializers.DecimalField(max_digits=20, decimal_places=2))
+    def get_revenue_value(self, obj) -> str:
+        payment = getattr(obj, "payment", None)
+        if payment and payment.status == PaymentStatus.REFUNDED:
+            return f"{-obj.total_amount:.2f}"
+        if (
+            payment
+            and payment.status == PaymentStatus.PAID
+            and obj.status == OrderStatus.DELIVERED
+        ):
+            return f"{obj.total_amount:.2f}"
+        return "0.00"
+
+    @extend_schema_field(serializers.IntegerField(allow_null=True))
+    def get_metric_units(self, obj) -> int | None:
+        return getattr(obj, "metric_units", None)
+
+    @extend_schema_field(
+        serializers.DecimalField(max_digits=20, decimal_places=2, allow_null=True)
+    )
+    def get_metric_item_revenue(self, obj) -> str | None:
+        value = getattr(obj, "metric_item_revenue", None)
+        return f"{value:.2f}" if value is not None else None
+
+    def get_admin_path(self, obj) -> str:
+        return f"/admin/orders/{obj.id}"
+
+
+class DashboardOrderPageSerializer(serializers.Serializer):
+    count = serializers.IntegerField()
+    next = serializers.URLField(allow_null=True)
+    previous = serializers.URLField(allow_null=True)
+    results = DashboardOrderDrillDownSerializer(many=True)
+    metric = serializers.CharField()
+    date_basis = serializers.CharField()
 
 
 class SimpleOrderItemSerializer(serializers.ModelSerializer):
@@ -104,6 +298,15 @@ class PaymentSerializer(serializers.ModelSerializer):
         ]
 
 
+class PaymentReturnSerializer(serializers.Serializer):
+    order_nsu = serializers.UUIDField()
+
+
+class PaymentWebhookSerializer(PaymentReturnSerializer):
+    transaction_nsu = serializers.CharField(max_length=255)
+    invoice_slug = serializers.CharField(max_length=255)
+
+
 class AdminAddressSerializer(serializers.Serializer):
     id = serializers.UUIDField()
     zip_code = serializers.CharField()
@@ -157,6 +360,7 @@ class OrderDetailSerializer(serializers.ModelSerializer):
             "id",
             "user",
             "status",
+            "reservation_expires_at",
             "subtotal",
             "shipping_cost",
             "discount_amount",
@@ -218,7 +422,9 @@ class CartItemUpdateSerializer(serializers.Serializer):
     quantity = serializers.IntegerField(min_value=1)
 
 
-class CheckoutCalculationInputSerializer(serializers.Serializer):
+class _CheckoutBaseInputSerializer(serializers.Serializer):
+    """Base da cotação e do checkout: recusa qualquer campo não declarado."""
+
     address_id = serializers.UUIDField()
 
     def to_internal_value(self, data):
@@ -234,13 +440,26 @@ class CheckoutCalculationInputSerializer(serializers.Serializer):
         return super().to_internal_value(data)
 
 
-class CheckoutInputSerializer(CheckoutCalculationInputSerializer):
+class CheckoutCalculationInputSerializer(_CheckoutBaseInputSerializer):
+    # Só a cotação recebe o código; o checkout usa o que ficou gravado nela.
+    coupon_code = serializers.CharField(
+        required=False, allow_blank=True, max_length=50, default=""
+    )
+
+
+class CheckoutInputSerializer(_CheckoutBaseInputSerializer):
     shipping_quote_id = serializers.UUIDField()
     idempotency_key = serializers.UUIDField()
 
 
 class CheckoutQuoteItemSerializer(CartItemRepresentationSerializer):
     stock_quantity = serializers.IntegerField(required=False)
+
+
+class CheckoutCouponSerializer(serializers.Serializer):
+    code = serializers.CharField()
+    type = serializers.CharField()
+    value = serializers.DecimalField(max_digits=10, decimal_places=2)
 
 
 class CheckoutCalculationSerializer(serializers.Serializer):
@@ -252,4 +471,5 @@ class CheckoutCalculationSerializer(serializers.Serializer):
     subtotal = serializers.DecimalField(max_digits=10, decimal_places=2)
     shipping_cost = serializers.DecimalField(max_digits=10, decimal_places=2)
     discount_amount = serializers.DecimalField(max_digits=10, decimal_places=2)
+    coupon = CheckoutCouponSerializer(source="snapshot.coupon", allow_null=True)
     total_amount = serializers.DecimalField(max_digits=10, decimal_places=2)

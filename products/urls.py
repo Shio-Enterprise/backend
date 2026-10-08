@@ -126,6 +126,6 @@ urlpatterns = [
         StockMovementListCreateView.as_view(),
         name="variation-stock-movements",
     ),
-    # GET - Resumo de stock (legado)
+    # GET (admin) - Resumo de stock (legado)
     path("inventory/", inventory_summary, name="inventory_summary"),
 ]

@@ -30,6 +30,7 @@ from rest_framework.test import APIClient, APITestCase, APITransactionTestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from authentication.models import Address, UserProfile, UserRole
+from orders.coupons import resolve_coupon
 from orders.models import (
     Cart,
     CartItem,
@@ -49,8 +50,6 @@ from orders.services import (
     CheckoutShippingUnavailable,
     create_infinitepay_checkout,
     create_shipping_quote,
-    get_welcome_discount,
-    get_welcome_discount_preview,
     prepare_checkout_attempt,
     update_status,
     validate_shipping_quote,
@@ -189,6 +188,7 @@ class CheckoutAPITests(APITestCase):
         self.assertEqual(order.status, OrderStatus.AWAITING_PAYMENT)
         self.assertEqual(order.total_amount, Decimal("215.00"))
         self.assertEqual(order.discount_amount, Decimal("0.00"))
+        self.assertEqual(order.payment.method, PaymentMethod.UNKNOWN)
 
     @patch("orders.services.requests.post")
     def test_promocao_e_boas_vindas_coincidem_na_cotacao_pedido_e_gateway(
@@ -1450,7 +1450,11 @@ class ShippingQuoteTests(APITestCase):
         self.assertEqual(response.data["address"]["street"], self.address.street)
 
 
-class PaymentSuccessRedirectTests(APITestCase):
+@override_settings(
+    INFINITEPAY_HANDLE="loja-teste",
+    INFINITEPAY_RETURN_URL="https://loja.example/pix",
+)
+class PaymentWebhookTests(APITestCase):
     def setUp(self):
         self.user = User.objects.create_user(email="testador2@shio.com", password="123")
 
@@ -1469,72 +1473,282 @@ class PaymentSuccessRedirectTests(APITestCase):
 
         self.payment = Payment.objects.create(
             order=self.order,
-            method="CREDIT_CARD",
+            method=PaymentMethod.UNKNOWN,
             status=PaymentStatus.PROCESSING,
             total_amount=100.00,
         )
 
-        self.url = "/api/orders/pagamento-sucesso/"
+        self.webhook_url = "/api/orders/infinitepay/webhook/"
+        self.return_url = "/api/orders/pagamento-sucesso/"
+        self.payload = {
+            "order_nsu": str(self.order.id),
+            "transaction_nsu": "TRANS123",
+            "invoice_slug": "FATURA123",
+        }
+        self.verified = {
+            "success": True,
+            "paid": True,
+            "amount": 10000,
+            "paid_amount": 10010,
+            "installments": 1,
+            "capture_method": "pix",
+        }
 
-    @patch("orders.views.check_payment_status")
-    def test_pagamento_confirmado_pela_infinitepay(self, mock_check_payment):
-        """Deve atualizar o pedido para PAID se o gateway confirmar."""
-        mock_check_payment.return_value = {"paid": True}
-
-        response = self.client.get(
-            self.url,
-            {
-                "order_nsu": str(self.order.id),
-                "transaction_nsu": "TRANS123",
-                "slug": "FATURA123",
-            },
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-
+    def assert_pending(self):
         self.order.refresh_from_db()
         self.payment.refresh_from_db()
+        self.assertEqual(self.order.status, OrderStatus.AWAITING_PAYMENT)
+        self.assertEqual(self.payment.status, PaymentStatus.PROCESSING)
+        self.assertEqual(self.payment.method, PaymentMethod.UNKNOWN)
+        self.assertIsNone(self.payment.gateway_transaction_id)
+        self.assertEqual(self.order.status_logs.count(), 0)
 
+    @patch("orders.services.check_payment_status")
+    def test_webhook_confirma_pix_com_dados_verificados(self, mock_check):
+        mock_check.return_value = self.verified
+
+        response = self.client.post(self.webhook_url, self.payload, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.order.refresh_from_db()
+        self.payment.refresh_from_db()
         self.assertEqual(self.order.status, OrderStatus.PAID)
         self.assertEqual(self.payment.status, PaymentStatus.PAID)
+        self.assertEqual(self.payment.method, PaymentMethod.PIX)
         self.assertEqual(self.payment.gateway_transaction_id, "TRANS123")
+        self.assertEqual(self.payment.gateway_invoice_slug, "FATURA123")
+        self.assertEqual(self.payment.installments, 1)
+        self.assertIsNotNone(self.payment.paid_at)
+        self.assertEqual(self.order.status_logs.count(), 1)
+        mock_check.assert_called_once_with(str(self.order.id), "TRANS123", "FATURA123")
 
-    @patch("orders.views.check_payment_status")
-    def test_pagamento_nao_confirmado_mantem_pendente(self, mock_check_payment):
-        """Deve ignorar fraude se o gateway informar que não foi pago."""
-        mock_check_payment.return_value = {"paid": False}
+    @patch("orders.services.check_payment_status")
+    def test_webhook_registra_cartao_e_parcelas_do_gateway(self, mock_check):
+        mock_check.return_value = {
+            **self.verified,
+            "capture_method": "credit_card",
+            "installments": 3,
+        }
 
-        response = self.client.get(
-            self.url,
+        response = self.client.post(self.webhook_url, self.payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.payment.refresh_from_db()
+        self.assertEqual(self.payment.method, PaymentMethod.CREDIT_CARD)
+        self.assertEqual(self.payment.installments, 3)
+        self.assertEqual(self.payment.total_amount, Decimal("100.00"))
+
+    @patch("orders.services.check_payment_status")
+    def test_respostas_pendentes_incompletas_ou_adulteradas_nao_confirmam(
+        self, mock_check
+    ):
+        invalid = [{}, {"paid": True}, {**self.verified, "paid": False}]
+        for field, values in {
+            "success": [False, "true", 1],
+            "paid": [False, "true", 1],
+            "amount": [9999, 10001, "10000", True, None],
+            "paid_amount": [9999, "10010", True, None],
+            "installments": [0, 2147483648, "1", True, None, 2],
+            "capture_method": ["boleto", "PIX", None, []],
+            "order_nsu": [str(uuid.uuid4())],
+            "transaction_nsu": ["OUTRA"],
+            "invoice_slug": ["OUTRA"],
+            "slug": ["OUTRA"],
+            "handle": ["outro-vendedor"],
+        }.items():
+            invalid.extend({**self.verified, field: value} for value in values)
+
+        for data in invalid:
+            with self.subTest(data=data):
+                mock_check.return_value = data
+                response = self.client.post(
+                    self.webhook_url, self.payload, format="json"
+                )
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assert_pending()
+
+    @patch("orders.services.check_payment_status")
+    def test_payload_do_webhook_nao_define_valor_metodo_ou_parcelas(self, mock_check):
+        mock_check.return_value = self.verified
+
+        response = self.client.post(
+            self.webhook_url,
             {
-                "order_nsu": str(self.order.id),
-                "transaction_nsu": "FRAUDE123",
-                "slug": "FATURA123",
+                **self.payload,
+                "paid": True,
+                "amount": 1,
+                "capture_method": "credit_card",
+                "installments": 12,
             },
+            format="json",
         )
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.payment.refresh_from_db()
+        self.assertEqual(self.payment.method, PaymentMethod.PIX)
+        self.assertEqual(self.payment.installments, 1)
+        self.assertEqual(self.payment.total_amount, Decimal("100.00"))
 
+    @patch("orders.services.check_payment_status")
+    def test_webhook_repetido_e_notificacao_antiga_sao_idempotentes(self, mock_check):
+        mock_check.return_value = self.verified
+        first = self.client.post(self.webhook_url, self.payload, format="json")
+        self.assertEqual(first.status_code, status.HTTP_200_OK)
+        self.payment.refresh_from_db()
+        first_paid_at = self.payment.paid_at
+        first_updated_at = self.payment.updated_at
+
+        repeated = self.client.post(self.webhook_url, self.payload, format="json")
+        self.assertEqual(repeated.status_code, status.HTTP_200_OK)
+        self.payment.refresh_from_db()
+        self.assertEqual(self.payment.paid_at, first_paid_at)
+        self.assertEqual(self.payment.updated_at, first_updated_at)
+        self.assertEqual(self.order.status_logs.count(), 1)
+
+        self.payment.status = PaymentStatus.REFUNDED
+        self.payment.save(update_fields=["status", "updated_at"])
+        old_notification = self.client.post(
+            self.webhook_url, self.payload, format="json"
+        )
+        self.assertEqual(old_notification.status_code, status.HTTP_200_OK)
+        self.payment.refresh_from_db()
+        self.assertEqual(self.payment.status, PaymentStatus.REFUNDED)
+        self.assertEqual(self.payment.paid_at, first_paid_at)
+        self.assertEqual(self.order.status_logs.count(), 1)
+
+    @patch("orders.services.check_payment_status")
+    def test_pagamento_tardio_nao_reativa_pedido_cancelado(self, mock_check):
+        mock_check.return_value = self.verified
+        self.order.status = OrderStatus.CANCELED
+        self.order.save(update_fields=["status", "updated_at"])
+        self.payment.status = PaymentStatus.FAILED
+        self.payment.save(update_fields=["status", "updated_at"])
+
+        response = self.client.post(self.webhook_url, self.payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.order.refresh_from_db()
-        self.assertEqual(self.order.status, OrderStatus.AWAITING_PAYMENT)
+        self.payment.refresh_from_db()
+        self.assertEqual(self.order.status, OrderStatus.CANCELED)
+        self.assertEqual(self.payment.status, PaymentStatus.PAID)
+        self.assertEqual(self.order.status_logs.count(), 0)
 
-    def test_parametros_faltando_retorna_400(self):
-        """Deve retornar erro se a query string estiver incompleta."""
-        response = self.client.get(self.url, {"order_nsu": str(self.order.id)})
+    @patch("orders.services.check_payment_status")
+    def test_transacao_nao_pode_ser_associada_a_dois_pedidos(self, mock_check):
+        mock_check.return_value = self.verified
+        self.assertEqual(
+            self.client.post(self.webhook_url, self.payload, format="json").status_code,
+            status.HTTP_200_OK,
+        )
+        second_order = CustomerOrder.objects.create(
+            user=self.user,
+            subtotal=100,
+            total_amount=100,
+            status=OrderStatus.AWAITING_PAYMENT,
+            shipping_zip_code="000",
+            shipping_street="X",
+            shipping_number="2",
+            shipping_neighborhood="Y",
+            shipping_city="Z",
+            shipping_state="DF",
+        )
+        second_payment = Payment.objects.create(
+            order=second_order,
+            status=PaymentStatus.PROCESSING,
+            total_amount=100,
+        )
+
+        response = self.client.post(
+            self.webhook_url,
+            {**self.payload, "order_nsu": str(second_order.id)},
+            format="json",
+        )
+
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        second_order.refresh_from_db()
+        second_payment.refresh_from_db()
+        self.assertEqual(second_order.status, OrderStatus.AWAITING_PAYMENT)
+        self.assertEqual(second_payment.status, PaymentStatus.PROCESSING)
+        self.assertIsNone(second_payment.gateway_transaction_id)
 
-    def test_pedido_nao_encontrado_retorna_404(self):
-        """Deve retornar 404 para um UUID inexistente."""
-        fake_uuid = str(uuid.uuid4())
-        response = self.client.get(
-            self.url,
-            {
-                "order_nsu": fake_uuid,
+    @patch("orders.services.requests.post")
+    def test_consulta_gateway_usa_identificadores_e_bloqueia_redirecionamento(
+        self, mock_post
+    ):
+        mock_post.return_value.status_code = 200
+        mock_post.return_value.json.return_value = self.verified
+
+        response = self.client.post(self.webhook_url, self.payload, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        mock_post.assert_called_once_with(
+            "https://api.checkout.infinitepay.io/payment_check",
+            json={
+                "handle": "loja-teste",
+                "order_nsu": str(self.order.id),
                 "transaction_nsu": "TRANS123",
                 "slug": "FATURA123",
             },
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+            allow_redirects=False,
         )
-        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    @patch("orders.services.check_payment_status")
+    def test_retorno_do_navegador_apenas_redireciona(self, mock_check):
+        response = self.client.get(
+            self.return_url,
+            {
+                **self.payload,
+                "paid": "true",
+                "capture_method": "pix",
+                "slug": "FATURA123",
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertEqual(
+            response.url, f"https://loja.example/pix?order_nsu={self.order.id}"
+        )
+        mock_check.assert_not_called()
+        self.assert_pending()
+
+        for params in ({}, {"order_nsu": "invalido"}):
+            with self.subTest(params=params):
+                invalid = self.client.get(self.return_url, params)
+                self.assertEqual(invalid.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @patch("orders.services.requests.post")
+    def test_falha_na_consulta_permite_reenvio_sem_confirmar(self, mock_post):
+        for code in (302, 400, 500, 503):
+            with self.subTest(code=code):
+                mock_post.reset_mock()
+                mock_post.return_value.status_code = code
+                response = self.client.post(
+                    self.webhook_url, self.payload, format="json"
+                )
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assert_pending()
+
+        mock_post.return_value.status_code = 200
+        mock_post.return_value.json.return_value = self.verified
+        retry = self.client.post(self.webhook_url, self.payload, format="json")
+        self.assertEqual(retry.status_code, status.HTTP_200_OK)
+
+    @patch("orders.services.check_payment_status")
+    def test_parametros_invalidos_e_pedido_ausente_retorna_400(self, mock_check):
+        for payload in (
+            {},
+            {**self.payload, "order_nsu": "invalido"},
+            {**self.payload, "transaction_nsu": ""},
+            {**self.payload, "invoice_slug": "x" * 256},
+            {**self.payload, "order_nsu": str(uuid.uuid4())},
+        ):
+            with self.subTest(payload=payload):
+                response = self.client.post(self.webhook_url, payload, format="json")
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        mock_check.assert_not_called()
+        self.assert_pending()
 
 
 class OrderTrackingViewTests(APITestCase):
@@ -3609,191 +3823,80 @@ class WelcomeCouponSeedTests(APITestCase):
         self.assertTrue(coupon.is_active)
 
 
-class GetWelcomeDiscountConcurrencyTests(APITestCase):
-    """Cobre o risco de corrida entre dois checkouts concorrentes do mesmo
-    usuário que nunca comprou antes: ambos não podem aplicar o desconto de
-    boas-vindas (ver get_welcome_discount em orders/services.py).
+@override_settings(**SHIPPING_TEST_SETTINGS)
+class WelcomeCouponCheckoutLockTests(APITestCase):
+    """Dois checkouts simultâneos do mesmo cliente novo não podem levar o
+    desconto de primeira compra.
 
-    Nota sobre a estratégia de teste: o banco usado nos testes é SQLite em
-    memória. Nesse backend, `django.db.models.QuerySet.select_for_update()`
-    é essencialmente um no-op — a feature `has_select_for_update` é False
-    para o SQLite, então o Django nem adiciona a cláusula `FOR UPDATE` nem
-    valida que a chamada está dentro de uma transação (ver
-    django/db/models/sql/compiler.py, condição
-    `self.query.select_for_update and features.has_select_for_update`).
-    Ou seja: um teste com threads reais batendo no SQLite não provaria nada
-    sobre o `select_for_update` em si (ele não bloqueia lá) — só mostraria
-    uma peculiaridade de locking do SQLite, o que tornaria o teste flaky e
-    não relacionado ao comportamento real de produção (Postgres, onde
-    `SELECT ... FOR UPDATE` bloqueia de verdade e serializa as transações).
-
-    Por isso o teste abaixo prova, de forma determinística, que o lock
-    "governa" a checagem: dentro de uma única transaction.atomic() — a mesma
-    seção que, em Postgres, uma segunda transação concorrente só atravessaria
-    depois que a primeira commitasse — criamos o pedido da primeira "checkout"
-    e então chamamos get_welcome_discount() de novo, simulando a checagem que
-    a segunda transação concorrente faria ao ser liberada pelo lock. Ela deve
-    enxergar o pedido recém-criado e negar o desconto, confirmando que a
-    ordem lock -> checagem -> criação está correta e que, em um banco com
-    locking real, isso serializa as duas requisições concorrentes.
+    resolve_coupon não trava o usuário: quem serializa os checkouts de um
+    mesmo cliente é prepare_checkout_attempt, que trava a linha do usuário
+    antes de calcular o cupom. No SQLite dos testes select_for_update() não
+    bloqueia, então os testes abaixo provam a ordem (trava -> checagem) em
+    vez de disputar com threads.
     """
 
     def setUp(self):
         self.user = User.objects.create_user(
-            email="concorrencia@shio.com",
-            name="Concorrencia",
-            password="senha_forte_123",
+            email="concorrencia@shio.com", name="Concorrencia"
         )
+        self.address = make_address(self.user)
+        category = Category.objects.create(name="LockCat", slug="lock-cat")
+        product = Product.objects.create(
+            category=category, name="Jaqueta", description="x", base_price=200
+        )
+        self.variation = ProductVariation.objects.create(
+            product=product, size="M", sku="LOCK-M", stock_quantity=10
+        )
+        cart = Cart.objects.create(user=self.user, status="ACTIVE")
+        CartItem.objects.create(
+            cart=cart, variation=self.variation, quantity=1, unit_price=200
+        )
+        self.items = [{"variation": self.variation, "total_price": Decimal("200.00")}]
+        self.client.force_authenticate(user=self.user)
 
-    def test_lock_do_usuario_governa_checagem_de_primeira_compra(self):
+    def test_segunda_checagem_depois_da_trava_ve_o_primeiro_pedido(self):
         with transaction.atomic():
             User.objects.select_for_update().get(pk=self.user.pk)
 
-            coupon, discount = get_welcome_discount(self.user, Decimal("200.00"))
-            self.assertIsNotNone(coupon)
-            self.assertEqual(coupon.code, "BEMVINDO10")
-            self.assertEqual(discount, Decimal("20.00"))
-
+            first = resolve_coupon(self.user, self.items, Decimal("200.00"), lock=True)
+            self.assertEqual(first.coupon.code, "BEMVINDO10")
+            self.assertEqual(first.discount, Decimal("20.00"))
             CustomerOrder.objects.create(
                 user=self.user,
-                coupon=coupon,
+                coupon=first.coupon,
                 subtotal=Decimal("200.00"),
-                discount_amount=discount,
+                discount_amount=first.discount,
                 total_amount=Decimal("180.00"),
                 status=OrderStatus.AWAITING_PAYMENT,
             )
 
-            # Simula a segunda transação concorrente retomando após o lock:
-            # ela deve enxergar o pedido acabado de criar e não conceder
-            # desconto duplicado.
-            coupon2, discount2 = get_welcome_discount(self.user, Decimal("200.00"))
-            self.assertIsNone(coupon2)
-            self.assertEqual(discount2, Decimal("0.00"))
+            # O segundo checkout só passaria da trava depois do commit do
+            # primeiro e precisa enxergar o pedido criado.
+            second = resolve_coupon(self.user, self.items, Decimal("200.00"), lock=True)
+            self.assertIsNone(second.coupon)
+            self.assertEqual(second.discount, Decimal("0.00"))
 
-    def test_helper_bloqueia_linha_do_usuario_antes_de_checar_pedidos_anteriores(self):
-        """Prova, via SQL de fato executado, que get_welcome_discount adquire
-        o lock na linha do usuário (SELECT ... na tabela de usuário via
-        select_for_update) ANTES de consultar se ele já possui pedido. Essa
-        ordem é o que, em um banco com locking real (Postgres em produção),
-        serializa dois checkouts concorrentes do mesmo usuário — a segunda
-        transação bloqueia no lock até a primeira commitar. Diferente do
-        teste acima (que só confirma o resultado final e passaria mesmo sem
-        o lock, já que o SQLite ignora select_for_update), este teste
-        garante que uma remoção acidental do select_for_update() quebre o
-        CI, checando a ordem real das queries emitidas."""
-        User = get_user_model()
+    def test_checkout_trava_o_usuario_antes_de_checar_pedidos_anteriores(self):
+        """Se alguém remover a trava do usuário do checkout, este teste quebra
+        mesmo no SQLite, porque checa a ordem das consultas emitidas."""
+        payload = make_checkout_payload(self.client, self.address)
         user_table = User._meta.db_table
         order_table = CustomerOrder._meta.db_table
 
-        with transaction.atomic():
-            with CaptureQueriesContext(connection) as ctx:
-                get_welcome_discount(self.user, Decimal("200.00"))
-
-        queries = [q["sql"] for q in ctx.captured_queries]
-        user_query_index = next(
-            (i for i, sql in enumerate(queries) if user_table in sql), None
-        )
-        order_query_index = next(
-            (i for i, sql in enumerate(queries) if order_table in sql), None
-        )
-
-        self.assertIsNotNone(
-            user_query_index, "Esperava uma query de lock na tabela de usuário."
-        )
-        self.assertIsNotNone(
-            order_query_index,
-            "Esperava uma query checando pedidos anteriores do usuário.",
-        )
-        self.assertLess(
-            user_query_index,
-            order_query_index,
-            "O lock select_for_update na linha do usuário deve ocorrer antes "
-            "da checagem de pedidos anteriores (CustomerOrder.objects...exists()).",
-        )
-
-
-class WelcomeDiscountCouponRulesTests(APITestCase):
-    """Cobre as regras do cupom que antes eram ignoradas pelos helpers de
-    desconto: expiration_date e discount_type (PERCENTAGE vs FIXED_VALUE).
-    """
-
-    def setUp(self):
-        self.user = User.objects.create_user(
-            email="cupom@shio.com", name="Cupom", password="senha_forte_123"
-        )
-        self.coupon = Coupon.objects.get(code="BEMVINDO10")
-
-    def test_cupom_sem_expiracao_continua_valido(self):
-        coupon, discount = get_welcome_discount_preview(self.user, Decimal("200.00"))
-
-        self.assertIsNotNone(coupon)
-        self.assertEqual(discount, Decimal("20.00"))
-
-    def test_cupom_com_expiracao_futura_continua_valido(self):
-        self.coupon.expiration_date = timezone.now() + timedelta(days=1)
-        self.coupon.save()
-
-        coupon, discount = get_welcome_discount_preview(self.user, Decimal("200.00"))
-
-        self.assertIsNotNone(coupon)
-        self.assertEqual(discount, Decimal("20.00"))
-
-    def test_cupom_expirado_nao_concede_desconto(self):
-        self.coupon.expiration_date = timezone.now() - timedelta(days=1)
-        self.coupon.save()
-
-        coupon, discount = get_welcome_discount_preview(self.user, Decimal("200.00"))
-
-        self.assertIsNone(coupon)
-        self.assertEqual(discount, Decimal("0.00"))
-
-    def test_cupom_expirado_tambem_bloqueia_no_checkout(self):
-        """A versão com lock (usada no checkout) compartilha o mesmo helper,
-        então também precisa respeitar a expiração."""
-        self.coupon.expiration_date = timezone.now() - timedelta(days=1)
-        self.coupon.save()
-
-        with transaction.atomic():
-            coupon, discount = get_welcome_discount(self.user, Decimal("200.00"))
-
-        self.assertIsNone(coupon)
-        self.assertEqual(discount, Decimal("0.00"))
-
-    def test_cupom_fixed_value_aplica_valor_fixo(self):
-        # Alteração restrita a esta transação de teste (rollback no tearDown),
-        # simulando alguém editando o cupom pelo admin.
-        self.coupon.discount_type = "FIXED_VALUE"
-        self.coupon.discount_value = Decimal("30.00")
-        self.coupon.save()
-
-        coupon, discount = get_welcome_discount_preview(self.user, Decimal("200.00"))
-
-        self.assertIsNotNone(coupon)
-        self.assertEqual(discount, Decimal("30.00"))
-
-    def test_cupom_fixed_value_maior_que_subtotal_e_limitado_ao_subtotal(self):
-        self.coupon.discount_type = "FIXED_VALUE"
-        self.coupon.discount_value = Decimal("500.00")
-        self.coupon.save()
-
-        coupon, discount = get_welcome_discount_preview(self.user, Decimal("200.00"))
-
-        self.assertIsNotNone(coupon)
-        self.assertEqual(discount, Decimal("200.00"))
-
-    def test_preview_e_versao_com_lock_retornam_o_mesmo_resultado(self):
-        """Guarda contra drift entre os dois helpers públicos (ambos delegam a
-        _compute_welcome_discount)."""
-        preview_coupon, preview_discount = get_welcome_discount_preview(
-            self.user, Decimal("200.00")
-        )
-        with transaction.atomic():
-            locked_coupon, locked_discount = get_welcome_discount(
-                self.user, Decimal("200.00")
+        with CaptureQueriesContext(connection) as ctx:
+            prepare_checkout_attempt(
+                self.user,
+                uuid.UUID(payload["address_id"]),
+                uuid.UUID(payload["shipping_quote_id"]),
+                uuid.UUID(payload["idempotency_key"]),
             )
 
-        self.assertEqual(preview_coupon, locked_coupon)
-        self.assertEqual(preview_discount, locked_discount)
+        queries = [q["sql"] for q in ctx.captured_queries]
+        user_index = next(i for i, sql in enumerate(queries) if user_table in sql)
+        order_index = next(
+            i for i, sql in enumerate(queries) if f'"{order_table}"' in sql
+        )
+        self.assertLess(user_index, order_index)
 
 
 @override_settings(**SHIPPING_TEST_SETTINGS)
@@ -3834,7 +3937,7 @@ class InfinitePayCardSimulationTests(APITestCase):
         )
 
         self.checkout_url = "/api/orders/checkout/"
-        self.success_url = "/api/orders/pagamento-sucesso/"
+        self.webhook_url = "/api/orders/infinitepay/webhook/"
 
     @staticmethod
     def _fake_gateway_post(links_response, payment_check_response):
@@ -3873,6 +3976,7 @@ class InfinitePayCardSimulationTests(APITestCase):
         order = CustomerOrder.objects.get(user=self.user)
         self.assertEqual(order.status, OrderStatus.AWAITING_PAYMENT)
         self.assertEqual(order.payment.status, PaymentStatus.PROCESSING)
+        self.assertEqual(order.payment.method, PaymentMethod.UNKNOWN)
         return order
 
     @patch("orders.services.requests.post")
@@ -3882,16 +3986,25 @@ class InfinitePayCardSimulationTests(APITestCase):
         order = self._fazer_checkout(mock_post)
 
         mock_post.side_effect = self._fake_gateway_post(
-            links_response={}, payment_check_response={"paid": True}
+            links_response={},
+            payment_check_response={
+                "success": True,
+                "paid": True,
+                "amount": int(order.total_amount * 100),
+                "paid_amount": int(order.total_amount * 100),
+                "installments": 1,
+                "capture_method": "credit_card",
+            },
         )
 
-        response = self.client.get(
-            self.success_url,
+        response = self.client.post(
+            self.webhook_url,
             {
                 "order_nsu": str(order.id),
                 "transaction_nsu": "CARTAO_TESTE_APROVADO",
-                "slug": "FATURA_TESTE",
+                "invoice_slug": "FATURA_TESTE",
             },
+            format="json",
         )
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
@@ -3899,6 +4012,7 @@ class InfinitePayCardSimulationTests(APITestCase):
         order.refresh_from_db()
         self.assertEqual(order.status, OrderStatus.PAID)
         self.assertEqual(order.payment.status, PaymentStatus.PAID)
+        self.assertEqual(order.payment.method, PaymentMethod.CREDIT_CARD)
         self.assertEqual(order.payment.gateway_transaction_id, "CARTAO_TESTE_APROVADO")
 
     @patch("orders.services.requests.post")
@@ -3908,19 +4022,28 @@ class InfinitePayCardSimulationTests(APITestCase):
         order = self._fazer_checkout(mock_post)
 
         mock_post.side_effect = self._fake_gateway_post(
-            links_response={}, payment_check_response={"paid": False}
-        )
-
-        response = self.client.get(
-            self.success_url,
-            {
-                "order_nsu": str(order.id),
-                "transaction_nsu": "CARTAO_TESTE_RECUSADO",
-                "slug": "FATURA_TESTE",
+            links_response={},
+            payment_check_response={
+                "success": True,
+                "paid": False,
+                "amount": int(order.total_amount * 100),
+                "paid_amount": 0,
+                "installments": 1,
+                "capture_method": "credit_card",
             },
         )
 
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response = self.client.post(
+            self.webhook_url,
+            {
+                "order_nsu": str(order.id),
+                "transaction_nsu": "CARTAO_TESTE_RECUSADO",
+                "invoice_slug": "FATURA_TESTE",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
         order.refresh_from_db()
         self.assertEqual(order.status, OrderStatus.AWAITING_PAYMENT)
@@ -3946,11 +4069,12 @@ class CreateInfinitePayCheckoutPayloadTests(APITestCase):
         )
         self.factory = RequestFactory()
 
-    def make_order(self, discount_amount):
+    def make_order(self, discount_amount, coupon=None):
         subtotal = Decimal("200.00")
         shipping_cost = Decimal("15.00")
         order = CustomerOrder.objects.create(
             user=self.user,
+            coupon=coupon,
             subtotal=subtotal,
             shipping_cost=shipping_cost,
             discount_amount=discount_amount,
@@ -4002,9 +4126,7 @@ class CreateInfinitePayCheckoutPayloadTests(APITestCase):
         payload = self.call_service(order)
 
         descriptions = [item["description"] for item in payload["items"]]
-        self.assertEqual(
-            descriptions, ["Tênis Teste", "Frete", "Desconto de boas-vindas"]
-        )
+        self.assertEqual(descriptions, ["Tênis Teste", "Frete", "Desconto"])
 
         discount_line = payload["items"][-1]
         self.assertEqual(discount_line["quantity"], 1)
@@ -4013,6 +4135,21 @@ class CreateInfinitePayCheckoutPayloadTests(APITestCase):
         # Os preços por produto continuam íntegros (itemização correta no recibo).
         self.assertEqual(payload["items"][0]["price"], 10000)
         self.assertEqual(payload["items"][0]["quantity"], 2)
+
+    def test_linha_de_desconto_mostra_o_codigo_do_cupom(self):
+        coupon = Coupon.objects.create(
+            code="VERAO20", discount_type="PERCENTAGE", discount_value=20
+        )
+        order = self.make_order(Decimal("40.00"), coupon=coupon)
+
+        payload = self.call_service(order)
+
+        self.assertEqual(payload["items"][-1]["description"], "Cupom VERAO20")
+        self.assertEqual(payload["items"][-1]["price"], -4000)
+        total_cobrado = sum(
+            item["price"] * item["quantity"] for item in payload["items"]
+        )
+        self.assertEqual(total_cobrado, int(order.total_amount * 100))
 
     def test_payload_sem_desconto_nao_ganha_linha_de_desconto(self):
         order = self.make_order(Decimal("0.00"))
@@ -4027,3 +4164,19 @@ class CreateInfinitePayCheckoutPayloadTests(APITestCase):
             item["price"] * item["quantity"] for item in payload["items"]
         )
         self.assertEqual(total_cobrado, int(order.total_amount * 100))
+
+    @override_settings(
+        INFINITEPAY_WEBHOOK_URL="https://api.shio.test/webhooks/infinitepay"
+    )
+    def test_payload_informa_webhook_e_retorno_do_backend(self):
+        order = self.make_order(Decimal("0.00"))
+
+        payload = self.call_service(order)
+
+        self.assertEqual(
+            payload["webhook_url"], "https://api.shio.test/webhooks/infinitepay"
+        )
+        self.assertEqual(
+            payload["redirect_url"],
+            "http://testserver/api/orders/pagamento-sucesso/",
+        )

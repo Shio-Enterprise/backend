@@ -190,9 +190,23 @@ SIMPLE_JWT = {
 GOOGLE_CLIENT_ID = config("GOOGLE_CLIENT_ID")
 
 INFINITEPAY_HANDLE = config("INFINITEPAY_HANDLE", default="")
+INFINITEPAY_RETURN_URL = config(
+    "INFINITEPAY_RETURN_URL", default="http://localhost:5173/pix"
+)
+INFINITEPAY_WEBHOOK_URL = config("INFINITEPAY_WEBHOOK_URL", default="")
 
 STOCK_RESERVATION_TTL_MINUTES = config(
     "STOCK_RESERVATION_TTL_MINUTES", default=30, cast=int
+)
+# A liberação automática só pega reservas vencidas há mais que isto, para não
+# liberar a de quem está concluindo o pagamento no último instante.
+STOCK_RESERVATION_GRACE_SECONDS = config(
+    "STOCK_RESERVATION_GRACE_SECONDS", default=120, cast=int
+)
+# Intervalo mínimo, por processo, entre varreduras de reservas vencidas
+# disparadas pelo catálogo e pelo carrinho.
+RESERVATION_SWEEP_INTERVAL_SECONDS = config(
+    "RESERVATION_SWEEP_INTERVAL_SECONDS", default=60, cast=int
 )
 SHIPPING_QUOTE_TTL_SECONDS = config("SHIPPING_QUOTE_TTL_SECONDS", default=900, cast=int)
 CHECKOUT_PROCESSING_TIMEOUT_SECONDS = config(

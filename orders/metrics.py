@@ -3,12 +3,12 @@ from decimal import Decimal
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from django.db.models import Q, QuerySet
+from django.db.models import Exists, OuterRef, Q, QuerySet
 from django.utils import timezone
 from django.utils.dateparse import parse_date
 from rest_framework.exceptions import ValidationError
 
-from .models import CustomerOrder, OrderStatus, PaymentStatus
+from .models import CustomerOrder, OrderItem, OrderStatus, PaymentStatus
 
 METRICS_TIMEZONE = ZoneInfo("America/Sao_Paulo")
 VALID_SALE_Q = Q(status=OrderStatus.DELIVERED, payment__status=PaymentStatus.PAID)
@@ -49,19 +49,31 @@ def resolve_period(params):
 
 
 def apply_dimensions(queryset: QuerySet, params) -> QuerySet:
-    """Aplica os filtros compartilhados antes de qualquer agregação."""
-    queryset = queryset.filter(**dimension_filters(params))
+    """Filtra pedidos sem multiplicá-los pelos itens associados."""
+    filters = dimension_filters(params)
+    if customer_id := filters.get("user_id"):
+        queryset = queryset.filter(user_id=customer_id)
+    item_filters = _item_filters(filters)
+    if item_filters:
+        queryset = queryset.filter(
+            Exists(OrderItem.objects.filter(order_id=OuterRef("pk"), **item_filters))
+        )
+
     search = params.get("search", "").strip()
     if search:
+        matching_items = OrderItem.objects.filter(order_id=OuterRef("pk")).filter(
+            Q(product_name__icontains=search)
+            | Q(variation__product__name__icontains=search)
+            | Q(variation__product__drop__name__icontains=search)
+            | Q(variation__product__category__name__icontains=search)
+        )
+        queryset = queryset.alias(matching_search_item=Exists(matching_items))
         queryset = queryset.filter(
             Q(user__name__icontains=search)
             | Q(user__email__icontains=search)
-            | Q(items__product_name__icontains=search)
-            | Q(items__variation__product__name__icontains=search)
-            | Q(items__variation__product__drop__name__icontains=search)
-            | Q(items__variation__product__category__name__icontains=search)
+            | Q(matching_search_item=True)
         )
-    return queryset.distinct()
+    return queryset
 
 
 def dimension_filters(params):
@@ -75,16 +87,35 @@ def dimension_filters(params):
         value = params.get(name)
         if not value:
             continue
-        if name in {"drop", "category", "customer"}:
+        if name in {"drop", "category"}:
             try:
                 UUID(str(value))
             except ValueError as exc:
                 raise ValidationError(f"{name} deve ser um UUID válido.") from exc
+        elif name == "customer":
+            try:
+                value = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValidationError(
+                    "customer deve ser um ID inteiro válido."
+                ) from exc
+            if value < 1:
+                raise ValidationError("customer deve ser um ID inteiro válido.")
         filters[lookup] = value
     return filters
 
 
+def _item_filters(filters):
+    """Converte os filtros de pedido em filtros aplicáveis ao mesmo OrderItem."""
+    return {
+        lookup.removeprefix("items__"): value
+        for lookup, value in filters.items()
+        if lookup.startswith("items__")
+    }
+
+
 def metric_orders(params, start=None, end=None) -> QuerySet:
+    """Pedidos comerciais na janela de pagamento: venda válida ou reembolso."""
     if start is None or end is None:
         start, end, _ = resolve_period(params)
     queryset = CustomerOrder.objects.filter(
@@ -94,12 +125,28 @@ def metric_orders(params, start=None, end=None) -> QuerySet:
     return apply_dimensions(queryset, params)
 
 
+def created_orders(params, start=None, end=None) -> QuerySet:
+    """Todos os pedidos criados na janela, inclusive os ainda não pagos."""
+    if start is None or end is None:
+        start, end, _ = resolve_period(params)
+    queryset = CustomerOrder.objects.filter(created_at__gte=start, created_at__lt=end)
+    return apply_dimensions(queryset, params)
+
+
 def positive_sales(queryset: QuerySet) -> QuerySet:
     return queryset.filter(VALID_SALE_Q)
 
 
 def refunds(queryset: QuerySet) -> QuerySet:
     return queryset.filter(REFUND_Q)
+
+
+def sale_items(params, start=None, end=None) -> QuerySet:
+    """Itens de vendas válidas; drop e categoria restringem o próprio item."""
+    orders = positive_sales(metric_orders(params, start, end))
+    return OrderItem.objects.filter(
+        order_id__in=orders.values("pk"), **_item_filters(dimension_filters(params))
+    )
 
 
 def revenue_value(order: CustomerOrder) -> Decimal:
