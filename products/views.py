@@ -1,9 +1,10 @@
 import logging
 import uuid
+from decimal import Decimal
 
 from django.core.files.base import ContentFile
 from django.db import transaction
-from django.db.models import Exists, Max, OuterRef, Sum
+from django.db.models import Exists, Max, OuterRef, Q, Sum
 from django.db.models.deletion import ProtectedError
 from django.shortcuts import get_object_or_404
 from drf_spectacular.utils import (
@@ -26,6 +27,7 @@ from authentication.permissions import (
     CanManageDrops,
     user_has_admin_permission,
 )
+from core.exports import export_data_response
 from orders.expiration import sweep_expired_reservations
 
 from .availability import (
@@ -203,6 +205,148 @@ def inventory_summary(request):
             }
         )
     return Response({"inventory": data})
+
+
+class InventoryExportView(APIView):
+    """
+    GET /api/catalog/inventory/export/
+    Exporta variações de produtos (estoque) para CSV ou Excel (.xlsx).
+    Requer a permissão CanManageCatalog.
+    """
+
+    permission_classes = [CanManageCatalog]
+
+    @extend_schema(
+        tags=["Catalog Admin"],
+        summary="Exportar estoque",
+        parameters=[
+            OpenApiParameter(
+                name="file_format",
+                type=OpenApiTypes.STR,
+                description="Formato de exportação: 'csv' (padrão) ou 'xlsx'",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
+            OpenApiParameter(
+                name="search",
+                type=OpenApiTypes.STR,
+                description="Busca por nome do produto, SKU, tamanho ou cor",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
+            OpenApiParameter(
+                name="drop",
+                type=OpenApiTypes.STR,
+                description="Filtro por ID ou nome do drop",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
+            OpenApiParameter(
+                name="category",
+                type=OpenApiTypes.STR,
+                description="Filtro por ID ou nome da categoria",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
+        ],
+        responses={
+            200: OpenApiResponse(description="Arquivo exportado (CSV ou XLSX)"),
+            400: OpenApiResponse(description="Formato inválido"),
+            403: OpenApiResponse(description="Acesso negado"),
+        },
+    )
+    def get(self, request):
+        file_format = request.query_params.get("file_format", "csv")
+        search_q = request.query_params.get("search")
+        drop_q = request.query_params.get("drop")
+        category_q = request.query_params.get("category")
+
+        qs = ProductVariation.objects.select_related(
+            "product", "product__drop", "product__category"
+        ).order_by("product__name", "size")
+
+        if search_q:
+            clean_search = search_q.strip()
+            qs = qs.filter(
+                Q(product__name__icontains=clean_search)
+                | Q(sku__icontains=clean_search)
+                | Q(size__icontains=clean_search)
+                | Q(color__icontains=clean_search)
+            )
+
+        if drop_q:
+            clean_drop = drop_q.strip()
+            drop_filter = Q(product__drop__name__icontains=clean_drop)
+            try:
+                drop_uuid = uuid.UUID(clean_drop)
+                drop_filter = drop_filter | Q(product__drop_id=drop_uuid)
+            except ValueError:
+                pass
+            qs = qs.filter(drop_filter)
+
+        if category_q:
+            clean_category = category_q.strip()
+            category_filter = Q(product__category__name__icontains=clean_category)
+            try:
+                cat_uuid = uuid.UUID(clean_category)
+                category_filter = category_filter | Q(product__category_id=cat_uuid)
+            except ValueError:
+                pass
+            qs = qs.filter(category_filter)
+
+        headers = [
+            "Produto",
+            "Drop",
+            "Categoria",
+            "Tamanho",
+            "Cor",
+            "Quantidade em Estoque",
+            "Preço de Custo",
+            "Preço de Venda",
+        ]
+        column_types = [
+            "text",
+            "text",
+            "text",
+            "text",
+            "text",
+            "number",
+            "currency",
+            "currency",
+        ]
+
+        rows = []
+        for variation in qs:
+            product = variation.product
+            drop_name = product.drop.name if product.drop else "—"
+            cat_name = product.category.name if product.category else "—"
+            cost_price = (
+                product.cost_price
+                if product.cost_price is not None
+                else Decimal("0.00")
+            )
+            selling_price = product.effective_price
+
+            rows.append(
+                [
+                    product.name,
+                    drop_name,
+                    cat_name,
+                    variation.size,
+                    variation.color or "—",
+                    variation.stock_quantity,
+                    cost_price,
+                    selling_price,
+                ]
+            )
+
+        return export_data_response(
+            filename_base="estoque",
+            headers=headers,
+            rows=rows,
+            file_format=file_format,
+            column_types=column_types,
+        )
 
 
 # ─── Categories ───────────────────────────────────────────────────────────────

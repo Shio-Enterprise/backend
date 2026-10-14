@@ -21,7 +21,9 @@ from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from drf_spectacular.utils import (
     OpenApiExample,
+    OpenApiParameter,
     OpenApiResponse,
+    OpenApiTypes,
     extend_schema,
 )
 from rest_framework import filters, mixins, status, viewsets
@@ -32,6 +34,7 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from authentication.signals import google_login_completed
+from core.exports import export_data_response
 from notifications.email import send_email
 from orders.models import CustomerOrder, OrderStatus, PaymentStatus
 
@@ -600,6 +603,98 @@ class CustomerCRMViewSet(viewsets.ReadOnlyModelViewSet):
         if self.action == "retrieve":
             return CustomerCRMDetailSerializer
         return CustomerCRMSerializer
+
+    @extend_schema(
+        tags=["CRM Clientes"],
+        summary="Exportar clientes",
+        parameters=[
+            OpenApiParameter(
+                name="file_format",
+                type=OpenApiTypes.STR,
+                description="Formato de exportação: 'csv' (padrão) ou 'xlsx'",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
+            OpenApiParameter(
+                name="search",
+                type=OpenApiTypes.STR,
+                description="Busca por nome ou e-mail",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
+            OpenApiParameter(
+                name="ordering",
+                type=OpenApiTypes.STR,
+                description="Ordenação por campo (ex: -created_at, total_spent)",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
+        ],
+        responses={
+            200: OpenApiResponse(description="Arquivo exportado (CSV ou XLSX)"),
+            400: OpenApiResponse(description="Formato inválido"),
+            403: OpenApiResponse(description="Acesso negado"),
+        },
+    )
+    @action(detail=False, methods=["get"], url_path="export")
+    def export(self, request):
+        file_format = request.query_params.get("file_format", "csv")
+        queryset = self.filter_queryset(self.get_queryset())
+
+        customers = list(queryset)
+        emails = [c.email for c in customers]
+        subscribed_emails = set(
+            NewsletterSubscriber.objects.filter(
+                email__in=emails,
+                unsubscribed_at__isnull=True,
+            ).values_list("email", flat=True)
+        )
+
+        headers = [
+            "Nome",
+            "E-mail",
+            "Data de Cadastro",
+            "Pedidos Concluídos",
+            "Total Gasto",
+            "Última Compra",
+            "Inscrito na Newsletter",
+        ]
+        column_types = [
+            "text",
+            "text",
+            "datetime",
+            "number",
+            "currency",
+            "datetime",
+            "text",
+        ]
+
+        rows = []
+        for c in customers:
+            total_orders = getattr(c, "total_orders", 0) or 0
+            total_spent = getattr(c, "total_spent", Decimal("0.00")) or Decimal("0.00")
+            last_purchase = getattr(c, "last_purchase_date", None)
+            is_subscribed = "Sim" if c.email in subscribed_emails else "Não"
+
+            rows.append(
+                [
+                    c.name or "—",
+                    c.email,
+                    c.created_at,
+                    total_orders,
+                    total_spent,
+                    last_purchase or "—",
+                    is_subscribed,
+                ]
+            )
+
+        return export_data_response(
+            filename_base="clientes",
+            headers=headers,
+            rows=rows,
+            file_format=file_format,
+            column_types=column_types,
+        )
 
 
 class AdminAccountViewSet(
