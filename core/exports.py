@@ -50,20 +50,6 @@ def to_sao_paulo(dt_value):
     return dt_value
 
 
-class ExportColumn:
-    """
-    Representação de uma coluna para exportação:
-    - header: Título da coluna
-    - key: chave ou função extratora
-    - data_type: 'text', 'currency', 'datetime', 'date', 'number'
-    """
-
-    def __init__(self, header, key=None, data_type="text"):
-        self.header = header
-        self.key = key or header
-        self.data_type = data_type
-
-
 def export_data_response(
     filename_base, headers, rows, file_format="csv", column_types=None
 ):

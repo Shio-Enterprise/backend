@@ -156,12 +156,32 @@ class InventoryExportTests(APITestCase):
         self.assertEqual(len(lines), 2)
         self.assertEqual(lines[1][1], "Drop Inverno")
 
+    def _csv_lines(self, response):
+        content = response.content.decode("utf-8-sig")
+        return list(csv.reader(io.StringIO(content), delimiter=";"))
+
     def test_filter_by_search(self):
         self.client.force_authenticate(self.admin)
-        response = self.client.get(f"{self.url}?search=CAM-BAS-M&file_format=csv")
+        response = self.client.get(f"{self.url}?search=camiseta&file_format=csv")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        content = response.content.decode("utf-8-sig")
-        lines = list(csv.reader(io.StringIO(content), delimiter=";"))
+        lines = self._csv_lines(response)
         self.assertEqual(len(lines), 2)
         self.assertEqual(lines[1][0], "Camiseta Básica")
+
+    def test_search_only_by_product_name(self):
+        # A tela de Produtos busca só pelo nome; SKU, tamanho e cor não entram
+        self.client.force_authenticate(self.admin)
+        for term in ("CAM-BAS-M", "G", "Preto"):
+            response = self.client.get(f"{self.url}?search={term}&file_format=csv")
+            self.assertEqual(len(self._csv_lines(response)), 1, term)
+
+    def test_missing_cost_exported_as_empty_cell(self):
+        self.client.force_authenticate(self.admin)
+
+        response = self.client.get(f"{self.url}?search=camiseta&file_format=csv")
+        self.assertEqual(self._csv_lines(response)[1][6], "")
+
+        response = self.client.get(f"{self.url}?search=camiseta&file_format=xlsx")
+        ws = openpyxl.load_workbook(io.BytesIO(response.content)).active
+        self.assertIn(ws.cell(row=2, column=7).value, (None, ""))

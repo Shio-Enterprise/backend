@@ -101,7 +101,8 @@ class AdminOrderExportTests(APITestCase):
         OrderItem.objects.create(
             order=self.order_paid,
             variation=self.variation,
-            product_name=self.product.name,
+            # Formato salvo pelo checkout: nome do produto + variação
+            product_name=f"{self.product.name} - M / Preto",
             sku_snapshot=self.variation.sku,
             quantity=1,
             unit_price=Decimal("120.00"),
@@ -173,7 +174,8 @@ class AdminOrderExportTests(APITestCase):
                 "E-mail",
                 "Itens",
                 "Subtotal",
-                "Desconto/Cupom",
+                "Desconto",
+                "Cupom",
                 "Frete",
                 "Total",
                 "Status do Pedido",
@@ -223,14 +225,65 @@ class AdminOrderExportTests(APITestCase):
         self.assertEqual(len(lines), 2)
         self.assertEqual(lines[1][0], str(self.order_paid.id))
 
+    def _csv_lines(self, response):
+        content = response.content.decode("utf-8-sig")
+        return list(csv.reader(io.StringIO(content), delimiter=";"))
+
     def test_filter_by_search(self):
+        self.client.force_authenticate(self.admin)
+        response = self.client.get(f"{self.url}?search=outro cliente&file_format=csv")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        lines = self._csv_lines(response)
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[1][0], str(self.order_pending.id))
+
+    def test_search_ignores_email_when_customer_has_name(self):
+        # A tela de Pedidos não busca por e-mail quando o cliente tem nome
         self.client.force_authenticate(self.admin)
         response = self.client.get(
             f"{self.url}?search=outro@example.com&file_format=csv"
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(self._csv_lines(response)), 1)
 
-        content = response.content.decode("utf-8-sig")
-        lines = list(csv.reader(io.StringIO(content), delimiter=";"))
+    def test_search_matches_email_when_customer_has_no_name(self):
+        # Sem nome, a tela mostra o e-mail no lugar do nome
+        self.customer_two.name = ""
+        self.customer_two.save(update_fields=["name"])
+        self.client.force_authenticate(self.admin)
+        response = self.client.get(
+            f"{self.url}?search=outro@example.com&file_format=csv"
+        )
+        lines = self._csv_lines(response)
         self.assertEqual(len(lines), 2)
         self.assertEqual(lines[1][0], str(self.order_pending.id))
+
+    def test_items_show_variation_once(self):
+        self.client.force_authenticate(self.admin)
+        response = self.client.get(f"{self.url}?status=PAID&file_format=csv")
+        lines = self._csv_lines(response)
+        self.assertEqual(lines[1][4], "1x Camiseta Minimalista (M / Preto)")
+
+    def test_discount_and_coupon_in_separate_columns_csv(self):
+        self.client.force_authenticate(self.admin)
+        response = self.client.get(f"{self.url}?file_format=csv")
+        rows = {row[0]: row for row in self._csv_lines(response)[1:]}
+
+        paid = rows[str(self.order_paid.id)]
+        self.assertEqual(paid[6], "R$ 12,00")
+        self.assertEqual(paid[7], "DESC10")
+
+        pending = rows[str(self.order_pending.id)]
+        self.assertEqual(pending[6], "R$ 0,00")
+        self.assertEqual(pending[7], "")
+
+    def test_discount_is_numeric_currency_in_xlsx(self):
+        self.client.force_authenticate(self.admin)
+        response = self.client.get(f"{self.url}?status=PAID&file_format=xlsx")
+        ws = openpyxl.load_workbook(io.BytesIO(response.content)).active
+
+        discount = ws.cell(row=2, column=7)
+        self.assertEqual(discount.value, 12.0)
+        self.assertEqual(discount.number_format, '"R$"\\ #,##0.00')
+        self.assertEqual(ws.cell(row=2, column=8).value, "DESC10")

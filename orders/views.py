@@ -602,7 +602,7 @@ class AdminOrderExportView(APIView):
             OpenApiParameter(
                 name="search",
                 type=OpenApiTypes.STR,
-                description="Busca por ID do pedido, nome ou e-mail do cliente",
+                description="Busca por ID do pedido ou nome do cliente",
                 location=OpenApiParameter.QUERY,
                 required=False,
             ),
@@ -620,7 +620,7 @@ class AdminOrderExportView(APIView):
 
         qs = (
             CustomerOrder.objects.select_related("user", "payment", "coupon")
-            .prefetch_related("items__variation")
+            .prefetch_related("items__variation__product")
             .order_by("-created_at")
         )
         if status_q:
@@ -631,10 +631,13 @@ class AdminOrderExportView(APIView):
             if clean_search.startswith("#"):
                 clean_no_hash = clean_search[1:].strip()
                 id_filter = Q(id__icontains=clean_no_hash)
+            # Mesma busca da tela de Pedidos: ID ou nome exibido do cliente
+            # (o e-mail só aparece como nome quando o cliente não tem nome)
+            no_name = Q(user__name="") | Q(user__name__isnull=True)
             qs = qs.filter(
                 id_filter
                 | Q(user__name__icontains=clean_search)
-                | Q(user__email__icontains=clean_search)
+                | (no_name & Q(user__email__icontains=clean_search))
             )
 
         headers = [
@@ -644,7 +647,8 @@ class AdminOrderExportView(APIView):
             "E-mail",
             "Itens",
             "Subtotal",
-            "Desconto/Cupom",
+            "Desconto",
+            "Cupom",
             "Frete",
             "Total",
             "Status do Pedido",
@@ -658,6 +662,7 @@ class AdminOrderExportView(APIView):
             "text",
             "currency",
             "currency",
+            "text",
             "currency",
             "currency",
             "text",
@@ -685,21 +690,21 @@ class AdminOrderExportView(APIView):
         for order in qs:
             item_summaries = []
             for item in order.items.all():
+                # No checkout, product_name já inclui a variação
+                # ("Camisa Azul - GG / Azul"); usa o nome do produto para não
+                # repetir a variação entre parênteses.
+                name = item.product_name
                 var_desc = ""
                 if item.variation:
+                    name = item.variation.product.name
                     attrs = [item.variation.size, item.variation.color]
                     attrs = [a for a in attrs if a]
                     if attrs:
                         var_desc = f" ({' / '.join(attrs)})"
-                item_summaries.append(f"{item.quantity}x {item.product_name}{var_desc}")
+                item_summaries.append(f"{item.quantity}x {name}{var_desc}")
             items_text = ", ".join(item_summaries) if item_summaries else "Sem itens"
 
-            if order.coupon and order.discount_amount > 0:
-                discount_cell = f"R$ {order.discount_amount:.2f} ({order.coupon.code})"
-            elif order.discount_amount > 0:
-                discount_cell = order.discount_amount
-            else:
-                discount_cell = Decimal("0.00")
+            coupon_code = order.coupon.code if order.coupon else None
 
             order_status = order_status_labels.get(order.status, order.status)
             if hasattr(order, "payment") and order.payment:
@@ -717,7 +722,8 @@ class AdminOrderExportView(APIView):
                     order.user.email,
                     items_text,
                     order.subtotal,
-                    discount_cell,
+                    order.discount_amount,
+                    coupon_code,
                     order.shipping_cost,
                     order.total_amount,
                     order_status,

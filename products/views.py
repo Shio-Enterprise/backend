@@ -1,6 +1,5 @@
 import logging
 import uuid
-from decimal import Decimal
 
 from django.core.files.base import ContentFile
 from django.db import transaction
@@ -230,7 +229,7 @@ class InventoryExportView(APIView):
             OpenApiParameter(
                 name="search",
                 type=OpenApiTypes.STR,
-                description="Busca por nome do produto, SKU, tamanho ou cor",
+                description="Busca pelo nome do produto",
                 location=OpenApiParameter.QUERY,
                 required=False,
             ),
@@ -267,12 +266,8 @@ class InventoryExportView(APIView):
 
         if search_q:
             clean_search = search_q.strip()
-            qs = qs.filter(
-                Q(product__name__icontains=clean_search)
-                | Q(sku__icontains=clean_search)
-                | Q(size__icontains=clean_search)
-                | Q(color__icontains=clean_search)
-            )
+            # Mesma busca da tela de Produtos do painel (só pelo nome)
+            qs = qs.filter(product__name__icontains=clean_search)
 
         if drop_q:
             clean_drop = drop_q.strip()
@@ -320,11 +315,8 @@ class InventoryExportView(APIView):
             product = variation.product
             drop_name = product.drop.name if product.drop else "—"
             cat_name = product.category.name if product.category else "—"
-            cost_price = (
-                product.cost_price
-                if product.cost_price is not None
-                else Decimal("0.00")
-            )
+            # Custo não informado sai como célula vazia, não como R$ 0,00
+            cost_price = product.cost_price
             selling_price = product.effective_price
 
             rows.append(
