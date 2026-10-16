@@ -4,6 +4,7 @@ from .correios_views import AgencySearchView, CepLookupView, ShippingOptionsView
 from .views import (
     AdminDashboardView,
     AdminOrderDetailView,
+    AdminOrderExportView,
     AdminOrderListView,
     CartAPIView,
     CartItemAddAPIView,
@@ -65,6 +66,7 @@ urlpatterns = [
         name="user_orders_detail",
     ),
     path("admin/", AdminOrderListView.as_view(), name="admin_orders_list"),
+    path("admin/export/", AdminOrderExportView.as_view(), name="admin_orders_export"),
     path(
         "admin/<uuid:order_id>/",
         AdminOrderDetailView.as_view(),

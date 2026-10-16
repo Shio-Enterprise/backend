@@ -30,6 +30,7 @@ from authentication.permissions import (
     IsStaffOrSuperUser,
     user_has_admin_permission,
 )
+from core.exports import export_data_response
 from products.models import ProductVariation
 
 from .correios import (
@@ -569,6 +570,174 @@ class AdminOrderListView(APIView):
 
         data = DashboardRecentOrderSerializer(qs, many=True).data
         return Response(data, status=status.HTTP_200_OK)
+
+
+class AdminOrderExportView(APIView):
+    """
+    GET /api/orders/admin/export/
+    Exporta pedidos para CSV ou Excel (.xlsx) respeitando filtros de busca e status.
+    Requer a permissão CanManageOrders.
+    """
+
+    permission_classes = [CanManageOrders]
+
+    @extend_schema(
+        tags=["Orders Admin"],
+        summary="Exportar pedidos",
+        parameters=[
+            OpenApiParameter(
+                name="file_format",
+                type=OpenApiTypes.STR,
+                description="Formato de exportação: 'csv' (padrão) ou 'xlsx'",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
+            OpenApiParameter(
+                name="status",
+                type=OpenApiTypes.STR,
+                description="Filtra pedidos pelo status (ex: PAID, SHIPPED)",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
+            OpenApiParameter(
+                name="search",
+                type=OpenApiTypes.STR,
+                description="Busca por ID do pedido ou nome do cliente",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
+        ],
+        responses={
+            200: OpenApiResponse(description="Arquivo exportado (CSV ou XLSX)"),
+            400: OpenApiResponse(description="Formato inválido"),
+            403: OpenApiResponse(description="Acesso negado"),
+        },
+    )
+    def get(self, request):
+        status_q = request.query_params.get("status")
+        search_q = request.query_params.get("search")
+        file_format = request.query_params.get("file_format", "csv")
+
+        qs = (
+            CustomerOrder.objects.select_related("user", "payment", "coupon")
+            .prefetch_related("items__variation__product")
+            .order_by("-created_at")
+        )
+        if status_q:
+            qs = qs.filter(status=status_q)
+        if search_q:
+            clean_search = search_q.strip()
+            id_filter = Q(id__icontains=clean_search)
+            if clean_search.startswith("#"):
+                clean_no_hash = clean_search[1:].strip()
+                id_filter = Q(id__icontains=clean_no_hash)
+            # Mesma busca da tela de Pedidos: ID ou nome exibido do cliente
+            # (o e-mail só aparece como nome quando o cliente não tem nome)
+            no_name = Q(user__name="") | Q(user__name__isnull=True)
+            qs = qs.filter(
+                id_filter
+                | Q(user__name__icontains=clean_search)
+                | (no_name & Q(user__email__icontains=clean_search))
+            )
+
+        headers = [
+            "Número",
+            "Data",
+            "Cliente",
+            "E-mail",
+            "Itens",
+            "Subtotal",
+            "Desconto",
+            "Cupom",
+            "Frete",
+            "Total",
+            "Status do Pedido",
+            "Status do Pagamento",
+        ]
+        column_types = [
+            "text",
+            "datetime",
+            "text",
+            "text",
+            "text",
+            "currency",
+            "currency",
+            "text",
+            "currency",
+            "currency",
+            "text",
+            "text",
+        ]
+
+        order_status_labels = {
+            OrderStatus.AWAITING_PAYMENT: "Aguardando Pagamento",
+            OrderStatus.PAID: "Pago",
+            OrderStatus.PREPARING: "Preparando",
+            OrderStatus.SHIPPED: "Em transporte",
+            OrderStatus.DELIVERED: "Entregue",
+            OrderStatus.CANCELED: "Cancelado",
+        }
+
+        payment_status_labels = {
+            PaymentStatus.PENDING: "Pendente",
+            PaymentStatus.PROCESSING: "Processando",
+            PaymentStatus.PAID: "Pago",
+            PaymentStatus.FAILED: "Falhou",
+            PaymentStatus.REFUNDED: "Reembolsado",
+        }
+
+        rows = []
+        for order in qs:
+            item_summaries = []
+            for item in order.items.all():
+                # No checkout, product_name já inclui a variação
+                # ("Camisa Azul - GG / Azul"); usa o nome do produto para não
+                # repetir a variação entre parênteses.
+                name = item.product_name
+                var_desc = ""
+                if item.variation:
+                    name = item.variation.product.name
+                    attrs = [item.variation.size, item.variation.color]
+                    attrs = [a for a in attrs if a]
+                    if attrs:
+                        var_desc = f" ({' / '.join(attrs)})"
+                item_summaries.append(f"{item.quantity}x {name}{var_desc}")
+            items_text = ", ".join(item_summaries) if item_summaries else "Sem itens"
+
+            coupon_code = order.coupon.code if order.coupon else None
+
+            order_status = order_status_labels.get(order.status, order.status)
+            if hasattr(order, "payment") and order.payment:
+                payment_status = payment_status_labels.get(
+                    order.payment.status, order.payment.status
+                )
+            else:
+                payment_status = "Sem pagamento"
+
+            rows.append(
+                [
+                    str(order.id),
+                    order.created_at,
+                    getattr(order.user, "name", None) or order.user.email,
+                    order.user.email,
+                    items_text,
+                    order.subtotal,
+                    order.discount_amount,
+                    coupon_code,
+                    order.shipping_cost,
+                    order.total_amount,
+                    order_status,
+                    payment_status,
+                ]
+            )
+
+        return export_data_response(
+            filename_base="pedidos",
+            headers=headers,
+            rows=rows,
+            file_format=file_format,
+            column_types=column_types,
+        )
 
 
 class AdminOrderDetailView(APIView):

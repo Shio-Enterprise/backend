@@ -7,6 +7,7 @@ from .views import (
     DropCampaignDetailView,
     DropCampaignListCreateView,
     DropProductManageView,
+    InventoryExportView,
     ProductDetailView,
     ProductDuplicateView,
     ProductImageCreateView,
@@ -126,6 +127,8 @@ urlpatterns = [
         StockMovementListCreateView.as_view(),
         name="variation-stock-movements",
     ),
+    # GET (admin) - Exportar estoque para CSV/XLSX
+    path("inventory/export/", InventoryExportView.as_view(), name="inventory_export"),
     # GET (admin) - Resumo de stock (legado)
     path("inventory/", inventory_summary, name="inventory_summary"),
 ]
