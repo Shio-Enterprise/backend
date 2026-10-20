@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 from django.test import SimpleTestCase, override_settings
 
 from notifications.unsubscribe import (
@@ -23,3 +25,11 @@ class UnsubscribeTokenTests(SimpleTestCase):
         url = unsubscribe_url("ana@x.com")
         token = make_unsubscribe_token("ana@x.com")
         self.assertEqual(url, f"https://x/descadastrar/{token}")
+
+    def test_token_nunca_expira(self):
+        token = make_unsubscribe_token("ana@x.com")
+        dez_anos = 10 * 365 * 24 * 3600
+        with patch(
+            "django.core.signing.time.time", return_value=9_999_999_999 + dez_anos
+        ):
+            self.assertEqual(read_unsubscribe_token(token), "ana@x.com")

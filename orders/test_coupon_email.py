@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.core import mail
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from authentication.models import NewsletterSubscriber
@@ -172,6 +172,22 @@ class CouponCampaignTests(TestCase):
         self.assertEqual(mocked.call_count, 2)
         self.assertEqual(record.sent_count, 1)
         self.assertEqual(record.failed_count, 1)
+
+    @override_settings(MARKETING_EMAIL_INTERVAL_SECONDS=0.5)
+    def test_pausa_entre_envios_menos_depois_do_ultimo(self):
+        self._audience()
+        NewsletterSubscriber.objects.create(email="cris@x.com", consent_lgpd=True)
+        with patch("orders.coupon_email.time.sleep") as sleeper:
+            send_coupon_campaign(self.coupon, self.admin, "oi")
+        self.assertEqual(sleeper.call_count, 2)
+        sleeper.assert_called_with(0.5)
+
+    @override_settings(MARKETING_EMAIL_INTERVAL_SECONDS=0)
+    def test_sem_pausa_quando_intervalo_zero(self):
+        self._audience()
+        with patch("orders.coupon_email.time.sleep") as sleeper:
+            send_coupon_campaign(self.coupon, self.admin, "oi")
+        sleeper.assert_not_called()
 
     def test_primeira_compra_exclui_quem_ja_tem_pedido(self):
         self.coupon.first_purchase_only = True

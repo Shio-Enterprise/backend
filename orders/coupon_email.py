@@ -1,6 +1,7 @@
 """E-mail de divulgação de cupom: bloqueios, condições, prévia e envio."""
 
 import logging
+import time
 from decimal import Decimal
 
 from django.conf import settings
@@ -113,7 +114,11 @@ def send_coupon_campaign(coupon: Coupon, admin, message: str) -> CouponEmailSend
     """Um e-mail por destinatário, cada um com seu link de descadastro."""
     audience = build_audience(first_purchase_only=coupon.first_purchase_only)
     sent = failed = 0
-    for recipient in audience.recipients:
+    interval = settings.MARKETING_EMAIL_INTERVAL_SECONDS
+    for index, recipient in enumerate(audience.recipients):
+        # Respeita o limite de requisições por segundo da API de e-mail.
+        if index and interval > 0:
+            time.sleep(interval)
         ok = send_email(
             recipient.email,
             COUPON_EMAIL_SUBJECT,

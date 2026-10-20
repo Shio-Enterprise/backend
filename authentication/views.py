@@ -702,7 +702,7 @@ class CustomerCRMViewSet(viewsets.ReadOnlyModelViewSet):
         queryset = self.filter_queryset(self.get_queryset())
 
         customers = list(queryset)
-        emails = [c.email for c in customers]
+        emails = [c.email.strip().lower() for c in customers]
         subscribed_emails = set(
             NewsletterSubscriber.objects.filter(
                 email__in=emails,
@@ -734,7 +734,9 @@ class CustomerCRMViewSet(viewsets.ReadOnlyModelViewSet):
             total_orders = getattr(c, "total_orders", 0) or 0
             total_spent = getattr(c, "total_spent", Decimal("0.00")) or Decimal("0.00")
             last_purchase = getattr(c, "last_purchase_date", None)
-            is_subscribed = "Sim" if c.email in subscribed_emails else "Não"
+            is_subscribed = (
+                "Sim" if c.email.strip().lower() in subscribed_emails else "Não"
+            )
 
             rows.append(
                 [
