@@ -75,8 +75,52 @@ class AdminCouponViewSetTests(APITestCase):
             self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
             self.assertIn(field, response.data)
 
-        response = self.client.patch(self.detail_url, {"max_uses_total": 0})
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        for field in ("max_uses_total", "max_uses_per_user"):
+            for value in (0, -1):
+                response = self.client.patch(self.detail_url, {field: value})
+                self.assertEqual(
+                    response.status_code, status.HTTP_400_BAD_REQUEST, (field, value)
+                )
+
+    def test_criar_com_campos_opcionais_null(self):
+        self.client.force_authenticate(user=self.admin_user)
+        payload = {
+            "code": "NULOS",
+            "discount_type": "PERCENTAGE",
+            "discount_value": "10.00",
+            "max_discount_amount": None,
+            "min_order_value": None,
+            "starts_at": None,
+            "expiration_date": None,
+            "max_uses_total": None,
+            "max_uses_per_user": None,
+        }
+        response = self.client.post(self.list_url, payload, format="json")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        coupon = Coupon.objects.get(code="NULOS")
+        self.assertIsNone(coupon.max_uses_total)
+        self.assertIsNone(coupon.expiration_date)
+
+    def test_editar_com_null_volta_a_ser_ilimitado(self):
+        self.coupon.max_uses_total = 10
+        self.coupon.max_uses_per_user = 2
+        self.coupon.min_order_value = Decimal("50.00")
+        self.coupon.save()
+        self.client.force_authenticate(user=self.admin_user)
+        response = self.client.patch(
+            self.detail_url,
+            {
+                "max_uses_total": None,
+                "max_uses_per_user": None,
+                "min_order_value": None,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.coupon.refresh_from_db()
+        self.assertIsNone(self.coupon.max_uses_total)
+        self.assertIsNone(self.coupon.max_uses_per_user)
+        self.assertIsNone(self.coupon.min_order_value)
 
     def test_admin_can_update_coupon(self):
         self.client.force_authenticate(user=self.admin_user)
