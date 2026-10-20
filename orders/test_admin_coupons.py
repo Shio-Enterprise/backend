@@ -62,6 +62,22 @@ class AdminCouponViewSetTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertTrue(Coupon.objects.filter(code="NEW20").exists())
 
+    def test_limites_de_uso_zero_sao_recusados(self):
+        self.client.force_authenticate(user=self.admin_user)
+        for field in ("max_uses_total", "max_uses_per_user"):
+            payload = {
+                "code": f"ZERO{field[9:12].upper()}",
+                "discount_type": "PERCENTAGE",
+                "discount_value": "10.00",
+                field: 0,
+            }
+            response = self.client.post(self.list_url, payload)
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn(field, response.data)
+
+        response = self.client.patch(self.detail_url, {"max_uses_total": 0})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
     def test_admin_can_update_coupon(self):
         self.client.force_authenticate(user=self.admin_user)
         payload = {"is_active": False, "max_uses_total": 100}
