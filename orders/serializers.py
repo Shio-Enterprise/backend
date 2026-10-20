@@ -604,3 +604,7 @@ class CouponAdminSerializer(serializers.ModelSerializer):
                 )
 
         return data
+
+
+class CouponEmailMessageSerializer(serializers.Serializer):
+    message = serializers.CharField(allow_blank=True, required=False, max_length=500)
