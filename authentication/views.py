@@ -35,7 +35,9 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from authentication.signals import google_login_completed
 from core.exports import export_data_response
-from notifications.email import send_email
+from notifications.email import mask_email, send_email
+from notifications.marketing import is_receiving, opt_in, opt_out
+from notifications.unsubscribe import read_unsubscribe_token
 from orders.models import CustomerOrder, OrderStatus, PaymentStatus
 
 from .admin_permissions import serialized_permission_definitions
@@ -412,6 +414,64 @@ class LogoutView(APIView):
                 {"error": "Token inválido ou já expirado."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+
+class MarketingUnsubscribeView(APIView):
+    """Descadastro de promoções por e-mail a partir do link assinado."""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    @staticmethod
+    def _invalid():
+        return Response({"error": "Link inválido."}, status=status.HTTP_400_BAD_REQUEST)
+
+    @extend_schema(
+        tags=["Users"],
+        summary="Confirma o e-mail do link de descadastro",
+        responses={200: OpenApiTypes.OBJECT, 400: OpenApiTypes.OBJECT},
+    )
+    def get(self, request, token):
+        email = read_unsubscribe_token(token)
+        if email is None:
+            return self._invalid()
+        return Response({"email": mask_email(email)})
+
+    @extend_schema(
+        tags=["Users"],
+        summary="Descadastra o e-mail das promoções",
+        responses={200: OpenApiTypes.OBJECT, 400: OpenApiTypes.OBJECT},
+    )
+    def post(self, request, token):
+        email = read_unsubscribe_token(token)
+        if email is None:
+            return self._invalid()
+        opt_out(email)
+        return Response({"message": "Pronto, você não vai mais receber promoções."})
+
+
+class MeMarketingView(APIView):
+    """Aceite de promoções por e-mail do utilizador autenticado."""
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(tags=["Users"], summary="Consulta se recebe promoções por e-mail")
+    def get(self, request):
+        return Response({"receives": is_receiving(request.user.email)})
+
+    @extend_schema(tags=["Users"], summary="Ativa ou desativa promoções por e-mail")
+    def put(self, request):
+        receives = request.data.get("receives")
+        if not isinstance(receives, bool):
+            return Response(
+                {"receives": ["Informe true ou false."]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if receives:
+            opt_in(request.user.email)
+        else:
+            opt_out(request.user.email)
+        return Response({"receives": is_receiving(request.user.email)})
 
 
 class MeView(APIView):
