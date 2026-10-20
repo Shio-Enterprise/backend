@@ -344,6 +344,9 @@ class NewsletterSubscribeSerializer(serializers.Serializer):
     email = serializers.EmailField()
     consent_lgpd = serializers.BooleanField()
 
+    def validate_email(self, value):
+        return value.strip().lower()
+
     def validate_consent_lgpd(self, value):
         if not value:
             raise serializers.ValidationError(
