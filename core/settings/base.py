@@ -370,4 +370,11 @@ SPECTACULAR_SETTINGS = {
     },
 }
 
+# Avisos "Avise-me quando chegar": rodam em thread; nos testes, inline.
+STOCK_ALERTS_RUN_INLINE = False
+# Pausa entre e-mails em massa (limite de requisições do provedor).
+MARKETING_EMAIL_INTERVAL_SECONDS = config(
+    "MARKETING_EMAIL_INTERVAL_SECONDS", default=0.6, cast=float
+)
+
 FRONTEND_URL = config("FRONTEND_URL", default="http://localhost:5173")

@@ -6,6 +6,7 @@ from .models import (
     Product,
     ProductImage,
     ProductVariation,
+    StockAlert,
     StockMovement,
 )
 
@@ -120,4 +121,13 @@ class StockMovementAdmin(admin.ModelAdmin):
         return False
 
     def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(StockAlert)
+class StockAlertAdmin(admin.ModelAdmin):
+    list_display = ("user", "variation", "created_at", "notified_at")
+    readonly_fields = ("user", "variation", "created_at", "notified_at")
+
+    def has_add_permission(self, request):
         return False

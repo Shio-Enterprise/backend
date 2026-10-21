@@ -162,6 +162,37 @@ class Wishlist(models.Model):
         return f"{self.user} — {self.product}"
 
 
+class StockAlert(models.Model):
+    """Pedido de aviso "Avise-me quando chegar" para uma variação sem estoque."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="stock_alerts",
+    )
+    variation = models.ForeignKey(
+        "ProductVariation",
+        on_delete=models.CASCADE,
+        related_name="stock_alerts",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    notified_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "variation"],
+                condition=models.Q(notified_at__isnull=True),
+                name="unique_pending_stock_alert",
+            )
+        ]
+        ordering = ["created_at", "id"]
+
+    def __str__(self):
+        return f"{self.user} — {self.variation}"
+
+
 class ProductVariation(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     product = models.ForeignKey(

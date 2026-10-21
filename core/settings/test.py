@@ -18,3 +18,6 @@ SIMPLE_JWT["SIGNING_KEY"] = SECRET_KEY
 
 # Testes nunca enviam e-mail de verdade
 EMAIL_BACKEND = "django.core.mail.backends.locmem.EmailBackend"
+
+STOCK_ALERTS_RUN_INLINE = True
+MARKETING_EMAIL_INTERVAL_SECONDS = 0
