@@ -69,6 +69,7 @@ from .serializers import (
     WishlistPageSerializer,
     WishlistSerializer,
 )
+from .stock_alerts import watch_sellable
 
 logger = logging.getLogger(__name__)
 
@@ -628,7 +629,8 @@ class DropCampaignDetailView(APIView):
                 {"error": "Dados inválidos.", "details": serializer.errors},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        serializer.save()
+        with watch_sellable(list(drop.products.select_related("drop"))):
+            serializer.save()
         return Response(serializer.data)
 
     @extend_schema(
@@ -682,8 +684,9 @@ class DropProductManageView(APIView):
     def post(self, request, drop_id, product_id):
         drop = self._get_drop(drop_id)
         product = self._get_product(product_id)
-        product.drop = drop
-        product.save(update_fields=["drop", "updated_at"])
+        with watch_sellable([product]):
+            product.drop = drop
+            product.save(update_fields=["drop", "updated_at"])
         logger.info(f"Produto {product.id} vinculado ao drop {drop.id}")
         return Response(
             DropCampaignDetailSerializer(drop, context={"request": request}).data
@@ -714,8 +717,9 @@ class DropProductManageView(APIView):
                 {"error": "Produto não pertence a este drop."},
                 status=status.HTTP_404_NOT_FOUND,
             )
-        product.drop = None
-        product.save(update_fields=["drop", "updated_at"])
+        with watch_sellable([product]):
+            product.drop = None
+            product.save(update_fields=["drop", "updated_at"])
         logger.info(f"Produto {product.id} desvinculado do drop {drop.id}")
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -991,7 +995,8 @@ class ProductDetailView(APIView):
                 {"error": "Dados inválidos.", "details": serializer.errors},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        product = serializer.save()
+        with watch_sellable([product]):
+            product = serializer.save()
         return Response(
             ProductDetailSerializer(product, context={"request": request}).data
         )

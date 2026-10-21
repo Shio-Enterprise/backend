@@ -3,6 +3,7 @@
 import logging
 import threading
 import time
+from contextlib import contextmanager
 
 from django.conf import settings
 from django.db import connection, transaction
@@ -11,7 +12,7 @@ from django.utils import timezone
 from notifications.email import send_email
 
 from .availability import is_product_sellable
-from .models import ProductVariation, StockAlert
+from .models import Product, ProductVariation, StockAlert
 
 logger = logging.getLogger(__name__)
 
@@ -104,3 +105,15 @@ def schedule_product_alerts(product) -> None:
     ).values_list("pk", flat=True).distinct()
     for variation_id in list(variation_ids):
         schedule_variation_alerts(variation_id)
+
+
+@contextmanager
+def watch_sellable(products):
+    """Avisa os pendentes dos produtos que passarem a ser vendáveis no bloco."""
+    not_sellable = [p.pk for p in products if not is_product_sellable(p)]
+    yield
+    if not not_sellable:
+        return
+    for product in Product.objects.select_related("drop").filter(pk__in=not_sellable):
+        if is_product_sellable(product):
+            schedule_product_alerts(product)

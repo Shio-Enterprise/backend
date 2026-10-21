@@ -6,11 +6,13 @@ from django.conf import settings
 from django.core import mail
 from django.db import IntegrityError, transaction
 from django.test import TestCase
+from rest_framework.test import APITestCase
 from django.utils import timezone
 
-from products.models import DropCampaign, ProductVariation, StockAlert
+from products.models import DropCampaign, Product, ProductVariation, StockAlert
 from products.stock_alerts import schedule_product_alerts, send_stock_alerts
-from products.tests import make_product, make_user
+from products.services import move_stock
+from products.tests import auth_header, make_product, make_user
 
 
 def make_variation(product, size="M", stock=3, color=""):
@@ -160,3 +162,175 @@ class StockAlertSendTests(TestCase):
         with self.captureOnCommitCallbacks(execute=True):
             schedule_product_alerts(self.product)
         self.assertEqual([m.to for m in mail.outbox], [["a@x.com"]])
+
+
+class StockAlertTriggerTests(APITestCase):
+    def setUp(self):
+        from authentication.models import UserRole
+
+        self.admin = make_user(
+            "admin@x.com", role=UserRole.ADMIN, name="Admin", is_staff=True
+        )
+        self.customer = make_user("c@x.com", name="Cliente")
+        self.product = make_product("Camiseta Shio", cost_price=50)
+        self.variation = make_variation(self.product, stock=0)
+
+    def pending(self, variation=None):
+        return StockAlert.objects.create(
+            user=self.customer, variation=variation or self.variation
+        )
+
+    def move(self, kind="ENTRADA", quantity=2, key="k1", variation=None):
+        return move_stock(
+            variation=variation or self.variation,
+            kind=kind,
+            reason="AJUSTE",
+            quantity=quantity,
+            origin_type="MANUAL_ADJUSTMENT",
+            origin_id=uuid.UUID(int=1),
+            idempotency_key=key,
+            created_by=self.admin,
+            note="x",
+        )
+
+    def test_restock_from_zero_sends(self):
+        self.pending()
+        with self.captureOnCommitCallbacks(execute=True):
+            self.move()
+        self.assertEqual(len(mail.outbox), 1)
+
+    def test_restock_from_positive_does_not_send(self):
+        ProductVariation.objects.filter(pk=self.variation.pk).update(stock_quantity=3)
+        self.pending()
+        with self.captureOnCommitCallbacks(execute=True):
+            self.move(quantity=2)
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_idempotent_replay_does_not_dispatch(self):
+        self.pending()
+        with self.captureOnCommitCallbacks(execute=True):
+            self.move(quantity=2, key="same")
+        self.assertEqual(len(mail.outbox), 1)
+        with self.captureOnCommitCallbacks(execute=True):
+            self.move(kind="SAIDA", quantity=2, key="out")
+        self.pending()
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            self.move(quantity=2, key="same")
+        self.assertEqual(callbacks, [])
+        self.assertEqual(len(mail.outbox), 1)
+
+    def test_rollback_does_not_dispatch(self):
+        self.pending()
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            with self.assertRaises(RuntimeError):
+                with transaction.atomic():
+                    self.move()
+                    raise RuntimeError("abort")
+        self.assertEqual(callbacks, [])
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_order_cancel_restock_sends(self):
+        from orders.models import CustomerOrder, OrderItem, OrderStatus
+        from orders.services import restore_order_stock
+
+        ProductVariation.objects.filter(pk=self.variation.pk).update(stock_quantity=1)
+        order = CustomerOrder.objects.create(
+            user=self.customer,
+            subtotal=100,
+            total_amount=100,
+            status=OrderStatus.CANCELED,
+            shipping_zip_code="000",
+            shipping_street="X",
+            shipping_number="1",
+            shipping_neighborhood="Y",
+            shipping_city="Z",
+            shipping_state="DF",
+        )
+        item = OrderItem.objects.create(
+            order=order,
+            variation=self.variation,
+            quantity=1,
+            unit_price=100,
+            product_name="Camiseta Shio - M",
+            sku_snapshot=self.variation.sku,
+        )
+        move_stock(
+            variation=self.variation,
+            kind="SAIDA",
+            reason="VENDA",
+            quantity=1,
+            origin_type="ORDER",
+            origin_id=order.pk,
+            order_item=item,
+            idempotency_key=f"sale:{item.pk}",
+            created_by=self.customer,
+        )
+        other = make_user("o@x.com", name="Outro")
+        StockAlert.objects.create(user=other, variation=self.variation)
+        with self.captureOnCommitCallbacks(execute=True):
+            restore_order_stock(order, changed_by=self.admin)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, ["o@x.com"])
+
+    def test_product_reactivation_sends(self):
+        Product.objects.filter(pk=self.product.pk).update(is_active=False)
+        ProductVariation.objects.filter(pk=self.variation.pk).update(stock_quantity=2)
+        self.pending()
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.patch(
+                f"/api/catalog/products/{self.product.id}/",
+                {"is_active": True},
+                format="json",
+                **auth_header(self.admin),
+            )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(len(mail.outbox), 1)
+
+    def test_saving_active_product_does_not_send(self):
+        ProductVariation.objects.filter(pk=self.variation.pk).update(stock_quantity=2)
+        self.pending()
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.patch(
+                f"/api/catalog/products/{self.product.id}/",
+                {"name": "Novo nome"},
+                format="json",
+                **auth_header(self.admin),
+            )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_drop_made_public_sends(self):
+        drop = DropCampaign.objects.create(
+            name="Drop", slug="drop-x", is_public=False, is_active=True
+        )
+        Product.objects.filter(pk=self.product.pk).update(drop=drop)
+        ProductVariation.objects.filter(pk=self.variation.pk).update(stock_quantity=2)
+        self.pending()
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.put(
+                f"/api/catalog/drops/{drop.id}/",
+                {"name": "Drop", "slug": "drop-x", "is_public": True, "is_active": True},
+                format="json",
+                **auth_header(self.admin),
+            )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(len(mail.outbox), 1)
+
+    def test_product_moved_out_of_closed_drop_sends(self):
+        drop = DropCampaign.objects.create(
+            name="Drop",
+            slug="drop-y",
+            is_public=True,
+            is_active=True,
+            end_date=timezone.now() - timedelta(days=1),
+        )
+        Product.objects.filter(pk=self.product.pk).update(drop=drop)
+        ProductVariation.objects.filter(pk=self.variation.pk).update(stock_quantity=2)
+        self.pending()
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.delete(
+                f"/api/catalog/drops/{drop.id}/products/{self.product.id}/",
+                **auth_header(self.admin),
+            )
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(len(mail.outbox), 1)
