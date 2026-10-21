@@ -1,17 +1,19 @@
 import uuid
 from datetime import timedelta
-from unittest.mock import patch
+from threading import Barrier
+from unittest import skipIf
+from unittest.mock import MagicMock, patch
 
 from django.conf import settings
 from django.core import mail
-from django.db import IntegrityError, transaction
-from django.test import TestCase
+from django.db import IntegrityError, connection, transaction
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
-from rest_framework.test import APITestCase
+from rest_framework.test import APIClient, APITestCase
 
 from products.models import DropCampaign, Product, ProductVariation, StockAlert
 from products.services import move_stock
-from products.stock_alerts import schedule_product_alerts, send_stock_alerts
+from products.stock_alerts import _run, schedule_product_alerts, send_stock_alerts
 from products.tests import auth_header, make_product, make_user
 
 
@@ -204,6 +206,65 @@ class StockAlertSendTests(TestCase):
         with self.captureOnCommitCallbacks(execute=True):
             schedule_product_alerts(self.product)
         self.assertEqual([m.to for m in mail.outbox], [["a@x.com"]])
+
+
+class StockAlertBackgroundTests(TestCase):
+    def setUp(self):
+        self.product = make_product("Camiseta Shio")
+        self.variation = make_variation(self.product)
+
+    @override_settings(STOCK_ALERTS_RUN_INLINE=False)
+    def test_background_mode_runs_in_thread_and_closes_connection(self):
+        captured = {}
+
+        def fake_thread(target, daemon):
+            captured["target"] = target
+            captured["daemon"] = daemon
+            captured["thread"] = MagicMock()
+            return captured["thread"]
+
+        func = MagicMock()
+        with patch("products.stock_alerts.threading.Thread", side_effect=fake_thread):
+            _run(func, "arg")
+        self.assertIs(captured["daemon"], True)
+        captured["thread"].start.assert_called_once_with()
+        func.assert_not_called()
+        with patch("products.stock_alerts.connection.close") as close:
+            captured["target"]()
+        func.assert_called_once_with("arg")
+        close.assert_called_once_with()
+
+    @override_settings(STOCK_ALERTS_RUN_INLINE=False)
+    def test_background_exception_is_logged_without_email(self):
+        captured = {}
+
+        def fake_thread(target, daemon):
+            captured["target"] = target
+            return MagicMock()
+
+        func = MagicMock(side_effect=RuntimeError("boom"))
+        with patch("products.stock_alerts.threading.Thread", side_effect=fake_thread):
+            _run(func, "arg")
+        with (
+            patch("products.stock_alerts.connection.close") as close,
+            self.assertLogs("products.stock_alerts", level="ERROR") as logs,
+        ):
+            captured["target"]()
+        close.assert_called_once_with()
+        for line in logs.output:
+            self.assertNotIn("@", line)
+
+    @override_settings(MARKETING_EMAIL_INTERVAL_SECONDS=0.6)
+    def test_pause_between_sends_not_before_first(self):
+        for i in range(3):
+            StockAlert.objects.create(
+                user=make_user(f"p{i}@x.com", name=f"P{i}"), variation=self.variation
+            )
+        with patch("products.stock_alerts.time.sleep") as sleep:
+            self.assertEqual(send_stock_alerts(self.variation.id), 3)
+        self.assertEqual(sleep.call_count, 2)
+        for call in sleep.call_args_list:
+            self.assertEqual(call.args, (0.6,))
 
 
 class StockAlertTriggerTests(APITestCase):
@@ -464,6 +525,15 @@ class StockAlertApiTests(APITestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(StockAlert.objects.count(), 1)
 
+    def test_post_returns_409_when_create_keeps_failing(self):
+        with patch(
+            "products.views.StockAlert.objects.create", side_effect=IntegrityError()
+        ) as create:
+            response = self.post(self.variation.id)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(create.call_count, 2)
+        self.assertEqual(StockAlert.objects.count(), 0)
+
     def test_create_on_stocked_variation_400(self):
         stocked = make_variation(self.product, size="G", stock=2)
         response = self.post(stocked.id)
@@ -549,3 +619,101 @@ class StockAlertApiTests(APITestCase):
         response = self.post(self.variation.id)
         self.assertEqual(response.status_code, 201)
         self.assertEqual(StockAlert.objects.filter(user=self.user).count(), 2)
+
+
+@skipIf(
+    connection.vendor == "sqlite", "Concurrent stock alert tests require PostgreSQL"
+)
+class StockAlertConcurrentTests(TransactionTestCase):
+    reset_sequences = True
+
+    def setUp(self):
+        from authentication.models import UserRole
+
+        self.admin = make_user(
+            "admin@x.com", role=UserRole.ADMIN, name="Admin", is_staff=True
+        )
+        self.product = make_product("Camiseta Shio", cost_price=50)
+
+    def run_concurrently(self, worker):
+        from concurrent.futures import ThreadPoolExecutor
+
+        barrier = Barrier(2)
+
+        def wrapped(index):
+            try:
+                barrier.wait(timeout=10)
+                return worker(index)
+            finally:
+                connection.close()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            return list(executor.map(wrapped, range(2)))
+
+    def test_concurrent_senders_send_each_alert_once(self):
+        variation = make_variation(self.product, stock=5)
+        users = [make_user(f"s{i}@x.com", name=f"S{i}") for i in range(3)]
+        for user in users:
+            StockAlert.objects.create(user=user, variation=variation)
+
+        with override_settings(MARKETING_EMAIL_INTERVAL_SECONDS=0):
+            results = self.run_concurrently(lambda _: send_stock_alerts(variation.id))
+
+        self.assertEqual(len(mail.outbox), 3)
+        self.assertEqual(sum(results), 3)
+        self.assertEqual(
+            StockAlert.objects.filter(
+                variation=variation, notified_at__isnull=False
+            ).count(),
+            3,
+        )
+
+    def test_concurrent_posts_create_single_pending_alert(self):
+        variation = make_variation(self.product, stock=0)
+        user = make_user("cliente@x.com", name="Cliente")
+        token = str(auth_header(user)["HTTP_AUTHORIZATION"])
+
+        def post(_):
+            return (
+                APIClient()
+                .post(
+                    "/api/catalog/stock-alerts/",
+                    {"variation_id": str(variation.id)},
+                    format="json",
+                    HTTP_AUTHORIZATION=token,
+                )
+                .status_code
+            )
+
+        statuses = self.run_concurrently(post)
+        self.assertCountEqual(statuses, [201, 200])
+        self.assertEqual(
+            StockAlert.objects.filter(
+                user=user, variation=variation, notified_at__isnull=True
+            ).count(),
+            1,
+        )
+
+    @override_settings(STOCK_ALERTS_RUN_INLINE=True)
+    def test_concurrent_restocks_send_once(self):
+        variation = make_variation(self.product, stock=0)
+        user = make_user("cliente@x.com", name="Cliente")
+        StockAlert.objects.create(user=user, variation=variation)
+
+        def restock(index):
+            with transaction.atomic():
+                return move_stock(
+                    variation=variation,
+                    kind="ENTRADA",
+                    reason="AJUSTE",
+                    quantity=2,
+                    origin_type="MANUAL_ADJUSTMENT",
+                    origin_id=uuid.UUID(int=1),
+                    idempotency_key=f"restock-{index}",
+                    created_by=self.admin,
+                    note="x",
+                )
+
+        self.run_concurrently(restock)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, ["cliente@x.com"])
