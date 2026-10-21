@@ -32,7 +32,9 @@ def send_stock_alerts(variation_id) -> int:
         return 0
 
     product = variation.product
-    size = f"{variation.size} / {variation.color}" if variation.color else variation.size
+    size = (
+        f"{variation.size} / {variation.color}" if variation.color else variation.size
+    )
     product_url = f"{settings.FRONTEND_URL}/product/{product.id}"
     subject = f"Chegou! {product.name} — Shio"
 
@@ -98,11 +100,15 @@ def schedule_variation_alerts(variation_id) -> None:
 
 
 def schedule_product_alerts(product) -> None:
-    variation_ids = ProductVariation.objects.filter(
-        product=product,
-        stock_quantity__gt=0,
-        stock_alerts__notified_at__isnull=True,
-    ).values_list("pk", flat=True).distinct()
+    variation_ids = (
+        ProductVariation.objects.filter(
+            product=product,
+            stock_quantity__gt=0,
+            stock_alerts__notified_at__isnull=True,
+        )
+        .values_list("pk", flat=True)
+        .distinct()
+    )
     for variation_id in list(variation_ids):
         schedule_variation_alerts(variation_id)
 
