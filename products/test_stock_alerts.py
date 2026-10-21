@@ -1,4 +1,6 @@
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from threading import Barrier
 from unittest import skipIf
@@ -253,6 +255,7 @@ class StockAlertBackgroundTests(TestCase):
         close.assert_called_once_with()
         for line in logs.output:
             self.assertNotIn("@", line)
+        self.assertEqual(mail.outbox, [])
 
     @override_settings(MARKETING_EMAIL_INTERVAL_SECONDS=0.6)
     def test_pause_between_sends_not_before_first(self):
@@ -625,8 +628,6 @@ class StockAlertApiTests(APITestCase):
     connection.vendor == "sqlite", "Concurrent stock alert tests require PostgreSQL"
 )
 class StockAlertConcurrentTests(TransactionTestCase):
-    reset_sequences = True
-
     def setUp(self):
         from authentication.models import UserRole
 
@@ -636,8 +637,6 @@ class StockAlertConcurrentTests(TransactionTestCase):
         self.product = make_product("Camiseta Shio", cost_price=50)
 
     def run_concurrently(self, worker):
-        from concurrent.futures import ThreadPoolExecutor
-
         barrier = Barrier(2)
 
         def wrapped(index):
@@ -650,13 +649,26 @@ class StockAlertConcurrentTests(TransactionTestCase):
         with ThreadPoolExecutor(max_workers=2) as executor:
             return list(executor.map(wrapped, range(2)))
 
+    @staticmethod
+    def slow_send_email():
+        from products.stock_alerts import send_email as real_send_email
+
+        def slow(*args, **kwargs):
+            time.sleep(0.05)
+            return real_send_email(*args, **kwargs)
+
+        return patch("products.stock_alerts.send_email", slow)
+
     def test_concurrent_senders_send_each_alert_once(self):
         variation = make_variation(self.product, stock=5)
         users = [make_user(f"s{i}@x.com", name=f"S{i}") for i in range(3)]
         for user in users:
             StockAlert.objects.create(user=user, variation=variation)
 
-        with override_settings(MARKETING_EMAIL_INTERVAL_SECONDS=0):
+        with (
+            override_settings(MARKETING_EMAIL_INTERVAL_SECONDS=0),
+            self.slow_send_email(),
+        ):
             results = self.run_concurrently(lambda _: send_stock_alerts(variation.id))
 
         self.assertEqual(len(mail.outbox), 3)
@@ -685,7 +697,20 @@ class StockAlertConcurrentTests(TransactionTestCase):
                 .status_code
             )
 
-        statuses = self.run_concurrently(post)
+        real_create = StockAlert.objects.create
+        integrity_errors = []
+
+        def slow_create(**kwargs):
+            time.sleep(0.05)  # both requests pass the "no pending" check first
+            try:
+                return real_create(**kwargs)
+            except IntegrityError:
+                integrity_errors.append(1)
+                raise
+
+        with patch("products.views.StockAlert.objects.create", slow_create):
+            statuses = self.run_concurrently(post)
+        self.assertGreaterEqual(len(integrity_errors), 1)
         self.assertCountEqual(statuses, [201, 200])
         self.assertEqual(
             StockAlert.objects.filter(
@@ -714,6 +739,7 @@ class StockAlertConcurrentTests(TransactionTestCase):
                     note="x",
                 )
 
-        self.run_concurrently(restock)
+        with self.slow_send_email():
+            self.run_concurrently(restock)
         self.assertEqual(len(mail.outbox), 1)
         self.assertEqual(mail.outbox[0].to, ["cliente@x.com"])
