@@ -209,6 +209,10 @@ STOCK_RESERVATION_GRACE_SECONDS = config(
 RESERVATION_SWEEP_INTERVAL_SECONDS = config(
     "RESERVATION_SWEEP_INTERVAL_SECONDS", default=60, cast=int
 )
+# Pausa entre e-mails de uma campanha (limite de requisições da API de e-mail).
+MARKETING_EMAIL_INTERVAL_SECONDS = config(
+    "MARKETING_EMAIL_INTERVAL_SECONDS", default=0.6, cast=float
+)
 SHIPPING_QUOTE_TTL_SECONDS = config("SHIPPING_QUOTE_TTL_SECONDS", default=900, cast=int)
 CHECKOUT_PROCESSING_TIMEOUT_SECONDS = config(
     "CHECKOUT_PROCESSING_TIMEOUT_SECONDS", default=60, cast=int
@@ -372,9 +376,5 @@ SPECTACULAR_SETTINGS = {
 
 # Avisos "Avise-me quando chegar": rodam em thread; nos testes, inline.
 STOCK_ALERTS_RUN_INLINE = False
-# Pausa entre e-mails em massa (limite de requisições do provedor).
-MARKETING_EMAIL_INTERVAL_SECONDS = config(
-    "MARKETING_EMAIL_INTERVAL_SECONDS", default=0.6, cast=float
-)
 
 FRONTEND_URL = config("FRONTEND_URL", default="http://localhost:5173")
