@@ -2,9 +2,20 @@ import logging
 import uuid
 
 from django.core.files.base import ContentFile
-from django.db import transaction
-from django.db.models import Exists, Max, OuterRef, Q, Sum
+from django.db import IntegrityError, transaction
+from django.db.models import (
+    Case,
+    Exists,
+    IntegerField,
+    Max,
+    OuterRef,
+    Q,
+    Sum,
+    Value,
+    When,
+)
 from django.db.models.deletion import ProtectedError
+from django.http import Http404
 from django.shortcuts import get_object_or_404
 from drf_spectacular.utils import (
     OpenApiParameter,
@@ -31,6 +42,7 @@ from orders.expiration import sweep_expired_reservations
 
 from .availability import (
     is_drop_visible,
+    is_product_sellable,
     is_product_visible,
     visible_drops_queryset,
     visible_products_queryset,
@@ -48,6 +60,7 @@ from .models import (
     Product,
     ProductImage,
     ProductVariation,
+    StockAlert,
     Wishlist,
 )
 from .serializers import (
@@ -63,6 +76,11 @@ from .serializers import (
     ProductListSerializer,
     ProductVariationSerializer,
     ProductWriteSerializer,
+    StockAlertCreateSerializer,
+    StockAlertItemSerializer,
+    StockAlertListSerializer,
+    StockAlertPendingVariationsSerializer,
+    StockAlertSerializer,
     StockMovementSerializer,
     WishlistCreateSerializer,
     WishlistIdsSerializer,
@@ -186,6 +204,132 @@ class WishlistDeleteView(APIView):
     )
     def delete(self, request, product_id):
         Wishlist.objects.filter(user=request.user, product_id=product_id).delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+def stock_alerts_queryset():
+    return StockAlert.objects.select_related(
+        "variation", "variation__product", "variation__product__drop"
+    ).prefetch_related("variation__product__images")
+
+
+class StockAlertListCreateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["Stock alerts"],
+        summary="Listar avisos de reposição",
+        responses={
+            200: StockAlertListSerializer,
+            401: OpenApiResponse(description="Não autenticado."),
+        },
+    )
+    def get(self, request):
+        queryset = (
+            stock_alerts_queryset()
+            .filter(user=request.user)
+            .annotate(
+                is_notified=Case(
+                    When(notified_at__isnull=True, then=Value(0)),
+                    default=Value(1),
+                    output_field=IntegerField(),
+                )
+            )
+            .order_by("is_notified", "-created_at", "id")
+        )
+        serializer = StockAlertSerializer(
+            queryset, many=True, context={"request": request}
+        )
+        return Response({"results": serializer.data})
+
+    @extend_schema(
+        tags=["Stock alerts"],
+        summary="Pedir aviso de reposição",
+        request=StockAlertCreateSerializer,
+        responses={
+            200: StockAlertItemSerializer,
+            201: StockAlertItemSerializer,
+            400: OpenApiResponse(
+                description="Variação com estoque ou produto fora de venda."
+            ),
+            401: OpenApiResponse(description="Não autenticado."),
+            404: OpenApiResponse(description="Variação inexistente ou não visível."),
+        },
+    )
+    def post(self, request):
+        input_serializer = StockAlertCreateSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+        variation = get_object_or_404(
+            ProductVariation.objects.select_related("product", "product__drop"),
+            pk=input_serializer.validated_data["variation_id"],
+        )
+        if not is_product_visible(variation.product):
+            raise Http404
+        if not is_product_sellable(variation.product):
+            raise ValidationError(
+                {"variation_id": ["Este produto não está à venda no momento."]}
+            )
+        if variation.stock_quantity > 0:
+            raise ValidationError({"variation_id": ["Este tamanho está disponível."]})
+
+        created = False
+        alert = StockAlert.objects.filter(
+            user=request.user, variation=variation, notified_at__isnull=True
+        ).first()
+        if alert is None:
+            try:
+                with transaction.atomic():
+                    alert = StockAlert.objects.create(
+                        user=request.user, variation=variation
+                    )
+                created = True
+            except IntegrityError:
+                alert = StockAlert.objects.get(
+                    user=request.user, variation=variation, notified_at__isnull=True
+                )
+        alert = stock_alerts_queryset().get(pk=alert.pk)
+        alert.already_pending = not created
+        return Response(
+            StockAlertItemSerializer(alert, context={"request": request}).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+class StockAlertPendingVariationsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["Stock alerts"],
+        summary="Listar variações com aviso pendente",
+        responses={
+            200: StockAlertPendingVariationsSerializer,
+            401: OpenApiResponse(description="Não autenticado."),
+        },
+    )
+    def get(self, request):
+        ids = StockAlert.objects.filter(
+            user=request.user, notified_at__isnull=True
+        ).values_list("variation_id", flat=True)
+        return Response({"variation_ids": [str(pk) for pk in ids]})
+
+
+class StockAlertDeleteView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["Stock alerts"],
+        summary="Cancelar aviso de reposição pendente",
+        responses={
+            204: OpenApiResponse(description="Aviso cancelado."),
+            401: OpenApiResponse(description="Não autenticado."),
+            404: OpenApiResponse(description="Aviso pendente não encontrado."),
+        },
+    )
+    def delete(self, request, pk):
+        alert = get_object_or_404(
+            StockAlert, pk=pk, user=request.user, notified_at__isnull=True
+        )
+        alert.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 

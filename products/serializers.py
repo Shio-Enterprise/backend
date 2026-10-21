@@ -4,15 +4,22 @@ from decimal import ROUND_HALF_UP, Decimal
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 from django.utils.text import slugify
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
-from .availability import is_drop_sellable, is_drop_visible, is_product_sellable
+from .availability import (
+    is_drop_sellable,
+    is_drop_visible,
+    is_product_sellable,
+    is_product_visible,
+)
 from .models import (
     Category,
     DropCampaign,
     Product,
     ProductImage,
     ProductVariation,
+    StockAlert,
     StockMovement,
     Wishlist,
 )
@@ -485,6 +492,70 @@ class WishlistPageSerializer(serializers.Serializer):
 
 class WishlistIdsSerializer(serializers.Serializer):
     product_ids = serializers.ListField(child=serializers.UUIDField())
+
+
+class StockAlertCreateSerializer(serializers.Serializer):
+    variation_id = serializers.UUIDField()
+
+
+class StockAlertProductSerializer(serializers.Serializer):
+    id = serializers.UUIDField()
+    name = serializers.CharField()
+    image = serializers.URLField(allow_null=True)
+    is_visible = serializers.BooleanField()
+
+
+class StockAlertSerializer(serializers.ModelSerializer):
+    variation_id = serializers.UUIDField(read_only=True)
+    size = serializers.CharField(source="variation.size", read_only=True)
+    color = serializers.CharField(source="variation.color", read_only=True)
+    product = serializers.SerializerMethodField()
+
+    class Meta:
+        model = StockAlert
+        fields = [
+            "id",
+            "variation_id",
+            "size",
+            "color",
+            "created_at",
+            "notified_at",
+            "product",
+        ]
+        read_only_fields = fields
+
+    @extend_schema_field(StockAlertProductSerializer)
+    def get_product(self, obj):
+        product = obj.variation.product
+        first_image = next(iter(product.images.all()), None)
+        image = None
+        if first_image is not None and first_image.image:
+            image = first_image.image.url
+            request = self.context.get("request")
+            if request is not None:
+                image = request.build_absolute_uri(image)
+        return {
+            "id": str(product.id),
+            "name": product.name,
+            "image": image,
+            "is_visible": is_product_visible(product),
+        }
+
+
+class StockAlertItemSerializer(StockAlertSerializer):
+    already_pending = serializers.BooleanField(read_only=True)
+
+    class Meta(StockAlertSerializer.Meta):
+        fields = StockAlertSerializer.Meta.fields + ["already_pending"]
+        read_only_fields = fields
+
+
+class StockAlertListSerializer(serializers.Serializer):
+    results = StockAlertSerializer(many=True)
+
+
+class StockAlertPendingVariationsSerializer(serializers.Serializer):
+    variation_ids = serializers.ListField(child=serializers.UUIDField())
 
 
 class ProductDetailSerializer(ProductPricingSerializer):

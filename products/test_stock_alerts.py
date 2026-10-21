@@ -6,12 +6,12 @@ from django.conf import settings
 from django.core import mail
 from django.db import IntegrityError, transaction
 from django.test import TestCase
-from rest_framework.test import APITestCase
 from django.utils import timezone
+from rest_framework.test import APITestCase
 
 from products.models import DropCampaign, Product, ProductVariation, StockAlert
-from products.stock_alerts import schedule_product_alerts, send_stock_alerts
 from products.services import move_stock
+from products.stock_alerts import schedule_product_alerts, send_stock_alerts
 from products.tests import auth_header, make_product, make_user
 
 
@@ -85,9 +85,7 @@ class StockAlertSendTests(TestCase):
         StockAlert.objects.filter(pk=a1.pk).update(
             created_at=timezone.now() - timedelta(minutes=5)
         )
-        with patch(
-            "products.stock_alerts.send_email", side_effect=[False, True]
-        ):
+        with patch("products.stock_alerts.send_email", side_effect=[False, True]):
             self.assertEqual(send_stock_alerts(self.variation.id), 1)
         a1.refresh_from_db()
         a2.refresh_from_db()
@@ -309,7 +307,12 @@ class StockAlertTriggerTests(APITestCase):
         with self.captureOnCommitCallbacks(execute=True):
             response = self.client.put(
                 f"/api/catalog/drops/{drop.id}/",
-                {"name": "Drop", "slug": "drop-x", "is_public": True, "is_active": True},
+                {
+                    "name": "Drop",
+                    "slug": "drop-x",
+                    "is_public": True,
+                    "is_active": True,
+                },
                 format="json",
                 **auth_header(self.admin),
             )
@@ -334,3 +337,141 @@ class StockAlertTriggerTests(APITestCase):
             )
         self.assertEqual(response.status_code, 204)
         self.assertEqual(len(mail.outbox), 1)
+
+
+class StockAlertApiTests(APITestCase):
+    list_url = "/api/catalog/stock-alerts/"
+    pending_url = "/api/catalog/stock-alerts/pending-variations/"
+
+    def setUp(self):
+        self.user = make_user("cliente@x.com", name="Cliente")
+        self.other = make_user("outro@x.com", name="Outro")
+        self.product = make_product("Camiseta Shio")
+        self.variation = make_variation(self.product, size="M", stock=0)
+
+    def headers(self, user=None):
+        return auth_header(user or self.user)
+
+    def post(self, variation_id, user=None):
+        return self.client.post(
+            self.list_url,
+            {"variation_id": str(variation_id)},
+            format="json",
+            **self.headers(user),
+        )
+
+    def test_anonymous_gets_401(self):
+        alert = StockAlert.objects.create(user=self.user, variation=self.variation)
+        self.assertEqual(self.client.get(self.list_url).status_code, 401)
+        self.assertEqual(
+            self.client.post(
+                self.list_url, {"variation_id": str(self.variation.id)}, format="json"
+            ).status_code,
+            401,
+        )
+        self.assertEqual(self.client.get(self.pending_url).status_code, 401)
+        self.assertEqual(
+            self.client.delete(f"{self.list_url}{alert.id}/").status_code, 401
+        )
+
+    def test_create_then_duplicate_returns_200_already_pending(self):
+        first = self.post(self.variation.id)
+        self.assertEqual(first.status_code, 201)
+        self.assertFalse(first.data["already_pending"])
+        self.assertEqual(first.data["variation_id"], str(self.variation.id))
+        self.assertEqual(first.data["size"], "M")
+        self.assertIsNone(first.data["notified_at"])
+        self.assertEqual(first.data["product"]["id"], str(self.product.id))
+        self.assertTrue(first.data["product"]["is_visible"])
+        self.assertIsNone(first.data["product"]["image"])
+        second = self.post(self.variation.id)
+        self.assertEqual(second.status_code, 200)
+        self.assertTrue(second.data["already_pending"])
+        self.assertEqual(second.data["id"], first.data["id"])
+        self.assertEqual(StockAlert.objects.count(), 1)
+
+    def test_create_on_stocked_variation_400(self):
+        stocked = make_variation(self.product, size="G", stock=2)
+        response = self.post(stocked.id)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.data["variation_id"], ["Este tamanho está disponível."]
+        )
+        self.assertEqual(StockAlert.objects.count(), 0)
+
+    def test_create_on_not_sellable_400(self):
+        drop = DropCampaign.objects.create(
+            name="Drop", slug="drop-x", is_public=True, is_active=False
+        )
+        product = make_product("Do drop", drop=drop)
+        variation = make_variation(product, stock=0)
+        response = self.post(variation.id)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.data["variation_id"],
+            ["Este produto não está à venda no momento."],
+        )
+
+    def test_create_on_hidden_or_missing_404(self):
+        hidden = make_product("Oculto", is_active=False)
+        hidden_variation = make_variation(hidden, stock=0)
+        self.assertEqual(self.post(hidden_variation.id).status_code, 404)
+        self.assertEqual(self.post(uuid.uuid4()).status_code, 404)
+
+    def test_list_only_own_pending_first(self):
+        v2 = make_variation(self.product, size="G", stock=0)
+        v3 = make_variation(self.product, size="P", stock=0)
+        notified = StockAlert.objects.create(
+            user=self.user, variation=self.variation, notified_at=timezone.now()
+        )
+        old_pending = StockAlert.objects.create(user=self.user, variation=v2)
+        new_pending = StockAlert.objects.create(user=self.user, variation=v3)
+        StockAlert.objects.filter(pk=old_pending.pk).update(
+            created_at=timezone.now() - timedelta(days=1)
+        )
+        StockAlert.objects.filter(pk=notified.pk).update(
+            created_at=timezone.now() + timedelta(days=1)
+        )
+        StockAlert.objects.create(user=self.other, variation=v3)
+        response = self.client.get(self.list_url, **self.headers())
+        self.assertEqual(response.status_code, 200)
+        ids = [item["id"] for item in response.data["results"]]
+        self.assertEqual(
+            ids, [str(new_pending.id), str(old_pending.id), str(notified.id)]
+        )
+        self.assertIsNotNone(response.data["results"][2]["notified_at"])
+
+    def test_pending_variations_ids(self):
+        v2 = make_variation(self.product, size="G", stock=0)
+        StockAlert.objects.create(user=self.user, variation=self.variation)
+        StockAlert.objects.create(
+            user=self.user, variation=v2, notified_at=timezone.now()
+        )
+        StockAlert.objects.create(user=self.other, variation=v2)
+        response = self.client.get(self.pending_url, **self.headers())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, {"variation_ids": [str(self.variation.id)]})
+
+    def test_delete_own_pending_204(self):
+        alert = StockAlert.objects.create(user=self.user, variation=self.variation)
+        response = self.client.delete(f"{self.list_url}{alert.id}/", **self.headers())
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(StockAlert.objects.filter(pk=alert.pk).exists())
+
+    def test_delete_notified_or_other_user_404(self):
+        notified = StockAlert.objects.create(
+            user=self.user, variation=self.variation, notified_at=timezone.now()
+        )
+        theirs = StockAlert.objects.create(user=self.other, variation=self.variation)
+        for pk in (notified.pk, theirs.pk, uuid.uuid4()):
+            response = self.client.delete(f"{self.list_url}{pk}/", **self.headers())
+            self.assertEqual(response.status_code, 404)
+        self.assertEqual(StockAlert.objects.count(), 2)
+
+    def test_can_request_again_after_notified_201(self):
+        StockAlert.objects.create(
+            user=self.user, variation=self.variation, notified_at=timezone.now()
+        )
+        response = self.post(self.variation.id)
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(StockAlert.objects.filter(user=self.user).count(), 2)
