@@ -148,7 +148,6 @@ pytest test_e2e.py -v --html=report.html
 Um arquivo `report.html` será criado no diretório. Basta abri-lo em qualquer navegador para visualizar o relatório gráfico.
 
 ---
----
 
 ## Avise-me (local)
 

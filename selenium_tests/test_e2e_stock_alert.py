@@ -22,15 +22,19 @@ from test_e2e import click_visible_element, inject_auth_token, wait_for_page
 ALERT_BUTTON = "//button[contains(normalize-space(.), 'Avise-me quando chegar')]"
 SOLD_OUT_SIZE = "//button[contains(normalize-space(.), 'G (esgotado)')]"
 NOTIFY_TIMEOUT = 30
+LOCAL_HOSTS = ("localhost", "127.0.0.1")
 
 
 @pytest.fixture(scope="session", autouse=True)
 def e2e_env(base_url):
     """Guarda: so roda em localhost e com as variaveis necessarias (antes do driver)."""
-    if urlparse(base_url).hostname not in ("localhost", "127.0.0.1"):
+    if urlparse(base_url).hostname not in LOCAL_HOSTS:
         pytest.skip("E2E do Avise-me roda apenas contra o front local.")
+    api_url = os.getenv("SHIO_TEST_API_URL", "").rstrip("/")
+    if api_url and urlparse(api_url).hostname not in LOCAL_HOSTS:
+        pytest.skip("E2E do Avise-me roda apenas contra a API local.")
     env = {
-        "api": os.getenv("SHIO_TEST_API_URL", "").rstrip("/"),
+        "api": api_url,
         "admin": os.getenv("SHIO_TEST_ADMIN_TOKEN"),
         "customer": os.getenv("SHIO_TEST_ACCESS_TOKEN"),
     }
@@ -74,12 +78,13 @@ class Catalog:
         return product, sizes["G"]
 
     def deactivate(self, product):
-        requests.patch(
+        response = requests.patch(
             f"{self.api}/products/{product['id']}/",
             headers=self.admin,
             json={"is_active": False, "cost_price": product["cost_price"]},
             timeout=15,
         )
+        response.raise_for_status()
 
     def stock_in(self, variation_id, quantity):
         response = requests.post(
@@ -97,13 +102,15 @@ class Catalog:
         assert response.status_code in (200, 201), response.text
 
     def customer_alert(self, product_id):
-        response = requests.get(
-            f"{self.api}/stock-alerts/", headers=self.customer, timeout=15
-        )
-        assert response.status_code == 200, response.text
-        for item in response.json()["results"]:
-            if item["product"]["id"] == product_id:
-                return item
+        url = f"{self.api}/stock-alerts/"
+        while url:
+            response = requests.get(url, headers=self.customer, timeout=15)
+            assert response.status_code == 200, response.text
+            data = response.json()
+            for item in data["results"]:
+                if item["product"]["id"] == product_id:
+                    return item
+            url = data.get("next")
         return None
 
 
@@ -135,7 +142,7 @@ def open_product_and_pick_sold_out(driver, base_url, product):
     click_visible_element(driver, SOLD_OUT_SIZE)
 
 
-def test_visitor_goes_to_login_and_back(clean_browser, base_url, sold_out_product):
+def test_visitor_goes_to_login(clean_browser, base_url, sold_out_product):
     driver = clean_browser
     product, _ = sold_out_product
     open_product_and_pick_sold_out(driver, base_url, product)
@@ -155,7 +162,7 @@ def test_customer_requests_alert_and_is_notified(
     click_visible_element(driver, ALERT_BUTTON)
     WebDriverWait(driver, 10).until(
         EC.presence_of_element_located(
-            (By.XPATH, "//*[contains(., 'Você já será avisado')]")
+            (By.XPATH, "//span[normalize-space(.)='Você já será avisado']")
         )
     )
 
