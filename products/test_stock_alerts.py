@@ -138,6 +138,50 @@ class StockAlertSendTests(TestCase):
         a.refresh_from_db()
         self.assertIsNone(a.notified_at)
 
+    def test_stops_when_stock_runs_out_mid_batch(self):
+        a1 = self.alert(self.u1)
+        a2 = self.alert(self.u2)
+        StockAlert.objects.filter(pk=a1.pk).update(
+            created_at=timezone.now() - timedelta(minutes=5)
+        )
+
+        def send_and_sell_out(*args, **kwargs):
+            ProductVariation.objects.filter(pk=self.variation.pk).update(
+                stock_quantity=0
+            )
+            return True
+
+        with patch("products.stock_alerts.send_email", side_effect=send_and_sell_out):
+            self.assertEqual(send_stock_alerts(self.variation.id), 1)
+        a1.refresh_from_db()
+        a2.refresh_from_db()
+        self.assertIsNotNone(a1.notified_at)
+        self.assertIsNone(a2.notified_at)
+
+    def test_failure_revert_conflict_deletes_claimed_row(self):
+        a1 = self.alert(self.u1)
+        a2 = self.alert(self.u2)
+        StockAlert.objects.filter(pk=a1.pk).update(
+            created_at=timezone.now() - timedelta(minutes=5)
+        )
+        new_pending = []
+
+        def fail_after_new_request(*args, **kwargs):
+            if not new_pending:
+                new_pending.append(self.alert(self.u1))
+                return False
+            return True
+
+        with patch(
+            "products.stock_alerts.send_email", side_effect=fail_after_new_request
+        ):
+            self.assertEqual(send_stock_alerts(self.variation.id), 1)
+        self.assertFalse(StockAlert.objects.filter(pk=a1.pk).exists())
+        new_pending[0].refresh_from_db()
+        self.assertIsNone(new_pending[0].notified_at)
+        a2.refresh_from_db()
+        self.assertIsNotNone(a2.notified_at)
+
     def test_claimed_alert_is_not_sent_twice(self):
         self.alert(self.u1)
         self.assertEqual(send_stock_alerts(self.variation.id), 1)
@@ -338,6 +382,20 @@ class StockAlertTriggerTests(APITestCase):
         self.assertEqual(response.status_code, 204)
         self.assertEqual(len(mail.outbox), 1)
 
+    def test_deleting_closed_drop_sends(self):
+        drop = DropCampaign.objects.create(
+            name="Drop", slug="drop-z", is_public=False, is_active=True
+        )
+        Product.objects.filter(pk=self.product.pk).update(drop=drop)
+        ProductVariation.objects.filter(pk=self.variation.pk).update(stock_quantity=2)
+        self.pending()
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.delete(
+                f"/api/catalog/drops/{drop.id}/", **auth_header(self.admin)
+            )
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(len(mail.outbox), 1)
+
 
 class StockAlertApiTests(APITestCase):
     list_url = "/api/catalog/stock-alerts/"
@@ -388,6 +446,22 @@ class StockAlertApiTests(APITestCase):
         self.assertEqual(second.status_code, 200)
         self.assertTrue(second.data["already_pending"])
         self.assertEqual(second.data["id"], first.data["id"])
+        self.assertEqual(StockAlert.objects.count(), 1)
+
+    def test_integrity_error_without_pending_retries_create(self):
+        real_create = StockAlert.objects.create
+        calls = []
+
+        def flaky_create(**kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise IntegrityError()
+            return real_create(**kwargs)
+
+        with patch("products.views.StockAlert.objects.create", flaky_create):
+            response = self.post(self.variation.id)
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(len(calls), 2)
         self.assertEqual(StockAlert.objects.count(), 1)
 
     def test_create_on_stocked_variation_400(self):

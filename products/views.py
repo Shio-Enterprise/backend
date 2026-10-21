@@ -277,15 +277,24 @@ class StockAlertListCreateView(APIView):
             user=request.user, variation=variation, notified_at__isnull=True
         ).first()
         if alert is None:
-            try:
-                with transaction.atomic():
-                    alert = StockAlert.objects.create(
-                        user=request.user, variation=variation
-                    )
-                created = True
-            except IntegrityError:
-                alert = StockAlert.objects.get(
-                    user=request.user, variation=variation, notified_at__isnull=True
+            for _ in range(2):
+                try:
+                    with transaction.atomic():
+                        alert = StockAlert.objects.create(
+                            user=request.user, variation=variation
+                        )
+                    created = True
+                    break
+                except IntegrityError:
+                    alert = StockAlert.objects.filter(
+                        user=request.user, variation=variation, notified_at__isnull=True
+                    ).first()
+                    if alert is not None:
+                        break
+            if alert is None:
+                return Response(
+                    {"error": "Não foi possível registrar o aviso. Tente novamente."},
+                    status=status.HTTP_409_CONFLICT,
                 )
         alert = stock_alerts_queryset().get(pk=alert.pk)
         alert.already_pending = not created
@@ -794,7 +803,8 @@ class DropCampaignDetailView(APIView):
     def delete(self, request, pk):
         drop = self._get_object(pk)
         logger.info(f"Drop removido: {drop.name} ({drop.id})")
-        drop.delete()
+        with watch_sellable(list(drop.products.select_related("drop"))):
+            drop.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 

@@ -6,7 +6,7 @@ import time
 from contextlib import contextmanager
 
 from django.conf import settings
-from django.db import connection, transaction
+from django.db import IntegrityError, connection, transaction
 from django.utils import timezone
 
 from notifications.email import send_email
@@ -45,6 +45,13 @@ def send_stock_alerts(variation_id) -> int:
     sent = 0
     failed = 0
     for alert in pending:
+        current_stock = (
+            ProductVariation.objects.filter(pk=variation.pk)
+            .values_list("stock_quantity", flat=True)
+            .first()
+        )
+        if not current_stock:
+            break
         # Reivindica antes de enviar: execuções concorrentes não duplicam.
         claimed = StockAlert.objects.filter(
             pk=alert.pk, notified_at__isnull=True
@@ -68,7 +75,12 @@ def send_stock_alerts(variation_id) -> int:
             sent += 1
         else:
             failed += 1
-            StockAlert.objects.filter(pk=alert.pk).update(notified_at=None)
+            try:
+                with transaction.atomic():
+                    StockAlert.objects.filter(pk=alert.pk).update(notified_at=None)
+            except IntegrityError:
+                # O usuário já pediu de novo: o pedido novo substitui este.
+                StockAlert.objects.filter(pk=alert.pk).delete()
 
     logger.info(
         "Avisos de reposição da variação %s: %d enviados, %d falhas.",
