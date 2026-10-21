@@ -148,3 +148,21 @@ pytest test_e2e.py -v --html=report.html
 Um arquivo `report.html` será criado no diretório. Basta abri-lo em qualquer navegador para visualizar o relatório gráfico.
 
 ---
+---
+
+## Avise-me (local)
+
+`test_e2e_stock_alert.py` cobre o fluxo "Avise-me quando chegar" (issue #66) e **roda somente contra o front local** (qualquer outra `SHIO_TEST_URL`, como produção, faz o teste pular). Ele cria um produto novo via API a cada teste e o desativa no final.
+
+Com back (`http://localhost:8000`) e front (`http://localhost:5173`) rodando, e tokens JWT de curta duração (administrador e cliente) gerados por você, **apenas em variáveis de ambiente**:
+
+```bash
+SHIO_HEADLESS=true SHIO_KEEP_OPEN=false \
+SHIO_TEST_URL=http://localhost:5173 \
+SHIO_TEST_API_URL=http://localhost:8000 \
+SHIO_TEST_ADMIN_TOKEN=<jwt-admin> \
+SHIO_TEST_ACCESS_TOKEN=<jwt-cliente> \
+pytest test_e2e_stock_alert.py -v
+```
+
+O cliente recebe um e-mail real de reposição no endereço da conta de teste.
