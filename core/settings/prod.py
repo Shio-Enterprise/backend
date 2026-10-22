@@ -29,9 +29,17 @@ DATABASES = {
     "default": dj_database_url.config(
         conn_max_age=600,
         conn_health_checks=True,
-        ssl_require=False,
+        ssl_require=True,
     ),
 }
+
+if DATABASES["default"].get("ENGINE") != "django.db.backends.postgresql":
+    raise RuntimeError("Production requires PostgreSQL with TLS")
+
+database_options = DATABASES["default"].setdefault("OPTIONS", {})
+database_options.setdefault("sslmode", "require")
+if database_options.get("sslmode") in {"disable", "allow", "prefer"}:
+    raise RuntimeError("Production database TLS cannot be downgraded")
 
 # Static files finders — garante que o admin (contrib) e apps instaladas
 # sejam descobertos pelo collectstatic + WhiteNoise em produção.

@@ -72,7 +72,8 @@ O modo recomendado é rodar a aplicação via Docker Compose.
 docker compose up --build
 ```
 
-O container já executa as migrações e cria o administrador automaticamente.
+O container aguarda a conexão com o banco e executa as migrações. O administrador
+é provisionado explicitamente pelo operador com `python manage.py initadmin`.
 
 
 ## Variáveis de ambiente importantes
@@ -80,7 +81,7 @@ O container já executa as migrações e cria o administrador automaticamente.
 - `SETTINGS_FILE_PATH`: caminho do settings, por exemplo `core.settings.dev`.
 - `DJANGO_SECRET_KEY`: chave secreta do Django.
 - `GOOGLE_CLIENT_ID`: client ID do OAuth do Google usado para validar `id_token`.
-- `ADMIN_NAME`, `ADMIN_PASS`, `ADMIN_EMAIL`: credenciais para o superusuário inicial.
+- `ADMIN_NAME`, `ADMIN_PASS`, `ADMIN_EMAIL`: credenciais usadas pelo comando explícito `initadmin`.
 - `RESEND_API_KEY`, `DEFAULT_FROM_EMAIL`: envio de e-mails (veja [E-mails](#e-mails)).
 - `STOCK_RESERVATION_TTL_MINUTES`, `STOCK_RESERVATION_GRACE_SECONDS`, `RESERVATION_SWEEP_INTERVAL_SECONDS`: prazos da reserva de estoque (veja [Reserva de estoque](#reserva-de-estoque)).
 
