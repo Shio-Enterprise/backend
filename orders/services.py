@@ -34,6 +34,7 @@ from orders.models import (
     normalize_coupon_code,
 )
 from orders.money import money_to_cents, normalize_money
+from orders.shipping import resolve_shipping_parameters
 from products.availability import (
     get_drop_sold_quantity,
     is_product_open_for_sale,
@@ -151,6 +152,13 @@ def _get_checkout_contents(
     destination = address.zip_code.replace("-", "").strip()
     if len(destination) != 8 or not destination.isdigit():
         raise ValidationError({"message": "CEP do endereço inválido."})
+    try:
+        shipping_parameters = resolve_shipping_parameters(
+            destination,
+            declared_value=max(subtotal - coupon_result.discount, Decimal("0.00")),
+        )
+    except ValueError as exc:
+        raise CheckoutShippingUnavailable() from exc
     return {
         "cart": cart,
         "address": address,
@@ -166,33 +174,30 @@ def _get_checkout_contents(
             if coupon_result.error_code
             else None
         ),
-        "shipping_parameters": {
-            "origin": settings.CORREIOS_REMETENTE_CEP.replace("-", "").strip(),
-            "destination": destination,
-            "service": str(settings.CORREIOS_CODIGO_SERVICO),
-            "weight": str(settings.CORREIOS_PESO_PADRAO_GRAMAS),
-            "mock_enabled": settings.CORREIOS_MOCK_ENABLED,
-            "base_url": settings.CORREIOS_API_BASE_URL,
-        },
+        "shipping_parameters": shipping_parameters,
     }
 
 
 def _calculate_checkout(contents):
     shipping_parameters = contents["shipping_parameters"]
-    origin = shipping_parameters["origin"]
-    destination = shipping_parameters["destination"]
+    origin = shipping_parameters.origin
+    destination = shipping_parameters.destination
     try:
         if len(origin) != 8 or not origin.isdigit():
             raise ValueError("CEP do remetente inválido.")
         price = fetch_shipping_price_by_service_and_ceps(
-            shipping_parameters["service"],
+            shipping_parameters.service,
             origin,
             destination,
-            shipping_parameters["weight"],
+            shipping_parameters.weight_grams,
+            comprimento=shipping_parameters.length_cm,
+            largura=shipping_parameters.width_cm,
+            altura=shipping_parameters.height_cm,
+            vl_declarado=shipping_parameters.declared_value,
         )
         shipping_cost = normalize_money(price["pcFinal"])
         deadline = fetch_shipping_deadline_by_service_and_ceps(
-            shipping_parameters["service"],
+            shipping_parameters.service,
             origin,
             destination,
         )
@@ -267,7 +272,7 @@ def _shipping_quote_snapshot(contents):
             )
         },
         "address_updated_at": address.updated_at.isoformat(),
-        "shipping_parameters": contents["shipping_parameters"],
+        "shipping_parameters": contents["shipping_parameters"].as_snapshot(),
         "coupon": (
             {
                 "id": str(contents["coupon"].pk),

@@ -12,6 +12,9 @@ ALLOWED_HOSTS = config("ALLOWED_HOSTS", default="", cast=Csv())
 CORS_ALLOWED_ORIGINS = config("CORS_ALLOWED_ORIGINS", default="", cast=Csv())
 # CORS_ALLOW_ALL_ORIGINS = True
 
+if not REDIS_URL.startswith(("redis://", "rediss://")):
+    raise RuntimeError("Production requires REDIS_URL for the shared Correios cache")
+
 # SSL Redirect
 
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
