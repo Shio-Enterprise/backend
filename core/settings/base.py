@@ -59,6 +59,7 @@ AUTH_USER_MODEL = "authentication.User"
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "core.middleware.RequestIdMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -246,6 +247,7 @@ DEFAULT_FROM_EMAIL = config(
 )
 
 CORS_ALLOW_CREDENTIALS = True
+CORS_EXPOSE_HEADERS = ["Retry-After", "X-Request-ID"]
 
 CORS_ALLOW_HEADERS = [
     "accept",

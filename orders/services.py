@@ -687,12 +687,17 @@ def complete_checkout_attempt(attempt, request):
             raise ValueError("URL de checkout inválida.")
     except Exception:
         CheckoutAttempt.objects.filter(pk=attempt.pk).update(
-            status=CheckoutAttemptStatus.UNCERTAIN, updated_at=timezone.now()
+            status=CheckoutAttemptStatus.UNCERTAIN,
+            last_error_code="gateway_error",
+            last_error_at=timezone.now(),
+            updated_at=timezone.now(),
         )
     else:
         CheckoutAttempt.objects.filter(pk=attempt.pk).update(
             status=CheckoutAttemptStatus.SUCCEEDED,
             checkout_url=checkout_url,
+            last_error_code="",
+            last_error_at=None,
             updated_at=timezone.now(),
         )
     attempt.refresh_from_db()
