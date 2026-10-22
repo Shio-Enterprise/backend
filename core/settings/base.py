@@ -31,6 +31,7 @@ DEBUG = False
 
 
 INSTALLED_APPS = [
+    "core",
     "django.contrib.contenttypes",
     "django.contrib.auth",
     "django.contrib.sessions",
