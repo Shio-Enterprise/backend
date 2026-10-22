@@ -3,7 +3,7 @@ import uuid
 
 from django.core.files.base import ContentFile
 from django.db import transaction
-from django.db.models import Exists, Max, OuterRef, Q, Sum
+from django.db.models import Exists, Max, OuterRef, Q
 from django.db.models.deletion import ProtectedError
 from django.shortcuts import get_object_or_404
 from drf_spectacular.utils import (
@@ -69,6 +69,7 @@ from .serializers import (
     WishlistPageSerializer,
     WishlistSerializer,
 )
+from .services import get_inventory_summary
 
 logger = logging.getLogger(__name__)
 
@@ -191,19 +192,7 @@ class WishlistDeleteView(APIView):
 @api_view(["GET"])
 @permission_classes([CanManageCatalog])
 def inventory_summary(request):
-    products = Product.objects.all()
-    data = []
-    for product in products:
-        total_stock = (
-            product.variations.aggregate(total=Sum("stock_quantity"))["total"] or 0
-        )
-        data.append(
-            {
-                "name": product.name,
-                "total_stock": total_stock,
-            }
-        )
-    return Response({"inventory": data})
+    return Response({"inventory": get_inventory_summary()})
 
 
 class InventoryExportView(APIView):
