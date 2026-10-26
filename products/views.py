@@ -10,7 +10,6 @@ from django.db.models import (
     Max,
     OuterRef,
     Q,
-    Sum,
     Value,
     When,
 )
@@ -87,8 +86,8 @@ from .serializers import (
     WishlistPageSerializer,
     WishlistSerializer,
 )
-from .stock_alerts import watch_sellable
 from .services import get_inventory_summary
+from .stock_alerts import watch_sellable
 
 logger = logging.getLogger(__name__)
 
