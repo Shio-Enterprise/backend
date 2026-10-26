@@ -15,7 +15,6 @@ from .models import (
     OrderStatusLog,
     Payment,
     PaymentMethod,
-    PaymentStatus,
     Refund,
     RefundReason,
 )
@@ -212,16 +211,9 @@ class DashboardOrderDrillDownSerializer(serializers.ModelSerializer):
 
     @extend_schema_field(serializers.DecimalField(max_digits=20, decimal_places=2))
     def get_revenue_value(self, obj) -> str:
-        payment = getattr(obj, "payment", None)
-        if payment and payment.status == PaymentStatus.REFUNDED:
-            return f"{-obj.total_amount:.2f}"
-        if (
-            payment
-            and payment.status == PaymentStatus.PAID
-            and obj.status == OrderStatus.DELIVERED
-        ):
-            return f"{obj.total_amount:.2f}"
-        return "0.00"
+        from .metrics import revenue_value
+
+        return f"{revenue_value(obj):.2f}"
 
     @extend_schema_field(serializers.IntegerField(allow_null=True))
     def get_metric_units(self, obj) -> int | None:

@@ -211,10 +211,10 @@ class DashboardDetailView(APIView):
     @extend_schema(
         description=(
             "Vendas válidas: pedido DELIVERED e pagamento PAID; reembolsos: "
-            "pagamento REFUNDED. Financeiro e séries usam payment.paid_at em "
-            "America/Sao_Paulo; receita líquida = total_amount das vendas válidas "
-            "menos total_amount dos reembolsos; ticket = líquido / vendas válidas "
-            "(zero sem vendas). Pedidos por status incluem todos os pedidos e usam "
+            "pedido DELIVERED e pagamento REFUNDED. Financeiro e séries usam "
+            "payment.paid_at em America/Sao_Paulo; receita bruta = total_amount "
+            "das vendas válidas e dos reembolsos; receita líquida = bruta menos "
+            "reembolsos; ticket = líquido / vendas válidas (zero sem vendas). Pedidos por status incluem todos os pedidos e usam "
             "CustomerOrder.created_at. Drops e categorias selecionam pedidos que "
             "tenham um mesmo item correspondente; rankings e distribuições somam "
             "somente esses itens por quantity × unit_price, sem rateio de frete ou "
@@ -257,8 +257,9 @@ class AdminDashboardView(APIView):
     @extend_schema(
         description=(
             "Dashboard comercial. Venda positiva exige pagamento PAID e pedido "
-            "DELIVERED; reembolsos subtraem CustomerOrder.total_amount. A competência "
-            "é payment.paid_at em America/Sao_Paulo."
+            "DELIVERED. A receita bruta inclui pedidos entregues e reembolsados, "
+            "que os reembolsos subtraem. A competência é payment.paid_at em "
+            "America/Sao_Paulo."
         ),
         parameters=METRIC_PARAMETERS,
         responses={
@@ -306,7 +307,7 @@ class AdminDashboardView(APIView):
         sales = positive_sales(orders)
         refunded = refunds(orders)
 
-        gross_revenue = sales.aggregate(total=Sum("total_amount"))["total"] or Decimal(
+        gross_revenue = orders.aggregate(total=Sum("total_amount"))["total"] or Decimal(
             "0"
         )
         refunded_revenue = refunded.aggregate(total=Sum("total_amount"))[
@@ -343,13 +344,17 @@ class AdminDashboardView(APIView):
             if granularity == "month"
             else TruncDay("payment__paid_at", tzinfo=METRICS_TIMEZONE)
         )
-        positive_points = {
-            row["bucket"]: row
+        gross_points = {
+            row["bucket"]: row["revenue"]
+            for row in orders.annotate(bucket=trunc)
+            .values("bucket")
+            .annotate(revenue=Sum("total_amount"))
+        }
+        sales_points = {
+            row["bucket"]: row["total_orders"]
             for row in sales.annotate(bucket=trunc)
             .values("bucket")
-            .annotate(
-                total_orders=Count("id", distinct=True), revenue=Sum("total_amount")
-            )
+            .annotate(total_orders=Count("id", distinct=True))
         }
         refund_points = {
             row["bucket"]: row["revenue"]
@@ -358,15 +363,14 @@ class AdminDashboardView(APIView):
             .annotate(revenue=Sum("total_amount"))
         }
         series = []
-        for bucket in sorted(set(positive_points) | set(refund_points)):
-            positive = positive_points.get(bucket, {})
-            net = (positive.get("revenue") or Decimal("0")) - (
+        for bucket in sorted(gross_points):
+            net = (gross_points.get(bucket) or Decimal("0")) - (
                 refund_points.get(bucket) or Decimal("0")
             )
             series.append(
                 {
                     "period": bucket.date().isoformat(),
-                    "total_orders": positive.get("total_orders", 0),
+                    "total_orders": sales_points.get(bucket, 0),
                     "total_revenue": f"{net:.2f}",
                 }
             )
@@ -423,9 +427,9 @@ class DashboardDrillDownView(APIView):
     @extend_schema(
         description=(
             "all mantém a lista comercial anterior e seus filtros customer/search. "
-            "valid_sales/gross_revenue usam vendas DELIVERED + PAID; refunds "
-            "usa pagamentos REFUNDED; net_revenue/average_ticket incluem ambos "
-            "os conjuntos que compõem o numerador. status requer status e usa "
+            "valid_sales usa vendas DELIVERED + PAID; refunds usa pedidos "
+            "DELIVERED com pagamento REFUNDED; gross_revenue, net_revenue e "
+            "average_ticket incluem ambos os conjuntos que compõem o numerador. status requer status e usa "
             "CustomerOrder.created_at, incluindo pedidos sem pagamento. "
             "payment_method requer payment_method e usa apenas vendas válidas. "
             "product_units/product_revenue requerem product_id; "
