@@ -11,7 +11,7 @@ from .availability import (
     get_drop_sold_quantity,
     is_drop_sellable,
     is_drop_visible,
-    is_product_sellable
+    is_product_sellable,
     is_product_visible,
 )
 from .models import (
