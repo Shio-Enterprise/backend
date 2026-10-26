@@ -6,7 +6,12 @@ from django.utils import timezone
 from django.utils.text import slugify
 from rest_framework import serializers
 
-from .availability import is_drop_sellable, is_drop_visible, is_product_sellable
+from .availability import (
+    get_drop_sold_quantity,
+    is_drop_sellable,
+    is_drop_visible,
+    is_product_sellable,
+)
 from .models import (
     Category,
     DropCampaign,
@@ -461,6 +466,48 @@ class ProductListSerializer(ProductPricingSerializer):
 
     def get_is_sellable(self, obj) -> bool:
         return is_product_sellable(obj)
+
+
+class PublicDropCampaignSerializer(DropCampaignSerializer):
+    """Drop para a página pública (`/drop/:slug`).
+
+    `products` usa o mesmo formato de card do catálogo público (imagens,
+    variações, `is_sellable`) e só inclui produtos ativos — diferente de
+    `DropCampaignDetailSerializer.products`, que é de uso administrativo e
+    não filtra. `sold_quantity`/`remaining_quantity` dão o contador "X de Y
+    restantes"; `remaining_quantity` é `None` quando o drop não tem limite
+    (`max_quantity` nulo).
+    """
+
+    products = serializers.SerializerMethodField()
+    sold_quantity = serializers.SerializerMethodField()
+    remaining_quantity = serializers.SerializerMethodField()
+
+    class Meta(DropCampaignSerializer.Meta):
+        fields = DropCampaignSerializer.Meta.fields + [
+            "products",
+            "sold_quantity",
+            "remaining_quantity",
+        ]
+
+    def get_products(self, obj):
+        queryset = obj.products.filter(is_active=True).order_by("name")
+        return ProductListSerializer(queryset, many=True, context=self.context).data
+
+    def _sold_quantity(self, obj):
+        # Cacheado na própria instância: get_sold_quantity e get_remaining_quantity
+        # são chamados para o mesmo objeto, e a conta não muda durante a serialização.
+        if not hasattr(obj, "_sold_quantity_cache"):
+            obj._sold_quantity_cache = get_drop_sold_quantity(obj)
+        return obj._sold_quantity_cache
+
+    def get_sold_quantity(self, obj):
+        return self._sold_quantity(obj)
+
+    def get_remaining_quantity(self, obj):
+        if obj.max_quantity is None:
+            return None
+        return max(obj.max_quantity - self._sold_quantity(obj), 0)
 
 
 class WishlistSerializer(serializers.ModelSerializer):
