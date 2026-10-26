@@ -9,6 +9,10 @@ TOPS = {
     ],
     "rows": [
         {
+            "size": "PP",
+            "measures": {"chest": [82, 88], "waist": [68, 74], "hip": [86, 92]},
+        },
+        {
             "size": "P",
             "measures": {"chest": [88, 94], "waist": [74, 80], "hip": [92, 98]},
         },
@@ -38,6 +42,7 @@ BOTTOMS = {
         {"key": "hip", "label": "Quadril"},
     ],
     "rows": [
+        {"size": "PP", "measures": {"waist": [68, 74], "hip": [86, 92]}},
         {"size": "P", "measures": {"waist": [74, 80], "hip": [92, 98]}},
         {"size": "M", "measures": {"waist": [80, 86], "hip": [98, 104]}},
         {"size": "G", "measures": {"waist": [86, 92], "hip": [104, 110]}},
