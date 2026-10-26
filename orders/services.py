@@ -30,6 +30,7 @@ from orders.models import (
     Payment,
     PaymentMethod,
     PaymentStatus,
+    RefundStatus,
     ShippingQuote,
     normalize_coupon_code,
 )
@@ -59,6 +60,22 @@ ALLOWED_TRANSITIONS = {
     OrderStatus.DELIVERED: set(),
     OrderStatus.CANCELED: set(),
 }
+
+# Pedido pago só é cancelado pelo fluxo de reembolso, nunca pelo PATCH genérico.
+REFUND_CANCELABLE_STATUSES = {
+    OrderStatus.PAID,
+    OrderStatus.PREPARING,
+    OrderStatus.SHIPPED,
+}
+
+PENDING_REFUND_SHIPPING_MESSAGE = (
+    "Pedido com reembolso solicitado não pode ser enviado. "
+    "Aprove, recuse ou registre o reembolso antes."
+)
+
+
+def has_pending_refund_request(order):
+    return order.refunds.filter(status=RefundStatus.REQUESTED).exists()
 
 
 class CheckoutShippingUnavailable(APIException):
@@ -1184,7 +1201,15 @@ def release_if_expired(order):
 
 
 @transaction.atomic
-def update_status(order, new_status, changed_by=None, tracking_code=None, comment=None):
+def update_status(
+    order,
+    new_status,
+    changed_by=None,
+    tracking_code=None,
+    comment=None,
+    *,
+    refund_cancellation=False,
+):
     """Centraliza a atualização de status de pedidos e cria um log histórico.
 
     Args:
@@ -1193,6 +1218,7 @@ def update_status(order, new_status, changed_by=None, tracking_code=None, commen
         changed_by: User who made the change (optional)
         tracking_code: optional tracking code to save
         comment: optional comment/observation
+        refund_cancellation: só para orders.refunds; permite cancelar pedido pago
     """
     locked = CustomerOrder.objects.select_for_update().get(pk=order.pk)
     order.status = locked.status
@@ -1208,11 +1234,15 @@ def update_status(order, new_status, changed_by=None, tracking_code=None, commen
             restore_order_stock(order, changed_by=changed_by)
 
     allowed = ALLOWED_TRANSITIONS.get(previous_status, set())
+    if refund_cancellation and previous_status in REFUND_CANCELABLE_STATUSES:
+        allowed = allowed | {OrderStatus.CANCELED}
 
     if new_status not in allowed:
         raise ValidationError(
             {"status": (f"Transição inválida: {previous_status} -> {new_status}.")}
         )
+    if new_status == OrderStatus.SHIPPED and has_pending_refund_request(order):
+        raise ValidationError({"status": PENDING_REFUND_SHIPPING_MESSAGE})
 
     if tracking_code:
         order.tracking_code = tracking_code
