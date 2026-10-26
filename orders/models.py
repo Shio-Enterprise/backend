@@ -344,3 +344,29 @@ class OrderStatusLog(models.Model):
 
     def __str__(self):
         return f"OrderStatusLog(order={self.order_id}, from={self.previous_status}, to={self.new_status})"
+
+
+class CouponEmailSend(models.Model):
+    """Histórico de envios de um cupom por e-mail (um registro por campanha)."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    coupon = models.ForeignKey(
+        Coupon, on_delete=models.CASCADE, related_name="email_sends"
+    )
+    sent_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="coupon_email_sends",
+    )
+    sent_at = models.DateTimeField(auto_now_add=True)
+    message = models.TextField(blank=True)
+    sent_count = models.PositiveIntegerField(default=0)
+    failed_count = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ["-sent_at"]
+
+    def __str__(self):
+        return f"CouponEmailSend(coupon={self.coupon_id}, sent={self.sent_count}, failed={self.failed_count})"

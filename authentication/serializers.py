@@ -3,6 +3,7 @@ from django.contrib.auth.models import Permission
 from django.contrib.auth.password_validation import validate_password
 from rest_framework import serializers
 
+from notifications.marketing import opt_in
 from orders.models import CustomerOrder
 
 from .admin_permissions import ADMIN_PERMISSION_CODES, ADMIN_PERMISSION_SET
@@ -207,18 +208,24 @@ class RegisterSerializer(serializers.ModelSerializer):
         write_only=True, required=True, validators=[validate_password]
     )
     name = serializers.CharField(required=True)
+    marketing_opt_in = serializers.BooleanField(
+        required=False, default=False, write_only=True
+    )
 
     class Meta:
         model = User
-        fields = ["email", "name", "password"]
+        fields = ["email", "name", "password", "marketing_opt_in"]
 
     def create(self, validated_data):
+        marketing_opt_in = validated_data.pop("marketing_opt_in", False)
         user = User.objects.create_user(
             email=validated_data["email"],
             name=validated_data["name"],
             password=validated_data["password"],
             is_new_user=True,
         )
+        if marketing_opt_in:
+            opt_in(user.email)
         return user
 
 
@@ -343,6 +350,9 @@ class CustomerCRMDetailSerializer(CustomerCRMSerializer):
 class NewsletterSubscribeSerializer(serializers.Serializer):
     email = serializers.EmailField()
     consent_lgpd = serializers.BooleanField()
+
+    def validate_email(self, value):
+        return value.strip().lower()
 
     def validate_consent_lgpd(self, value):
         if not value:
