@@ -501,6 +501,11 @@ class CouponAdminSerializer(serializers.ModelSerializer):
         model = Coupon
         fields = "__all__"
         read_only_fields = ["id", "created_at", "updated_at"]
+        # null = ilimitado; 0 criaria um cupom que ninguém consegue usar.
+        extra_kwargs = {
+            "max_uses_total": {"min_value": 1},
+            "max_uses_per_user": {"min_value": 1},
+        }
 
     def to_representation(self, instance):
         rep = super().to_representation(instance)
@@ -604,3 +609,7 @@ class CouponAdminSerializer(serializers.ModelSerializer):
                 )
 
         return data
+
+
+class CouponEmailMessageSerializer(serializers.Serializer):
+    message = serializers.CharField(allow_blank=True, required=False, max_length=500)

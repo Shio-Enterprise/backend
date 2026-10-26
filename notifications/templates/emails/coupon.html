@@ -1,0 +1,28 @@
+{% extends "emails/base.html" %}
+
+{% block content %}
+<p>{% if nome %}Olá, {{ nome }}!{% else %}Olá!{% endif %}</p>
+
+<p>Separamos um cupom para você usar na Shio.</p>
+
+{% if mensagem %}
+<p>{{ mensagem|linebreaksbr }}</p>
+{% endif %}
+
+<p style="text-align: center; margin: 30px 0; padding: 20px; border: 2px dashed #000000; font-size: 28px; font-weight: bold; letter-spacing: 4px; color: #000000;">{{ codigo }}</p>
+
+{% if condicoes %}
+<p style="margin-bottom: 4px;"><strong>Condições:</strong></p>
+<ul style="margin-top: 0; padding-left: 20px;">
+{% for linha in condicoes %}
+    <li>{{ linha }}</li>
+{% endfor %}
+</ul>
+{% endif %}
+
+<p style="text-align: center; margin: 30px 0;">
+    <a href="{{ loja_url }}" style="background-color: #000000; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 4px; display: inline-block; font-weight: bold;">Ir para a loja</a>
+</p>
+
+<p style="font-size: 12px; color: #666; text-align: center;"><a href="{{ unsubscribe_url }}" style="color: #666;">Não quero receber promoções</a></p>
+{% endblock %}

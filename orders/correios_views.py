@@ -1,6 +1,5 @@
 import logging
 
-from django.conf import settings
 from drf_spectacular.utils import OpenApiParameter, OpenApiTypes, extend_schema
 from rest_framework import status
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -19,6 +18,7 @@ from .correios import (
     format_cep_address_response,
     format_shipping_options_response,
 )
+from .shipping import resolve_shipping_parameters
 
 logger = logging.getLogger(__name__)
 
@@ -75,18 +75,10 @@ class ShippingOptionsView(APIView):
         summary="Cálculo de Frete (Preço e Prazo)",
         description=(
             "Consulta preço e prazo de entrega para um CEP de destino.\n\n"
-            "- `cep_destino` — obrigatório\n"
-            "- `cep_origem` — opcional, usa o CEP do remetente configurado no servidor\n"
-            "- `peso` — peso em gramas (opcional, usa o padrão configurado)\n"
-            "- `codigo_servico` — código do serviço Correios (opcional, usa o padrão configurado)\n"
+            "- `cep_destino` — obrigatório; origem, peso e serviço são definidos no servidor\n"
         ),
         parameters=[
             OpenApiParameter(name="cep_destino", type=OpenApiTypes.STR, required=True),
-            OpenApiParameter(name="cep_origem", type=OpenApiTypes.STR, required=False),
-            OpenApiParameter(name="peso", type=OpenApiTypes.STR, required=False),
-            OpenApiParameter(
-                name="codigo_servico", type=OpenApiTypes.STR, required=False
-            ),
         ],
         responses={
             200: OpenApiTypes.OBJECT,
@@ -95,19 +87,15 @@ class ShippingOptionsView(APIView):
         },
     )
     def get(self, request):
+        controlled_parameters = {"cep_origem", "peso", "codigo_servico"}
+        if controlled_parameters.intersection(request.query_params):
+            return Response(
+                {"message": "Origem, peso e serviço são definidos pelo servidor."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         cep_destino = (
             request.query_params.get("cep_destino", "").replace("-", "").strip()
         )
-        cep_origem = (
-            request.query_params.get("cep_origem", settings.CORREIOS_REMETENTE_CEP)
-            .replace("-", "")
-            .strip()
-        )
-        peso = request.query_params.get("peso", settings.CORREIOS_PESO_PADRAO_GRAMAS)
-        codigo_servico = request.query_params.get(
-            "codigo_servico", settings.CORREIOS_CODIGO_SERVICO
-        )
-
         if not cep_destino or len(cep_destino) != 8 or not cep_destino.isdigit():
             return Response(
                 {
@@ -117,11 +105,26 @@ class ShippingOptionsView(APIView):
             )
 
         try:
+            shipping = resolve_shipping_parameters(cep_destino)
+        except ValueError:
+            return Response(
+                {"message": "Configuração logística inválida."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        try:
             prazo_data = fetch_shipping_deadline_by_service_and_ceps(
-                codigo_servico, cep_origem, cep_destino
+                shipping.service, shipping.origin, shipping.destination
             )
             preco_data = fetch_shipping_price_by_service_and_ceps(
-                codigo_servico, cep_origem, cep_destino, peso
+                shipping.service,
+                shipping.origin,
+                shipping.destination,
+                shipping.weight_grams,
+                comprimento=shipping.length_cm,
+                largura=shipping.width_cm,
+                altura=shipping.height_cm,
+                vl_declarado=shipping.declared_value,
             )
             return Response(
                 format_shipping_options_response(prazo_data, preco_data),

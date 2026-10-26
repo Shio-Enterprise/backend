@@ -70,6 +70,10 @@ SHIPPING_TEST_SETTINGS = {
     "CORREIOS_REMETENTE_CEP": "70000000",
     "CORREIOS_CODIGO_SERVICO": "03220",
     "CORREIOS_PESO_PADRAO_GRAMAS": "300",
+    "CORREIOS_COMPRIMENTO_CM": "20",
+    "CORREIOS_LARGURA_CM": "20",
+    "CORREIOS_ALTURA_CM": "20",
+    "SHIPPING_POLICY_VERSION": "1",
 }
 
 
@@ -354,7 +358,14 @@ class CheckoutAPITests(APITestCase):
         self.assertEqual(self.cart_item.unit_price, Decimal("100.00"))
         self.assertEqual(self.variation.stock_quantity, 10)
         self.mock_shipping.assert_called_once_with(
-            "03220", "70000000", "71000000", "300"
+            "03220",
+            "70000000",
+            "71000000",
+            "300",
+            comprimento="20",
+            largura="20",
+            altura="20",
+            vl_declarado="39.98",
         )
 
     @patch("orders.services.requests.post")
@@ -1133,6 +1144,33 @@ class ShippingQuoteTests(APITestCase):
         self.assertEqual(quote.discount_amount, Decimal("0.00"))
         self.assertEqual(quote.total_amount, Decimal("54.99"))
         self.assertEqual(quote.prazo_dias, 3)
+        self.assertEqual(
+            {
+                key: quote.snapshot["shipping_parameters"][key]
+                for key in (
+                    "origin",
+                    "destination",
+                    "service",
+                    "weight_grams",
+                    "length_cm",
+                    "width_cm",
+                    "height_cm",
+                    "declared_value",
+                    "policy_version",
+                )
+            },
+            {
+                "origin": "70000000",
+                "destination": "71000000",
+                "service": "03220",
+                "weight_grams": "300",
+                "length_cm": "20",
+                "width_cm": "20",
+                "height_cm": "20",
+                "declared_value": "39.98",
+                "policy_version": "1",
+            },
+        )
         self.assertEqual(quote.expires_at, now + timedelta(minutes=15))
         self.assertIsNone(quote.invalidated_at)
         self.cart.refresh_from_db()
@@ -1144,7 +1182,16 @@ class ShippingQuoteTests(APITestCase):
         self.assertEqual(self.variation.stock_quantity, 10)
         self.assertFalse(CustomerOrder.objects.exists())
         self.assertFalse(Payment.objects.exists())
-        self.mock_price.assert_called_once_with("03220", "70000000", "71000000", "300")
+        self.mock_price.assert_called_once_with(
+            "03220",
+            "70000000",
+            "71000000",
+            "300",
+            comprimento="20",
+            largura="20",
+            altura="20",
+            vl_declarado="39.98",
+        )
 
     def test_validacao_reutiliza_valores_sem_chamar_correios(self):
         quote = create_shipping_quote(self.user, self.address.pk)
@@ -1399,7 +1446,7 @@ class ShippingQuoteTests(APITestCase):
         self.assertFalse(ShippingQuote.objects.exists())
 
     def test_rejeita_compra_alterada_durante_consulta_externa(self):
-        def update_price(*args):
+        def update_price(*args, **kwargs):
             Product.objects.filter(pk=self.product.pk).update(
                 base_price=Decimal("25.00")
             )
@@ -2863,6 +2910,14 @@ class CepLookupViewTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
 
 
+@override_settings(
+    CORREIOS_REMETENTE_CEP="70000000",
+    CORREIOS_CODIGO_SERVICO="03220",
+    CORREIOS_PESO_PADRAO_GRAMAS="300",
+    CORREIOS_COMPRIMENTO_CM="20",
+    CORREIOS_LARGURA_CM="18",
+    CORREIOS_ALTURA_CM="5",
+)
 class ShippingOptionsViewTests(APITestCase):
     def setUp(self):
         self.user = User.objects.create_user(
@@ -2891,11 +2946,35 @@ class ShippingOptionsViewTests(APITestCase):
         self.assertEqual(data["prazo_dias"], 3)
         self.assertEqual(data["preco_final"], "19,92")
         self.assertTrue(data["entrega_domiciliar"])
+        mock_preco.assert_called_once_with(
+            "03220",
+            "70000000",
+            "71000000",
+            "300",
+            comprimento="20",
+            largura="18",
+            altura="5",
+            vl_declarado="0.00",
+        )
 
     def test_sem_cep_destino_retorna_400(self):
         self.client.force_authenticate(user=self.user)
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_rejeita_parametros_logisticos_controlados_pelo_cliente(self):
+        self.client.force_authenticate(user=self.user)
+        response = self.client.get(
+            self.url,
+            {
+                "cep_destino": "71000000",
+                "cep_origem": "00000000",
+                "peso": "1",
+                "codigo_servico": "99999",
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("X-Request-ID", response)
 
     def test_usuario_nao_autenticado_retorna_401(self):
         response = self.client.get(self.url, {"cep_destino": "71000000"})

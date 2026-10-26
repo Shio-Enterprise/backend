@@ -2,9 +2,19 @@ import logging
 import uuid
 
 from django.core.files.base import ContentFile
-from django.db import transaction
-from django.db.models import Exists, Max, OuterRef, Q, Sum
+from django.db import IntegrityError, transaction
+from django.db.models import (
+    Case,
+    Exists,
+    IntegerField,
+    Max,
+    OuterRef,
+    Q,
+    Value,
+    When,
+)
 from django.db.models.deletion import ProtectedError
+from django.http import Http404
 from django.shortcuts import get_object_or_404
 from drf_spectacular.utils import (
     OpenApiParameter,
@@ -31,6 +41,7 @@ from orders.expiration import sweep_expired_reservations
 
 from .availability import (
     is_drop_visible,
+    is_product_sellable,
     is_product_visible,
     visible_drops_queryset,
     visible_products_queryset,
@@ -48,6 +59,7 @@ from .models import (
     Product,
     ProductImage,
     ProductVariation,
+    StockAlert,
     Wishlist,
 )
 from .serializers import (
@@ -64,12 +76,19 @@ from .serializers import (
     ProductVariationSerializer,
     ProductWriteSerializer,
     PublicDropCampaignSerializer,
+    StockAlertCreateSerializer,
+    StockAlertItemSerializer,
+    StockAlertListSerializer,
+    StockAlertPendingVariationsSerializer,
+    StockAlertSerializer,
     StockMovementSerializer,
     WishlistCreateSerializer,
     WishlistIdsSerializer,
     WishlistPageSerializer,
     WishlistSerializer,
 )
+from .services import get_inventory_summary
+from .stock_alerts import watch_sellable
 
 logger = logging.getLogger(__name__)
 
@@ -189,22 +208,145 @@ class WishlistDeleteView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+def stock_alerts_queryset():
+    return StockAlert.objects.select_related(
+        "variation", "variation__product", "variation__product__drop"
+    ).prefetch_related("variation__product__images")
+
+
+class StockAlertListCreateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["Stock alerts"],
+        summary="Listar avisos de reposição",
+        responses={
+            200: StockAlertListSerializer,
+            401: OpenApiResponse(description="Não autenticado."),
+        },
+    )
+    def get(self, request):
+        queryset = (
+            stock_alerts_queryset()
+            .filter(user=request.user)
+            .annotate(
+                is_notified=Case(
+                    When(notified_at__isnull=True, then=Value(0)),
+                    default=Value(1),
+                    output_field=IntegerField(),
+                )
+            )
+            .order_by("is_notified", "-created_at", "id")
+        )
+        serializer = StockAlertSerializer(
+            queryset, many=True, context={"request": request}
+        )
+        return Response({"results": serializer.data})
+
+    @extend_schema(
+        tags=["Stock alerts"],
+        summary="Pedir aviso de reposição",
+        request=StockAlertCreateSerializer,
+        responses={
+            200: StockAlertItemSerializer,
+            201: StockAlertItemSerializer,
+            400: OpenApiResponse(
+                description="Variação com estoque ou produto fora de venda."
+            ),
+            401: OpenApiResponse(description="Não autenticado."),
+            404: OpenApiResponse(description="Variação inexistente ou não visível."),
+        },
+    )
+    def post(self, request):
+        input_serializer = StockAlertCreateSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+        variation = get_object_or_404(
+            ProductVariation.objects.select_related("product", "product__drop"),
+            pk=input_serializer.validated_data["variation_id"],
+        )
+        if not is_product_visible(variation.product):
+            raise Http404
+        if not is_product_sellable(variation.product):
+            raise ValidationError(
+                {"variation_id": ["Este produto não está à venda no momento."]}
+            )
+        if variation.stock_quantity > 0:
+            raise ValidationError({"variation_id": ["Este tamanho está disponível."]})
+
+        created = False
+        alert = StockAlert.objects.filter(
+            user=request.user, variation=variation, notified_at__isnull=True
+        ).first()
+        if alert is None:
+            for _ in range(2):
+                try:
+                    with transaction.atomic():
+                        alert = StockAlert.objects.create(
+                            user=request.user, variation=variation
+                        )
+                    created = True
+                    break
+                except IntegrityError:
+                    alert = StockAlert.objects.filter(
+                        user=request.user, variation=variation, notified_at__isnull=True
+                    ).first()
+                    if alert is not None:
+                        break
+            if alert is None:
+                return Response(
+                    {"error": "Não foi possível registrar o aviso. Tente novamente."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+        alert = stock_alerts_queryset().get(pk=alert.pk)
+        alert.already_pending = not created
+        return Response(
+            StockAlertItemSerializer(alert, context={"request": request}).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+class StockAlertPendingVariationsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["Stock alerts"],
+        summary="Listar variações com aviso pendente",
+        responses={
+            200: StockAlertPendingVariationsSerializer,
+            401: OpenApiResponse(description="Não autenticado."),
+        },
+    )
+    def get(self, request):
+        ids = StockAlert.objects.filter(
+            user=request.user, notified_at__isnull=True
+        ).values_list("variation_id", flat=True)
+        return Response({"variation_ids": [str(pk) for pk in ids]})
+
+
+class StockAlertDeleteView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["Stock alerts"],
+        summary="Cancelar aviso de reposição pendente",
+        responses={
+            204: OpenApiResponse(description="Aviso cancelado."),
+            401: OpenApiResponse(description="Não autenticado."),
+            404: OpenApiResponse(description="Aviso pendente não encontrado."),
+        },
+    )
+    def delete(self, request, pk):
+        alert = get_object_or_404(
+            StockAlert, pk=pk, user=request.user, notified_at__isnull=True
+        )
+        alert.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
 @api_view(["GET"])
 @permission_classes([CanManageCatalog])
 def inventory_summary(request):
-    products = Product.objects.all()
-    data = []
-    for product in products:
-        total_stock = (
-            product.variations.aggregate(total=Sum("stock_quantity"))["total"] or 0
-        )
-        data.append(
-            {
-                "name": product.name,
-                "total_stock": total_stock,
-            }
-        )
-    return Response({"inventory": data})
+    return Response({"inventory": get_inventory_summary()})
 
 
 class InventoryExportView(APIView):
@@ -629,7 +771,8 @@ class DropCampaignDetailView(APIView):
                 {"error": "Dados inválidos.", "details": serializer.errors},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        serializer.save()
+        with watch_sellable(list(drop.products.select_related("drop"))):
+            serializer.save()
         return Response(serializer.data)
 
     @extend_schema(
@@ -649,7 +792,8 @@ class DropCampaignDetailView(APIView):
     def delete(self, request, pk):
         drop = self._get_object(pk)
         logger.info(f"Drop removido: {drop.name} ({drop.id})")
-        drop.delete()
+        with watch_sellable(list(drop.products.select_related("drop"))):
+            drop.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -716,8 +860,9 @@ class DropProductManageView(APIView):
     def post(self, request, drop_id, product_id):
         drop = self._get_drop(drop_id)
         product = self._get_product(product_id)
-        product.drop = drop
-        product.save(update_fields=["drop", "updated_at"])
+        with watch_sellable([product]):
+            product.drop = drop
+            product.save(update_fields=["drop", "updated_at"])
         logger.info(f"Produto {product.id} vinculado ao drop {drop.id}")
         return Response(
             DropCampaignDetailSerializer(drop, context={"request": request}).data
@@ -748,8 +893,9 @@ class DropProductManageView(APIView):
                 {"error": "Produto não pertence a este drop."},
                 status=status.HTTP_404_NOT_FOUND,
             )
-        product.drop = None
-        product.save(update_fields=["drop", "updated_at"])
+        with watch_sellable([product]):
+            product.drop = None
+            product.save(update_fields=["drop", "updated_at"])
         logger.info(f"Produto {product.id} desvinculado do drop {drop.id}")
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -1025,7 +1171,8 @@ class ProductDetailView(APIView):
                 {"error": "Dados inválidos.", "details": serializer.errors},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        product = serializer.save()
+        with watch_sellable([product]):
+            product = serializer.save()
         return Response(
             ProductDetailSerializer(product, context={"request": request}).data
         )
