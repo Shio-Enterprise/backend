@@ -17,6 +17,9 @@ from .views import (
     ProductRecommendationsView,
     ProductVariationCreateView,
     ProductVariationDetailView,
+    StockAlertDeleteView,
+    StockAlertListCreateView,
+    StockAlertPendingVariationsView,
     StockMovementListCreateView,
     WishlistDeleteView,
     WishlistIdsView,
@@ -27,6 +30,21 @@ from .views import (
 app_name = "products"
 
 urlpatterns = [
+    path(
+        "stock-alerts/",
+        StockAlertListCreateView.as_view(),
+        name="stock-alert-list-create",
+    ),
+    path(
+        "stock-alerts/pending-variations/",
+        StockAlertPendingVariationsView.as_view(),
+        name="stock-alert-pending-variations",
+    ),
+    path(
+        "stock-alerts/<uuid:pk>/",
+        StockAlertDeleteView.as_view(),
+        name="stock-alert-delete",
+    ),
     path("wishlist/", WishlistListCreateView.as_view(), name="wishlist-list-create"),
     path("wishlist/ids/", WishlistIdsView.as_view(), name="wishlist-ids"),
     path(

@@ -141,7 +141,12 @@ def move_stock(
             )
     except IntegrityError:
         raise OperationConflict("Operação ou compensação já registrada.") from None
+    previous = variation.stock_quantity
     ProductVariation.objects.filter(pk=variation.pk).update(stock_quantity=balance)
+    if previous == 0 and balance > 0:
+        from .stock_alerts import schedule_variation_alerts
+
+        schedule_variation_alerts(variation.pk)
     return movement
 
 

@@ -405,4 +405,7 @@ SPECTACULAR_SETTINGS = {
     },
 }
 
+# Avisos "Avise-me quando chegar": rodam em thread; nos testes, inline.
+STOCK_ALERTS_RUN_INLINE = False
+
 FRONTEND_URL = config("FRONTEND_URL", default="http://localhost:5173")

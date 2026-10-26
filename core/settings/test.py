@@ -16,6 +16,9 @@ MEDIA_ROOT = tempfile.mkdtemp(prefix="test-media-")
 SECRET_KEY = "uma-chave-secreta-muito-longa-apenas-para-testes-jwt-validar"
 SIMPLE_JWT["SIGNING_KEY"] = SECRET_KEY
 
+# Avisos de reposição rodam inline (sem thread) nos testes
+STOCK_ALERTS_RUN_INLINE = True
+
 # Testes nunca enviam e-mail de verdade
 EMAIL_BACKEND = "django.core.mail.backends.locmem.EmailBackend"
 
