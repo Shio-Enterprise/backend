@@ -2959,6 +2959,11 @@ class SizeGuideTests(APITestCase):
         with self.assertRaises(ModelValidationError):
             guide.full_clean()
 
+    def test_validacao_rejeita_tamanhos_fora_de_ordem(self):
+        guide = SizeGuide(name="Ruim", columns=self.columns, rows=self.rows[::-1])
+        with self.assertRaises(ModelValidationError):
+            guide.full_clean()
+
     def test_validacao_rejeita_medida_faltando(self):
         guide = SizeGuide(
             name="Ruim",

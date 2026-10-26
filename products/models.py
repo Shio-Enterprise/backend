@@ -30,6 +30,7 @@ def validate_size_guide_content(columns, rows):
         raise ValidationError({"columns": "As chaves das medidas devem ser únicas."})
     if not isinstance(rows, list) or not rows:
         raise ValidationError({"rows": "Informe ao menos um tamanho."})
+    previous = None
     for row in rows:
         if (
             not isinstance(row, dict)
@@ -61,6 +62,16 @@ def validate_size_guide_content(columns, rows):
                         "com mín menor que máx."
                     }
                 )
+        if previous and any(
+            row["measures"][key][0] <= previous["measures"][key][0] for key in keys
+        ):
+            raise ValidationError(
+                {
+                    "rows": f"{row['size']} deve vir depois de {previous['size']} "
+                    "com medidas maiores (ordem crescente)."
+                }
+            )
+        previous = row
 
 
 class SizeGuide(models.Model):
