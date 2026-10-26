@@ -4,34 +4,21 @@ from datetime import datetime
 
 import requests
 from django.conf import settings
-from django.core.cache import cache
 from django.core.exceptions import ObjectDoesNotExist
+from redis.exceptions import RedisError
 
 from . import correios_mock
+from .integrations.correios_client import CorreiosClient
+from .integrations.correios_token_provider import CorreiosTokenProvider
 
 logger = logging.getLogger(__name__)
 
 CORREIOS_TOKEN_CACHE_KEY = "correios_access_token"
-CORREIOS_TOKEN_ENDPOINT = (
-    "https://api.correios.com.br/token/v1/autentica/cartaopostagem"
-)
-CORREIOS_TRACKING_ENDPOINT = (
-    "https://api.correios.com.br/srorastro/v1/objetos/{codigo_objeto}"
-)
-CORREIOS_PREPOSTAGEM_ENDPOINT = (
-    "https://api.correios.com.br/prepostagem/v1/prepostagens"
-)
-CORREIOS_PREPOSTAGEM_DETAILS_ENDPOINT = (
-    "https://api.correios.com.br/prepostagem/v1/prepostagens/{id}"
-)
-CORREIOS_CEP_ENDPOINT = "https://api.correios.com.br/cep/v1/enderecos/{cep}"
-CORREIOS_PRAZO_ENDPOINT = (
-    "https://api.correios.com.br/prazo/v1/nacional/{codigo_servico}"
-)
-CORREIOS_PRECO_ENDPOINT = (
-    "https://api.correios.com.br/preco/v1/nacional/{codigo_servico}"
-)
-CORREIOS_AGENCIA_ENDPOINT = "https://api.correios.com.br/agencia/v1/unidades"
+correios_client = CorreiosClient(transport=requests)
+
+
+def correios_url(path: str) -> str:
+    return correios_client.build_correios_url(path)
 
 
 class CorreiosAuthenticationError(Exception):
@@ -63,9 +50,9 @@ def calculate_token_ttl_in_seconds(expires_at_iso: str) -> int:
     return max(remaining_seconds - 60, 0)
 
 
-def request_new_correios_access_token() -> str:
+def _load_new_correios_access_token() -> tuple[str, int]:
     if settings.CORREIOS_MOCK_ENABLED:
-        return correios_mock.mock_token_response()
+        return correios_mock.mock_token_response(), 60
 
     username = settings.CORREIOS_USERNAME
     password = settings.CORREIOS_PASSWORD
@@ -73,8 +60,9 @@ def request_new_correios_access_token() -> str:
     payload = {"numero": cartao_postagem}
 
     # requests can send basic auth via `auth` tuple
-    response = requests.post(
-        CORREIOS_TOKEN_ENDPOINT,
+    response = correios_client.request(
+        "POST",
+        "token/v1/autentica/cartaopostagem",
         json=payload,
         auth=(username, password),
         timeout=10,
@@ -91,37 +79,43 @@ def request_new_correios_access_token() -> str:
         )
 
     ttl = calculate_token_ttl_in_seconds(expires_at)
-    if ttl > 0:
-        cache.set(CORREIOS_TOKEN_CACHE_KEY, token, timeout=ttl)
+    return token, ttl
 
-    return token
+
+correios_token_provider = CorreiosTokenProvider(_load_new_correios_access_token)
+
+
+def request_new_correios_access_token() -> str:
+    try:
+        return correios_token_provider.refresh_token()
+    except RedisError as exc:
+        raise CorreiosAuthenticationError("Cache dos Correios indisponível.") from exc
 
 
 def get_valid_correios_access_token() -> str:
-    cached_token = cache.get(CORREIOS_TOKEN_CACHE_KEY)
-    if cached_token:
-        return cached_token
-    return request_new_correios_access_token()
+    try:
+        return correios_token_provider.get_token()
+    except RedisError as exc:
+        raise CorreiosAuthenticationError("Cache dos Correios indisponível.") from exc
+
+
+def _authenticated_request(method: str, path: str, **kwargs):
+    token = get_valid_correios_access_token()
+    response = correios_client.request(method, path, token=token, **kwargs)
+    if response.status_code == 401:
+        correios_token_provider.invalidate_if_current(token)
+        token = get_valid_correios_access_token()
+        response = correios_client.request(method, path, token=token, **kwargs)
+    return response
 
 
 def fetch_tracking_data_from_correios(tracking_code: str) -> dict:
     if settings.CORREIOS_MOCK_ENABLED:
         return correios_mock.mock_tracking_response(tracking_code)
 
-    token = get_valid_correios_access_token()
-    url = CORREIOS_TRACKING_ENDPOINT.format(codigo_objeto=tracking_code)
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-    }
-
-    response = requests.get(url, headers=headers, timeout=10)
-
-    if response.status_code == 401:
-        cache.delete(CORREIOS_TOKEN_CACHE_KEY)
-        token = request_new_correios_access_token()
-        headers["Authorization"] = f"Bearer {token}"
-        response = requests.get(url, headers=headers, timeout=10)
+    response = _authenticated_request(
+        "GET", f"srorastro/v1/objetos/{tracking_code}", timeout=10
+    )
 
     response.raise_for_status()
     return response.json()
@@ -261,17 +255,9 @@ def fetch_prepostagem_details_from_correios(prepostagem_id: str) -> dict:
     if settings.CORREIOS_MOCK_ENABLED:
         return correios_mock.mock_prepostagem_details_response()
 
-    token = get_valid_correios_access_token()
-    url = CORREIOS_PREPOSTAGEM_DETAILS_ENDPOINT.format(id=prepostagem_id)
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-
-    response = requests.get(url, headers=headers, timeout=10)
-
-    if response.status_code == 401:
-        cache.delete(CORREIOS_TOKEN_CACHE_KEY)
-        token = request_new_correios_access_token()
-        headers["Authorization"] = f"Bearer {token}"
-        response = requests.get(url, headers=headers, timeout=10)
+    response = _authenticated_request(
+        "GET", f"prepostagem/v1/prepostagens/{prepostagem_id}", timeout=10
+    )
 
     response.raise_for_status()
     return response.json()
@@ -281,25 +267,18 @@ def create_prepostagem_at_correios(order) -> dict:
     if settings.CORREIOS_MOCK_ENABLED:
         return correios_mock.mock_prepostagem_response()
 
-    token = get_valid_correios_access_token()
     payload = build_prepostagem_payload_for_order(order)
     headers = {
-        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
-        "Accept": "application/json",
     }
 
-    response = requests.post(
-        CORREIOS_PREPOSTAGEM_ENDPOINT, json=payload, headers=headers, timeout=15
+    response = _authenticated_request(
+        "POST",
+        "prepostagem/v1/prepostagens",
+        headers=headers,
+        json=payload,
+        timeout=15,
     )
-
-    if response.status_code == 401:
-        cache.delete(CORREIOS_TOKEN_CACHE_KEY)
-        token = request_new_correios_access_token()
-        headers["Authorization"] = f"Bearer {token}"
-        response = requests.post(
-            CORREIOS_PREPOSTAGEM_ENDPOINT, json=payload, headers=headers, timeout=15
-        )
 
     if not response.ok:
         try:
@@ -317,17 +296,9 @@ def fetch_address_data_by_cep(cep: str) -> dict:
     if settings.CORREIOS_MOCK_ENABLED:
         return correios_mock.mock_cep_response(cep.replace("-", "").strip())
 
-    token = get_valid_correios_access_token()
-    url = CORREIOS_CEP_ENDPOINT.format(cep=cep.replace("-", "").strip())
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-
-    response = requests.get(url, headers=headers, timeout=10)
-
-    if response.status_code == 401:
-        cache.delete(CORREIOS_TOKEN_CACHE_KEY)
-        token = request_new_correios_access_token()
-        headers["Authorization"] = f"Bearer {token}"
-        response = requests.get(url, headers=headers, timeout=10)
+    response = _authenticated_request(
+        "GET", f"cep/v1/enderecos/{cep.replace('-', '').strip()}", timeout=10
+    )
 
     if response.status_code == 404:
         raise CorreiosCepNotFoundError(f"CEP {cep} não encontrado.")
@@ -353,21 +324,17 @@ def fetch_shipping_deadline_by_service_and_ceps(
     if settings.CORREIOS_MOCK_ENABLED:
         return correios_mock.mock_prazo_response()
 
-    token = get_valid_correios_access_token()
-    url = CORREIOS_PRAZO_ENDPOINT.format(codigo_servico=codigo_servico)
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     params = {
         "cepOrigem": cep_origem.replace("-", ""),
         "cepDestino": cep_destino.replace("-", ""),
     }
 
-    response = requests.get(url, headers=headers, params=params, timeout=10)
-
-    if response.status_code == 401:
-        cache.delete(CORREIOS_TOKEN_CACHE_KEY)
-        token = request_new_correios_access_token()
-        headers["Authorization"] = f"Bearer {token}"
-        response = requests.get(url, headers=headers, params=params, timeout=10)
+    response = _authenticated_request(
+        "GET",
+        f"prazo/v1/nacional/{codigo_servico}",
+        params=params,
+        timeout=10,
+    )
 
     response.raise_for_status()
     return response.json()
@@ -386,9 +353,6 @@ def fetch_shipping_price_by_service_and_ceps(
     if settings.CORREIOS_MOCK_ENABLED:
         return correios_mock.mock_preco_response(peso_gramas)
 
-    token = get_valid_correios_access_token()
-    url = CORREIOS_PRECO_ENDPOINT.format(codigo_servico=codigo_servico)
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     params = {
         "cepDestino": cep_destino.replace("-", ""),
         "cepOrigem": cep_origem.replace("-", ""),
@@ -400,13 +364,12 @@ def fetch_shipping_price_by_service_and_ceps(
         "vlDeclarado": vl_declarado,
     }
 
-    response = requests.get(url, headers=headers, params=params, timeout=10)
-
-    if response.status_code == 401:
-        cache.delete(CORREIOS_TOKEN_CACHE_KEY)
-        token = request_new_correios_access_token()
-        headers["Authorization"] = f"Bearer {token}"
-        response = requests.get(url, headers=headers, params=params, timeout=10)
+    response = _authenticated_request(
+        "GET",
+        f"preco/v1/nacional/{codigo_servico}",
+        params=params,
+        timeout=10,
+    )
 
     response.raise_for_status()
     return response.json()
@@ -429,8 +392,6 @@ def fetch_agencies_by_city_and_state(
     if settings.CORREIOS_MOCK_ENABLED:
         return correios_mock.mock_agencies_response()
 
-    token = get_valid_correios_access_token()
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     params = {
         "municipio": municipio,
         "uf": uf,
@@ -439,17 +400,9 @@ def fetch_agencies_by_city_and_state(
         "size": size,
     }
 
-    response = requests.get(
-        CORREIOS_AGENCIA_ENDPOINT, headers=headers, params=params, timeout=10
+    response = _authenticated_request(
+        "GET", "agencia/v1/unidades", params=params, timeout=10
     )
-
-    if response.status_code == 401:
-        cache.delete(CORREIOS_TOKEN_CACHE_KEY)
-        token = request_new_correios_access_token()
-        headers["Authorization"] = f"Bearer {token}"
-        response = requests.get(
-            CORREIOS_AGENCIA_ENDPOINT, headers=headers, params=params, timeout=10
-        )
 
     response.raise_for_status()
     return response.json()

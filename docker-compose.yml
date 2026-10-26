@@ -1,4 +1,13 @@
 services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--maxmemory", "25mb", "--maxmemory-policy", "noeviction", "--maxclients", "50", "--save", "", "--appendonly", "no"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
   db:
     image: postgres:latest
     container_name: shio_db
@@ -37,8 +46,11 @@ services:
     env_file: ./.env
     environment:
       - DB_HOSTNAME=db
+      - REDIS_URL=redis://redis:6379/0
     entrypoint: ["sh", "-c", "tr -d '\\r' < /app/entrypoint.sh > /tmp/entrypoint.sh && chmod +x /tmp/entrypoint.sh && exec /tmp/entrypoint.sh"]
     depends_on:
+      redis:
+        condition: service_healthy
       db:
         condition: service_healthy
     restart: unless-stopped

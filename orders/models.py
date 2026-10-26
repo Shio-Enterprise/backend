@@ -246,6 +246,8 @@ class CheckoutAttempt(models.Model):
         default=CheckoutAttemptStatus.PROCESSING,
     )
     checkout_url = models.URLField(max_length=2048, blank=True)
+    last_error_code = models.CharField(max_length=64, blank=True)
+    last_error_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
