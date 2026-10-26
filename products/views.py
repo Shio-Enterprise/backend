@@ -88,6 +88,7 @@ from .serializers import (
     WishlistSerializer,
 )
 from .stock_alerts import watch_sellable
+from .services import get_inventory_summary
 
 logger = logging.getLogger(__name__)
 
@@ -345,19 +346,7 @@ class StockAlertDeleteView(APIView):
 @api_view(["GET"])
 @permission_classes([CanManageCatalog])
 def inventory_summary(request):
-    products = Product.objects.all()
-    data = []
-    for product in products:
-        total_stock = (
-            product.variations.aggregate(total=Sum("stock_quantity"))["total"] or 0
-        )
-        data.append(
-            {
-                "name": product.name,
-                "total_stock": total_stock,
-            }
-        )
-    return Response({"inventory": data})
+    return Response({"inventory": get_inventory_summary()})
 
 
 class InventoryExportView(APIView):

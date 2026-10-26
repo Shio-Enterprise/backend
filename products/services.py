@@ -4,7 +4,8 @@ import re
 import uuid
 
 from django.db import IntegrityError, transaction
-from django.db.models import Max
+from django.db.models import Max, Sum, Value
+from django.db.models.functions import Coalesce
 from rest_framework.exceptions import APIException, ValidationError
 
 from .models import Product, ProductVariation, StockMovement, StockOpeningBalance
@@ -24,6 +25,14 @@ COLOR_NAMES = {
         "Preto",
     )
 }
+
+
+def get_inventory_summary():
+    return list(
+        Product.objects.annotate(
+            total_stock=Coalesce(Sum("variations__stock_quantity"), Value(0))
+        ).values("name", "total_stock")
+    )
 
 
 def normalize_color(value):
