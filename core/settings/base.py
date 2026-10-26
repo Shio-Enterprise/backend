@@ -402,6 +402,8 @@ SPECTACULAR_SETTINGS = {
         "OrderStatusEnum": "orders.models.OrderStatus",
         "ReviewStatusEnum": "reviews.models.ReviewStatus",
         # Se tiver outro enum de status dando conflito, adicione aqui embaixo
+        "RefundStatusEnum": "orders.models.RefundStatus",
+        "RefundReasonEnum": "orders.models.RefundReason",
     },
 }
 

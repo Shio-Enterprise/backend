@@ -370,3 +370,88 @@ class CouponEmailSend(models.Model):
 
     def __str__(self):
         return f"CouponEmailSend(coupon={self.coupon_id}, sent={self.sent_count}, failed={self.failed_count})"
+
+
+class RefundStatus(models.TextChoices):
+    REQUESTED = "REQUESTED", "Solicitado"
+    APPROVED = "APPROVED", "Aprovado"
+    REJECTED = "REJECTED", "Recusado"
+    COMPLETED = "COMPLETED", "Reembolsado"
+
+
+class RefundReason(models.TextChoices):
+    CUSTOMER_REQUEST = "CUSTOMER_REQUEST", "Desistência do cliente"
+    PRODUCT_ISSUE = "PRODUCT_ISSUE", "Problema com o produto"
+    DELIVERY_ISSUE = "DELIVERY_ISSUE", "Problema na entrega"
+    PAID_AFTER_CANCELLATION = "PAID_AFTER_CANCELLATION", "Pagamento após cancelamento"
+    OTHER = "OTHER", "Outro"
+
+
+class Refund(models.Model):
+    """Reembolso integral de um pedido, do pedido do cliente ao estorno.
+
+    O estorno é feito no painel da InfinitePay; aqui fica só o registro.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    order = models.ForeignKey(
+        CustomerOrder, on_delete=models.PROTECT, related_name="refunds"
+    )
+    status = models.CharField(max_length=20, choices=RefundStatus.choices)
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    reason = models.CharField(max_length=30, choices=RefundReason.choices)
+    customer_comment = models.CharField(max_length=1000, blank=True)
+    # Visível ao cliente: instruções da aprovação ou justificativa da recusa.
+    review_message = models.TextField(blank=True)
+    internal_note = models.TextField(blank=True)
+    gateway_reference = models.CharField(max_length=255, blank=True)
+    refunded_at = models.DateTimeField(null=True, blank=True)
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    completed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            # Recusas ficam no histórico; só um reembolso vivo por pedido.
+            models.UniqueConstraint(
+                fields=["order"],
+                condition=~models.Q(status=RefundStatus.REJECTED),
+                name="refund_one_active_per_order",
+            ),
+            models.CheckConstraint(
+                check=models.Q(amount__gt=0), name="refund_amount_positive"
+            ),
+            models.CheckConstraint(
+                check=~models.Q(status=RefundStatus.COMPLETED)
+                | (
+                    models.Q(refunded_at__isnull=False)
+                    & ~models.Q(gateway_reference="")
+                ),
+                name="refund_completed_has_gateway_data",
+            ),
+        ]
+
+    def __str__(self):
+        return f"Refund(order={self.order_id}, status={self.status})"

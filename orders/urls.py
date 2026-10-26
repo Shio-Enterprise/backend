@@ -6,6 +6,9 @@ from .views import (
     AdminOrderDetailView,
     AdminOrderExportView,
     AdminOrderListView,
+    AdminRefundApproveView,
+    AdminRefundRejectView,
+    AdminRefundView,
     CartAPIView,
     CartItemAddAPIView,
     CartItemDetailAPIView,
@@ -26,6 +29,7 @@ from .views import (
     PaymentSuccessRedirectView,
     UserOrderDetailView,
     UserOrderListView,
+    UserRefundRequestView,
 )
 
 app_name = "orders"
@@ -89,12 +93,32 @@ urlpatterns = [
         UserOrderDetailView.as_view(),
         name="user_orders_detail",
     ),
+    path(
+        "my-orders/<uuid:order_id>/refund-request/",
+        UserRefundRequestView.as_view(),
+        name="user_order_refund_request",
+    ),
     path("admin/", AdminOrderListView.as_view(), name="admin_orders_list"),
     path("admin/export/", AdminOrderExportView.as_view(), name="admin_orders_export"),
     path(
         "admin/<uuid:order_id>/",
         AdminOrderDetailView.as_view(),
         name="admin_orders_detail",
+    ),
+    path(
+        "admin/<uuid:order_id>/refund/",
+        AdminRefundView.as_view(),
+        name="admin_order_refund",
+    ),
+    path(
+        "admin/<uuid:order_id>/refund/approve/",
+        AdminRefundApproveView.as_view(),
+        name="admin_order_refund_approve",
+    ),
+    path(
+        "admin/<uuid:order_id>/refund/reject/",
+        AdminRefundRejectView.as_view(),
+        name="admin_order_refund_reject",
     ),
     path("correios/cep/<str:cep>/", CepLookupView.as_view(), name="cep-lookup"),
     path("correios/frete/", ShippingOptionsView.as_view(), name="shipping-options"),

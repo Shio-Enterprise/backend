@@ -1,0 +1,12 @@
+{% extends "emails/base.txt" %}
+
+{% block content %}
+Olá, {{ nome|default:"cliente" }}!
+
+O estorno de {{ valor }} referente ao pedido {{ pedido }} foi feito em {{ refund.refunded_at|date:"d/m/Y" }}.
+
+O valor volta pelo mesmo meio de pagamento usado na compra. O prazo para aparecer depende do seu banco ou da operadora do cartão.
+
+Detalhe do pedido:
+{{ pedido_url }}
+{% endblock %}

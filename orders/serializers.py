@@ -15,7 +15,8 @@ from .models import (
     OrderStatusLog,
     Payment,
     PaymentMethod,
-    PaymentStatus,
+    Refund,
+    RefundReason,
 )
 
 User = get_user_model()
@@ -25,6 +26,8 @@ class DashboardRecentOrderSerializer(serializers.ModelSerializer):
     customer_name = serializers.SerializerMethodField()
     paid_at = serializers.DateTimeField(source="payment.paid_at", read_only=True)
     payment_status = serializers.CharField(source="payment.status", read_only=True)
+    # Anotado por orders.refunds.with_refund_status nas listas de pedidos.
+    refund_status = serializers.CharField(read_only=True, allow_null=True, default=None)
     revenue_value = serializers.SerializerMethodField()
 
     class Meta:
@@ -35,6 +38,7 @@ class DashboardRecentOrderSerializer(serializers.ModelSerializer):
             "total_amount",
             "status",
             "payment_status",
+            "refund_status",
             "paid_at",
             "created_at",
             "revenue_value",
@@ -207,16 +211,9 @@ class DashboardOrderDrillDownSerializer(serializers.ModelSerializer):
 
     @extend_schema_field(serializers.DecimalField(max_digits=20, decimal_places=2))
     def get_revenue_value(self, obj) -> str:
-        payment = getattr(obj, "payment", None)
-        if payment and payment.status == PaymentStatus.REFUNDED:
-            return f"{-obj.total_amount:.2f}"
-        if (
-            payment
-            and payment.status == PaymentStatus.PAID
-            and obj.status == OrderStatus.DELIVERED
-        ):
-            return f"{obj.total_amount:.2f}"
-        return "0.00"
+        from .metrics import revenue_value
+
+        return f"{revenue_value(obj):.2f}"
 
     @extend_schema_field(serializers.IntegerField(allow_null=True))
     def get_metric_units(self, obj) -> int | None:
@@ -344,12 +341,91 @@ class OrderStatusLogSerializer(serializers.ModelSerializer):
         ]
 
 
+class RefundSerializer(serializers.ModelSerializer):
+    """Visão administrativa: tudo, inclusive dados internos do estorno."""
+
+    status_label = serializers.CharField(source="get_status_display", read_only=True)
+    reason_label = serializers.CharField(source="get_reason_display", read_only=True)
+    requested_by = AdminUserSerializer(read_only=True, allow_null=True)
+    reviewed_by = AdminUserSerializer(read_only=True, allow_null=True)
+    completed_by = AdminUserSerializer(read_only=True, allow_null=True)
+    stock_returned = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Refund
+        fields = [
+            "id",
+            "status",
+            "status_label",
+            "amount",
+            "reason",
+            "reason_label",
+            "customer_comment",
+            "review_message",
+            "internal_note",
+            "gateway_reference",
+            "refunded_at",
+            "requested_by",
+            "reviewed_by",
+            "completed_by",
+            "created_at",
+            "reviewed_at",
+            "completed_at",
+            "stock_returned",
+        ]
+
+    def get_stock_returned(self, obj) -> bool:
+        from .refunds import stock_returned
+
+        return stock_returned(obj.order)
+
+
+class CustomerRefundSerializer(serializers.ModelSerializer):
+    status_label = serializers.CharField(source="get_status_display", read_only=True)
+    reason_label = serializers.CharField(source="get_reason_display", read_only=True)
+
+    class Meta:
+        model = Refund
+        fields = [
+            "id",
+            "status",
+            "status_label",
+            "amount",
+            "reason",
+            "reason_label",
+            "customer_comment",
+            "review_message",
+            "refunded_at",
+            "created_at",
+            "reviewed_at",
+        ]
+
+
+class RefundEligibilitySerializer(serializers.Serializer):
+    can_request = serializers.BooleanField()
+    code = serializers.CharField(allow_null=True)
+    message = serializers.CharField(allow_null=True)
+    deadline = serializers.DateTimeField(allow_null=True)
+
+
 class OrderDetailSerializer(serializers.ModelSerializer):
+    """Detalhe administrativo do pedido."""
+
     items = SimpleOrderItemSerializer(many=True)
     payment = PaymentSerializer(read_only=True)
     user = AdminUserSerializer(read_only=True)
     status_logs = serializers.SerializerMethodField()
+    refund = serializers.SerializerMethodField()
+    refund_serializer_class = RefundSerializer
 
+    @extend_schema_field(RefundSerializer(allow_null=True))
+    def get_refund(self, obj):
+        from .refunds import latest_refund
+
+        refund = latest_refund(obj)
+        return self.refund_serializer_class(refund).data if refund else None
+
+    @extend_schema_field(OrderStatusLogSerializer(many=True))
     def get_status_logs(self, obj):
         logs = obj.status_logs.order_by("created_at")
 
@@ -382,11 +458,82 @@ class OrderDetailSerializer(serializers.ModelSerializer):
             "items",
             "payment",
             "status_logs",
+            "refund",
         ]
 
 
+class CustomerOrderDetailSerializer(OrderDetailSerializer):
+    """Detalhe do cliente: sem dados internos do reembolso."""
+
+    refund_serializer_class = CustomerRefundSerializer
+    refund_eligibility = serializers.SerializerMethodField()
+
+    @extend_schema_field(CustomerRefundSerializer(allow_null=True))
+    def get_refund(self, obj):
+        return super().get_refund(obj)
+
+    @extend_schema_field(RefundEligibilitySerializer)
+    def get_refund_eligibility(self, obj):
+        from .refunds import REFUND_ERROR_MESSAGES, refund_eligibility
+
+        eligibility = refund_eligibility(obj)
+        return RefundEligibilitySerializer(
+            {
+                "can_request": eligibility.can_request,
+                "code": eligibility.code,
+                "message": REFUND_ERROR_MESSAGES.get(eligibility.code),
+                "deadline": eligibility.deadline,
+            }
+        ).data
+
+    class Meta(OrderDetailSerializer.Meta):
+        fields = [*OrderDetailSerializer.Meta.fields, "refund_eligibility"]
+
+
+class RefundRequestSerializer(serializers.Serializer):
+    reason = serializers.ChoiceField(
+        choices=[
+            (RefundReason.CUSTOMER_REQUEST, "Desisti da compra"),
+            (RefundReason.PRODUCT_ISSUE, RefundReason.PRODUCT_ISSUE.label),
+            (RefundReason.OTHER, RefundReason.OTHER.label),
+        ]
+    )
+    comment = serializers.CharField(
+        max_length=1000, allow_blank=True, required=False, default=""
+    )
+
+    def validate(self, attrs):
+        attrs["comment"] = attrs["comment"].strip()
+        if attrs["reason"] == RefundReason.OTHER and not attrs["comment"]:
+            raise serializers.ValidationError(
+                {"comment": "Conte o motivo do reembolso."}
+            )
+        return attrs
+
+
+class RefundApproveSerializer(serializers.Serializer):
+    message = serializers.CharField(
+        max_length=2000, allow_blank=True, required=False, default=""
+    )
+
+
+class RefundRejectSerializer(serializers.Serializer):
+    message = serializers.CharField(max_length=2000)
+
+
+class RefundCompleteSerializer(serializers.Serializer):
+    gateway_reference = serializers.CharField(max_length=255)
+    refunded_at = serializers.DateTimeField()
+    items_returned = serializers.BooleanField(required=False, default=False)
+    internal_note = serializers.CharField(
+        max_length=2000, allow_blank=True, required=False, default=""
+    )
+    reason = serializers.ChoiceField(
+        choices=RefundReason.choices, required=False, allow_null=True, default=None
+    )
+
+
 class OrderStatusUpdateSerializer(serializers.Serializer):
-    physical_return_confirmed = serializers.BooleanField(required=False, default=False)
     status = serializers.ChoiceField(
         choices=CustomerOrder._meta.get_field("status").choices
     )

@@ -17,7 +17,7 @@ from orders.models import (
     OrderStatus,
     normalize_coupon_code,
 )
-from orders.money import normalize_money
+from orders.money import format_brl, normalize_money
 
 # Na ordem em que são verificados. São o contrato com o frontend.
 COUPON_ERROR_MESSAGES = {
@@ -109,7 +109,7 @@ def _evaluate(coupon, user, items, subtotal, now):
     ):
         return _error("coupon_first_purchase_only")
     if coupon.min_order_value and subtotal < coupon.min_order_value:
-        missing = _format_brl(coupon.min_order_value - subtotal)
+        missing = format_brl(coupon.min_order_value - subtotal)
         return _error("coupon_min_value", missing=missing)
 
     restricted, eligible = _eligible_items(coupon, items)
@@ -157,9 +157,3 @@ def _eligible_items(coupon, items):
 def _error(error_code, **params):
     message = COUPON_ERROR_MESSAGES[error_code].format(**params)
     return CouponResult(None, Decimal("0.00"), error_code, message)
-
-
-def _format_brl(value):
-    """Decimal('1234.5') -> 'R$ 1.234,50'."""
-    text = f"{normalize_money(value):,.2f}"
-    return "R$ " + text.replace(",", "_").replace(".", ",").replace("_", ".")

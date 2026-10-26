@@ -70,6 +70,14 @@ from .models import (
     OrderStatus,
     PaymentMethod,
     PaymentStatus,
+    RefundStatus,
+)
+from .refunds import (
+    approve_refund,
+    complete_refund,
+    reject_refund,
+    request_refund,
+    with_refund_status,
 )
 from .serializers import (
     CartItemAddSerializer,
@@ -80,6 +88,7 @@ from .serializers import (
     CheckoutInputSerializer,
     CouponAdminSerializer,
     CouponEmailMessageSerializer,
+    CustomerOrderDetailSerializer,
     DashboardDetailSerializer,
     DashboardLowStockSerializer,
     DashboardOrderDrillDownSerializer,
@@ -89,18 +98,23 @@ from .serializers import (
     OrderStatusUpdateSerializer,
     PaymentReturnSerializer,
     PaymentWebhookSerializer,
+    RefundApproveSerializer,
+    RefundCompleteSerializer,
+    RefundRejectSerializer,
+    RefundRequestSerializer,
 )
 from .services import (
+    PENDING_REFUND_SHIPPING_MESSAGE,
     add_item_to_cart,
     clear_cart,
     complete_checkout_attempt,
     confirm_infinitepay_payment,
     create_shipping_quote,
     get_cart_data,
+    has_pending_refund_request,
     prepare_checkout_attempt,
     release_if_expired,
     remove_item_from_cart,
-    restore_order_stock,
     update_item_quantity,
     update_status,
     update_tracking_code,
@@ -205,10 +219,10 @@ class DashboardDetailView(APIView):
     @extend_schema(
         description=(
             "Vendas válidas: pedido DELIVERED e pagamento PAID; reembolsos: "
-            "pagamento REFUNDED. Financeiro e séries usam payment.paid_at em "
-            "America/Sao_Paulo; receita líquida = total_amount das vendas válidas "
-            "menos total_amount dos reembolsos; ticket = líquido / vendas válidas "
-            "(zero sem vendas). Pedidos por status incluem todos os pedidos e usam "
+            "pedido DELIVERED e pagamento REFUNDED. Financeiro e séries usam "
+            "payment.paid_at em America/Sao_Paulo; receita bruta = total_amount "
+            "das vendas válidas e dos reembolsos; receita líquida = bruta menos "
+            "reembolsos; ticket = líquido / vendas válidas (zero sem vendas). Pedidos por status incluem todos os pedidos e usam "
             "CustomerOrder.created_at. Drops e categorias selecionam pedidos que "
             "tenham um mesmo item correspondente; rankings e distribuições somam "
             "somente esses itens por quantity × unit_price, sem rateio de frete ou "
@@ -251,8 +265,9 @@ class AdminDashboardView(APIView):
     @extend_schema(
         description=(
             "Dashboard comercial. Venda positiva exige pagamento PAID e pedido "
-            "DELIVERED; reembolsos subtraem CustomerOrder.total_amount. A competência "
-            "é payment.paid_at em America/Sao_Paulo."
+            "DELIVERED. A receita bruta inclui pedidos entregues e reembolsados, "
+            "que os reembolsos subtraem. A competência é payment.paid_at em "
+            "America/Sao_Paulo."
         ),
         parameters=METRIC_PARAMETERS,
         responses={
@@ -300,7 +315,7 @@ class AdminDashboardView(APIView):
         sales = positive_sales(orders)
         refunded = refunds(orders)
 
-        gross_revenue = sales.aggregate(total=Sum("total_amount"))["total"] or Decimal(
+        gross_revenue = orders.aggregate(total=Sum("total_amount"))["total"] or Decimal(
             "0"
         )
         refunded_revenue = refunded.aggregate(total=Sum("total_amount"))[
@@ -337,13 +352,17 @@ class AdminDashboardView(APIView):
             if granularity == "month"
             else TruncDay("payment__paid_at", tzinfo=METRICS_TIMEZONE)
         )
-        positive_points = {
-            row["bucket"]: row
+        gross_points = {
+            row["bucket"]: row["revenue"]
+            for row in orders.annotate(bucket=trunc)
+            .values("bucket")
+            .annotate(revenue=Sum("total_amount"))
+        }
+        sales_points = {
+            row["bucket"]: row["total_orders"]
             for row in sales.annotate(bucket=trunc)
             .values("bucket")
-            .annotate(
-                total_orders=Count("id", distinct=True), revenue=Sum("total_amount")
-            )
+            .annotate(total_orders=Count("id", distinct=True))
         }
         refund_points = {
             row["bucket"]: row["revenue"]
@@ -352,15 +371,14 @@ class AdminDashboardView(APIView):
             .annotate(revenue=Sum("total_amount"))
         }
         series = []
-        for bucket in sorted(set(positive_points) | set(refund_points)):
-            positive = positive_points.get(bucket, {})
-            net = (positive.get("revenue") or Decimal("0")) - (
+        for bucket in sorted(gross_points):
+            net = (gross_points.get(bucket) or Decimal("0")) - (
                 refund_points.get(bucket) or Decimal("0")
             )
             series.append(
                 {
                     "period": bucket.date().isoformat(),
-                    "total_orders": positive.get("total_orders", 0),
+                    "total_orders": sales_points.get(bucket, 0),
                     "total_revenue": f"{net:.2f}",
                 }
             )
@@ -417,9 +435,9 @@ class DashboardDrillDownView(APIView):
     @extend_schema(
         description=(
             "all mantém a lista comercial anterior e seus filtros customer/search. "
-            "valid_sales/gross_revenue usam vendas DELIVERED + PAID; refunds "
-            "usa pagamentos REFUNDED; net_revenue/average_ticket incluem ambos "
-            "os conjuntos que compõem o numerador. status requer status e usa "
+            "valid_sales usa vendas DELIVERED + PAID; refunds usa pedidos "
+            "DELIVERED com pagamento REFUNDED; gross_revenue, net_revenue e "
+            "average_ticket incluem ambos os conjuntos que compõem o numerador. status requer status e usa "
             "CustomerOrder.created_at, incluindo pedidos sem pagamento. "
             "payment_method requer payment_method e usa apenas vendas válidas. "
             "product_units/product_revenue requerem product_id; "
@@ -521,9 +539,9 @@ class UserOrderListView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        qs = (
+        qs = with_refund_status(
             CustomerOrder.objects.filter(user=request.user)
-            .select_related("user")
+            .select_related("user", "payment")
             .order_by("-created_at")
         )
         data = DashboardRecentOrderSerializer(qs, many=True).data
@@ -538,6 +556,7 @@ class UserOrderDetailView(APIView):
 
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(responses={200: CustomerOrderDetailSerializer})
     def get(self, request, order_id):
         try:
             order = (
@@ -548,7 +567,9 @@ class UserOrderDetailView(APIView):
         except CustomerOrder.DoesNotExist:
             return Response({"message": "Pedido não encontrado."}, status=404)
         release_if_expired(order)
-        return Response(OrderDetailSerializer(order).data, status=status.HTTP_200_OK)
+        return Response(
+            CustomerOrderDetailSerializer(order).data, status=status.HTTP_200_OK
+        )
 
 
 class AdminOrderListView(APIView):
@@ -567,14 +588,32 @@ class AdminOrderListView(APIView):
                 description="Filtra pedidos pelo status (ex: PAID, SHIPPED)",
                 location=OpenApiParameter.QUERY,
             ),
+            OpenApiParameter(
+                name="refund_status",
+                type=OpenApiTypes.STR,
+                enum=RefundStatus.values,
+                description="Filtra pelo status do reembolso mais recente do pedido",
+                location=OpenApiParameter.QUERY,
+            ),
         ],
         responses={200: DashboardRecentOrderSerializer(many=True)},
     )
     def get(self, request):
         status_q = request.query_params.get("status")
-        qs = CustomerOrder.objects.select_related("user").order_by("-created_at")
+        refund_status_q = request.query_params.get("refund_status")
+        qs = with_refund_status(
+            CustomerOrder.objects.select_related("user", "payment").order_by(
+                "-created_at"
+            )
+        )
         if status_q:
             qs = qs.filter(status=status_q)
+        if refund_status_q:
+            if refund_status_q not in RefundStatus.values:
+                raise ValidationError(
+                    {"refund_status": "Status de reembolso inválido."}
+                )
+            qs = qs.filter(refund_status=refund_status_q)
 
         data = DashboardRecentOrderSerializer(qs, many=True).data
         return Response(data, status=status.HTTP_200_OK)
@@ -801,7 +840,10 @@ class AdminOrderDetailView(APIView):
             ):
                 return Response(
                     {
-                        "message": "Não é possível cancelar um pedido com pagamento confirmado."
+                        "message": (
+                            "Não é possível cancelar um pedido com pagamento "
+                            "confirmado. Use o fluxo de reembolso."
+                        )
                     },
                     status=status.HTTP_400_BAD_REQUEST,
                 )
@@ -812,16 +854,6 @@ class AdminOrderDetailView(APIView):
         ):
             return Response(
                 {"message": "Tracking code obrigatório ao enviar pedido."}, status=400
-            )
-
-        if serializer.validated_data.get("physical_return_confirmed") and not (
-            order.status in (OrderStatus.SHIPPED, OrderStatus.DELIVERED)
-            or order.status_logs.filter(
-                new_status__in=[OrderStatus.SHIPPED, OrderStatus.DELIVERED]
-            ).exists()
-        ):
-            return Response(
-                {"message": "Retorno físico exige expedição anterior."}, status=400
             )
 
         if order.status == OrderStatus.SHIPPED and status_value == OrderStatus.SHIPPED:
@@ -849,10 +881,138 @@ class AdminOrderDetailView(APIView):
                 order.payment.status = PaymentStatus.FAILED
                 order.payment.save()
 
-        if serializer.validated_data.get("physical_return_confirmed"):
-            restore_order_stock(order, changed_by=request.user, physical_return=True)
-
         return Response(OrderDetailSerializer(order).data, status=status.HTTP_200_OK)
+
+
+def _order_for_detail(order_id):
+    return (
+        CustomerOrder.objects.select_related("user", "address", "payment")
+        .prefetch_related("items__variation__product")
+        .get(id=order_id)
+    )
+
+
+REFUND_ERROR_RESPONSES = {
+    400: OpenApiResponse(description="Dados inválidos ou reembolso não permitido."),
+    404: OpenApiResponse(description="Pedido não encontrado."),
+    409: OpenApiResponse(description="Conflito com o reembolso atual do pedido."),
+}
+
+
+class UserRefundRequestView(APIView):
+    """
+    POST /api/orders/my-orders/<order_id>/refund-request/
+    O cliente solicita o reembolso integral do próprio pedido.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        summary="Solicitar reembolso",
+        description=(
+            "Permitido com pagamento confirmado: antes do envio, para pedido "
+            "cancelado após o pagamento ou até o fim do 7º dia após a entrega "
+            "(America/Sao_Paulo). Erros de regra respondem "
+            '`{"message": "...", "code": "..."}`; os códigos são os de '
+            "`refund_eligibility.code`."
+        ),
+        request=RefundRequestSerializer,
+        responses={201: CustomerOrderDetailSerializer, **REFUND_ERROR_RESPONSES},
+    )
+    def post(self, request, order_id):
+        order = CustomerOrder.objects.filter(id=order_id, user=request.user).first()
+        if order is None:
+            return Response({"message": "Pedido não encontrado."}, status=404)
+        serializer = RefundRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        request_refund(order, request.user, **serializer.validated_data)
+        return Response(
+            CustomerOrderDetailSerializer(_order_for_detail(order.pk)).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class AdminRefundApproveView(APIView):
+    """
+    POST /api/orders/admin/<order_id>/refund/approve/
+    Aprova o pedido de reembolso; pedido pago e não enviado é cancelado.
+    """
+
+    permission_classes = [CanManageOrders]
+
+    @extend_schema(
+        summary="Aprovar pedido de reembolso",
+        request=RefundApproveSerializer,
+        responses={200: OrderDetailSerializer, **REFUND_ERROR_RESPONSES},
+    )
+    def post(self, request, order_id):
+        order = CustomerOrder.objects.filter(id=order_id).first()
+        if order is None:
+            return Response({"message": "Pedido não encontrado."}, status=404)
+        serializer = RefundApproveSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        approve_refund(order, request.user, serializer.validated_data["message"])
+        return Response(OrderDetailSerializer(_order_for_detail(order.pk)).data)
+
+
+class AdminRefundRejectView(APIView):
+    """
+    POST /api/orders/admin/<order_id>/refund/reject/
+    Recusa o pedido de reembolso com justificativa visível ao cliente.
+    """
+
+    permission_classes = [CanManageOrders]
+
+    @extend_schema(
+        summary="Recusar pedido de reembolso",
+        request=RefundRejectSerializer,
+        responses={200: OrderDetailSerializer, **REFUND_ERROR_RESPONSES},
+    )
+    def post(self, request, order_id):
+        order = CustomerOrder.objects.filter(id=order_id).first()
+        if order is None:
+            return Response({"message": "Pedido não encontrado."}, status=404)
+        serializer = RefundRejectSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        reject_refund(order, request.user, serializer.validated_data["message"])
+        return Response(OrderDetailSerializer(_order_for_detail(order.pk)).data)
+
+
+class AdminRefundView(APIView):
+    """
+    POST /api/orders/admin/<order_id>/refund/
+    Registra o estorno já feito no painel da InfinitePay.
+    """
+
+    permission_classes = [CanManageOrders]
+
+    @extend_schema(
+        summary="Registrar estorno",
+        description=(
+            "Conclui o reembolso solicitado ou aprovado do pedido; sem nenhum, "
+            "cria um registro direto e exige `reason`. O estorno deve ter sido "
+            "feito antes no painel da InfinitePay: este endpoint não movimenta "
+            "dinheiro. `items_returned` é obrigatório para pedido SHIPPED e "
+            "opcional para DELIVERED; nos demais status é ignorado."
+        ),
+        request=RefundCompleteSerializer,
+        responses={
+            200: OrderDetailSerializer,
+            201: OrderDetailSerializer,
+            **REFUND_ERROR_RESPONSES,
+        },
+    )
+    def post(self, request, order_id):
+        order = CustomerOrder.objects.filter(id=order_id).first()
+        if order is None:
+            return Response({"message": "Pedido não encontrado."}, status=404)
+        serializer = RefundCompleteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        _, created = complete_refund(order, request.user, **serializer.validated_data)
+        return Response(
+            OrderDetailSerializer(_order_for_detail(order.pk)).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
 
 
 class CheckoutCalculationView(APIView):
@@ -1206,6 +1366,13 @@ class OrderDispatchView(APIView):
                         "Pedido sem pagamento confirmado não pode ser despachado."
                     )
                 },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Antes dos Correios: a etiqueta é gerada antes de update_status.
+        if has_pending_refund_request(order):
+            return Response(
+                {"message": PENDING_REFUND_SHIPPING_MESSAGE},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 

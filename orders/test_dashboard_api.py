@@ -189,7 +189,6 @@ class DashboardApiTests(TestCase):
         self.add_item(selected, selected_variation, quantity=2, price="10.00")
         self.add_item(selected, None, price="5.00")
         refunded = self.create_order(
-            status=OrderStatus.CANCELED,
             payment_status=PaymentStatus.REFUNDED,
             total="30.00",
         )

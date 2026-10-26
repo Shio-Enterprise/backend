@@ -2126,10 +2126,10 @@ class AdminDashboardViewTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         summary = response.json()["sales_summary"]
         self.assertEqual(summary["total_orders"], 1)
-        self.assertEqual(Decimal(summary["gross_revenue"]), Decimal("110.00"))
+        self.assertEqual(Decimal(summary["gross_revenue"]), Decimal("150.00"))
         self.assertEqual(Decimal(summary["refunds"]), Decimal("40.00"))
-        self.assertEqual(Decimal(summary["total_revenue"]), Decimal("70.00"))
-        self.assertEqual(Decimal(summary["average_ticket"]), Decimal("70.00"))
+        self.assertEqual(Decimal(summary["total_revenue"]), Decimal("110.00"))
+        self.assertEqual(Decimal(summary["average_ticket"]), Decimal("110.00"))
 
     def test_periodo_padrao_e_serie_sao_definidos_no_backend(self):
         self.create_metric_order(OrderStatus.DELIVERED, PaymentStatus.PAID, "75.00")

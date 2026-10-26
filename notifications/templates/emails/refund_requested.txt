@@ -1,0 +1,12 @@
+{% extends "emails/base.txt" %}
+
+{% block content %}
+Olá, {{ nome|default:"cliente" }}!
+
+Recebemos seu pedido de reembolso de {{ valor }} referente ao pedido {{ pedido }}.
+
+A loja vai analisar a solicitação e você receberá um e-mail com a resposta. Se for aprovada, enviaremos as próximas instruções.
+
+Acompanhe pelo detalhe do pedido:
+{{ pedido_url }}
+{% endblock %}

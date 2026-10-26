@@ -1,0 +1,11 @@
+{% extends "emails/base.html" %}
+
+{% block content %}
+<p style="margin:0 0 16px;">Novo pedido de reembolso.</p>
+<p style="margin:0 0 16px;"><strong>Pedido:</strong> {{ pedido }}<br>
+<strong>Cliente:</strong> {{ nome }}<br>
+<strong>Valor:</strong> {{ valor }}<br>
+<strong>Motivo:</strong> {{ motivo }}{% if comentario %}<br>
+<strong>Comentário do cliente:</strong> {{ comentario|linebreaksbr }}{% endif %}</p>
+<p style="margin:24px 0;"><a href="{{ pedido_url }}" style="display:inline-block;background-color:#000000;color:#ffffff;padding:12px 24px;text-decoration:none;font-weight:700;">Analisar no painel</a></p>
+{% endblock %}

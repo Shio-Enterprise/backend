@@ -1,0 +1,8 @@
+{% extends "emails/base.html" %}
+
+{% block content %}
+<p style="margin:0 0 16px;">Olá, {{ nome|default:"cliente" }}!</p>
+<p style="margin:0 0 16px;">O estorno de <strong>{{ valor }}</strong> referente ao pedido <strong>{{ pedido }}</strong> foi feito em {{ refund.refunded_at|date:"d/m/Y" }}.</p>
+<p style="margin:0 0 16px;">O valor volta pelo mesmo meio de pagamento usado na compra. O prazo para aparecer depende do seu banco ou da operadora do cartão.</p>
+<p style="margin:24px 0;"><a href="{{ pedido_url }}" style="display:inline-block;background-color:#000000;color:#ffffff;padding:12px 24px;text-decoration:none;font-weight:700;">Ver pedido</a></p>
+{% endblock %}
