@@ -1,0 +1,15 @@
+{% extends "emails/base.txt" %}
+
+{% block content %}
+Olá, {{ nome|default:"cliente" }}!
+
+Seu pedido de reembolso de {{ valor }} referente ao pedido {{ pedido }} foi aprovado.
+{% if refund.review_message %}
+Mensagem da loja:
+{{ refund.review_message }}
+{% endif %}
+Você receberá outro e-mail quando o estorno for feito.
+
+Acompanhe pelo detalhe do pedido:
+{{ pedido_url }}
+{% endblock %}
