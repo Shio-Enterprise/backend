@@ -31,6 +31,7 @@ DEBUG = False
 
 
 INSTALLED_APPS = [
+    "core",
     "django.contrib.contenttypes",
     "django.contrib.auth",
     "django.contrib.sessions",
@@ -59,6 +60,7 @@ AUTH_USER_MODEL = "authentication.User"
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "core.middleware.RequestIdMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -190,6 +192,30 @@ SIMPLE_JWT = {
 
 GOOGLE_CLIENT_ID = config("GOOGLE_CLIENT_ID")
 
+REDIS_URL = config("REDIS_URL", default="")
+CACHES = {
+    "default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"},
+    "correios": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        "LOCATION": "correios-local",
+    },
+}
+if REDIS_URL:
+    from redis.backoff import NoBackoff
+    from redis.retry import Retry
+
+    CACHES["correios"] = {
+        "BACKEND": "django.core.cache.backends.redis.RedisCache",
+        "LOCATION": REDIS_URL,
+        "KEY_PREFIX": "shio:correios",
+        "OPTIONS": {
+            "socket_connect_timeout": 2,
+            "socket_timeout": 2,
+            "max_connections": 5,
+            "retry": Retry(NoBackoff(), 0),
+        },
+    }
+
 INFINITEPAY_HANDLE = config("INFINITEPAY_HANDLE", default="")
 INFINITEPAY_RETURN_URL = config(
     "INFINITEPAY_RETURN_URL", default="http://localhost:5173/pix"
@@ -209,6 +235,10 @@ STOCK_RESERVATION_GRACE_SECONDS = config(
 RESERVATION_SWEEP_INTERVAL_SECONDS = config(
     "RESERVATION_SWEEP_INTERVAL_SECONDS", default=60, cast=int
 )
+# Pausa entre e-mails de uma campanha (limite de requisições da API de e-mail).
+MARKETING_EMAIL_INTERVAL_SECONDS = config(
+    "MARKETING_EMAIL_INTERVAL_SECONDS", default=0.6, cast=float
+)
 SHIPPING_QUOTE_TTL_SECONDS = config("SHIPPING_QUOTE_TTL_SECONDS", default=900, cast=int)
 CHECKOUT_PROCESSING_TIMEOUT_SECONDS = config(
     "CHECKOUT_PROCESSING_TIMEOUT_SECONDS", default=60, cast=int
@@ -225,6 +255,10 @@ CORREIOS_CARTAO_POSTAGEM = config("CORREIOS_CARTAO_POSTAGEM", default="")
 
 CORREIOS_CODIGO_SERVICO = config("CORREIOS_CODIGO_SERVICO", default="03220")
 CORREIOS_PESO_PADRAO_GRAMAS = config("CORREIOS_PESO_PADRAO_GRAMAS", default="300")
+CORREIOS_COMPRIMENTO_CM = config("CORREIOS_COMPRIMENTO_CM", default="20")
+CORREIOS_LARGURA_CM = config("CORREIOS_LARGURA_CM", default="20")
+CORREIOS_ALTURA_CM = config("CORREIOS_ALTURA_CM", default="20")
+SHIPPING_POLICY_VERSION = config("SHIPPING_POLICY_VERSION", default="1")
 CORREIOS_REMETENTE_NOME = config("CORREIOS_REMETENTE_NOME", default="")
 CORREIOS_REMETENTE_EMAIL = config("CORREIOS_REMETENTE_EMAIL", default="")
 CORREIOS_REMETENTE_CPF_CNPJ = config("CORREIOS_REMETENTE_CPF_CNPJ", default="")
@@ -246,6 +280,7 @@ DEFAULT_FROM_EMAIL = config(
 )
 
 CORS_ALLOW_CREDENTIALS = True
+CORS_EXPOSE_HEADERS = ["Retry-After", "X-Request-ID"]
 
 CORS_ALLOW_HEADERS = [
     "accept",
@@ -371,5 +406,8 @@ SPECTACULAR_SETTINGS = {
         "RefundReasonEnum": "orders.models.RefundReason",
     },
 }
+
+# Avisos "Avise-me quando chegar": rodam em thread; nos testes, inline.
+STOCK_ALERTS_RUN_INLINE = False
 
 FRONTEND_URL = config("FRONTEND_URL", default="http://localhost:5173")

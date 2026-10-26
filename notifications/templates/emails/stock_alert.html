@@ -1,0 +1,16 @@
+{% extends "emails/base.html" %}
+
+{% block content %}
+<p>Olá, {{ nome|default:"usuário" }}!</p>
+
+<p><strong>Chegou!</strong> {{ produto }} ({{ tamanho }}) voltou ao estoque.</p>
+
+<p style="text-align: center; margin: 30px 0;">
+    <a href="{{ product_url }}" style="background-color: #000000; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 4px; display: inline-block; font-weight: bold;">Ver produto</a>
+</p>
+
+<p>Ou copie e cole o link a seguir no seu navegador:</p>
+<p style="word-break: break-all; color: #666;"><a href="{{ product_url }}">{{ product_url }}</a></p>
+
+<p>Atenção: não há reserva. Quem comprar primeiro leva.</p>
+{% endblock %}

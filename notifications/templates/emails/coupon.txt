@@ -1,0 +1,18 @@
+{% extends "emails/base.txt" %}
+
+{% block content %}
+{% if nome %}Olá, {{ nome }}!{% else %}Olá!{% endif %}
+
+Separamos um cupom para você usar na Shio.
+{% if mensagem %}
+{{ mensagem }}
+{% endif %}
+Seu cupom: {{ codigo }}
+{% if condicoes %}
+Condições:
+{% for linha in condicoes %}- {{ linha }}
+{% endfor %}{% endif %}
+Ir para a loja: {{ loja_url }}
+
+Não quero receber promoções: {{ unsubscribe_url }}
+{% endblock %}

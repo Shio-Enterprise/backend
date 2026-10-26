@@ -7,17 +7,10 @@ export DJANGO_SETTINGS_MODULE="${SETTINGS_FILE_PATH:-core.settings.dev}"
 echo "Using settings: $DJANGO_SETTINGS_MODULE"
 
 echo 'Waiting for database...'
-until python -c "import psycopg2; psycopg2.connect(host='$DB_HOSTNAME', port='${DB_PORT:-5432}', dbname='$DB_NAME', user='$DB_USERNAME', password='$DB_PASSWORD')" 2>/dev/null; do
-  echo 'Database unavailable, retrying in 2s...'
-  sleep 2
-done
-echo 'Database ready.'
+python manage.py wait_for_database --timeout "${DB_WAIT_TIMEOUT_SECONDS:-60}" --interval "${DB_WAIT_INTERVAL_SECONDS:-2}"
 
 echo 'Migrating database...'
 python manage.py migrate --noinput
-
-echo 'Creating superuser...'
-python manage.py initadmin || true
 
 if [ "$DEBUG" = "True" ] || [ "$DEBUG" = "true" ] || [ "$DEBUG" = "1" ]; then
     echo "Starting Development Server..."

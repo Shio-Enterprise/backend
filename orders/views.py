@@ -31,6 +31,7 @@ from authentication.permissions import (
     user_has_admin_permission,
 )
 from core.exports import export_data_response
+from notifications.marketing import build_audience
 from products.models import ProductVariation
 
 from .correios import (
@@ -39,6 +40,12 @@ from .correios import (
     CorreiosTrackingUnavailableError,
     dispatch_order_and_get_tracking_code,
     get_order_tracking_data,
+)
+from .coupon_email import (
+    coupon_send_block_reason,
+    render_coupon_preview,
+    send_coupon_campaign,
+    send_coupon_test,
 )
 from .coupons import valid_order_q
 from .dashboard_aggregates import dashboard_detail_aggregates
@@ -80,6 +87,7 @@ from .serializers import (
     CheckoutCalculationSerializer,
     CheckoutInputSerializer,
     CouponAdminSerializer,
+    CouponEmailMessageSerializer,
     CustomerOrderDetailSerializer,
     DashboardDetailSerializer,
     DashboardLowStockSerializer,
@@ -1663,3 +1671,91 @@ class CouponDetailView(APIView):
         else:
             coupon.delete()
             return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class _CouponEmailBaseView(APIView):
+    permission_classes = [IsStaffOrSuperUser]
+
+    def get_coupon(self, uuid):
+        from django.shortcuts import get_object_or_404
+
+        return get_object_or_404(Coupon, pk=uuid)
+
+    def get_message(self, request) -> str:
+        serializer = CouponEmailMessageSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        return serializer.validated_data.get("message", "")
+
+
+class CouponEmailSummaryView(_CouponEmailBaseView):
+    @extend_schema(responses=dict)
+    def get(self, request, uuid):
+        coupon = self.get_coupon(uuid)
+        audience = build_audience(first_purchase_only=coupon.first_purchase_only)
+        history = [
+            {
+                "sent_at": send.sent_at,
+                "sent_by_name": send.sent_by.name if send.sent_by else None,
+                "sent_count": send.sent_count,
+                "failed_count": send.failed_count,
+            }
+            for send in coupon.email_sends.select_related("sent_by")
+        ]
+        return Response(
+            {
+                "block_reason": coupon_send_block_reason(coupon),
+                "audience": {
+                    "total": audience.total,
+                    "buyers": audience.buyers,
+                    "subscribers": audience.subscribers,
+                    "overlap": audience.overlap,
+                    "suppressed": audience.suppressed,
+                },
+                "history": history,
+            }
+        )
+
+
+class CouponEmailPreviewView(_CouponEmailBaseView):
+    @extend_schema(request=CouponEmailMessageSerializer, responses=dict)
+    def post(self, request, uuid):
+        coupon = self.get_coupon(uuid)
+        message = self.get_message(request)
+        return Response({"html": render_coupon_preview(coupon, message)})
+
+
+class CouponEmailTestView(_CouponEmailBaseView):
+    @extend_schema(request=CouponEmailMessageSerializer, responses=dict)
+    def post(self, request, uuid):
+        coupon = self.get_coupon(uuid)
+        message = self.get_message(request)
+        if send_coupon_test(coupon, request.user, message):
+            return Response({"sent": True})
+        return Response(
+            {"error": "Não foi possível enviar o teste."},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
+class CouponEmailSendView(_CouponEmailBaseView):
+    @extend_schema(request=CouponEmailMessageSerializer, responses=dict)
+    def post(self, request, uuid):
+        coupon = self.get_coupon(uuid)
+        message = self.get_message(request)
+        reason = coupon_send_block_reason(coupon)
+        if reason:
+            return Response({"error": reason}, status=status.HTTP_400_BAD_REQUEST)
+        audience = build_audience(first_purchase_only=coupon.first_purchase_only)
+        if audience.total == 0:
+            return Response(
+                {"error": "Ninguém para receber."}, status=status.HTTP_400_BAD_REQUEST
+            )
+        record = send_coupon_campaign(coupon, request.user, message)
+        return Response(
+            {
+                "sent_count": record.sent_count,
+                "failed_count": record.failed_count,
+                "sent_at": record.sent_at,
+            },
+            status=status.HTTP_201_CREATED,
+        )

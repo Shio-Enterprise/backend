@@ -136,6 +136,17 @@ class CustomerCRMExportTests(APITestCase):
         self.assertEqual(bruno_row[4], "R$ 0,00")
         self.assertEqual(bruno_row[6], "Não")
 
+    def test_inscrito_ignora_maiusculas_do_email_do_usuario(self):
+        maius = User.objects.create_user(email="Caio@Example.com", name="Caio")
+        UserProfile.objects.create(user=maius, role=UserRole.CUSTOMER)
+        NewsletterSubscriber.objects.create(email="caio@example.com", consent_lgpd=True)
+        self.client.force_authenticate(self.admin)
+        response = self.client.get(f"{self.url}?search=caio&file_format=csv")
+        content = response.content.decode("utf-8-sig")
+        lines = list(csv.reader(io.StringIO(content), delimiter=";"))
+        row = next(r for r in lines[1:] if "caio@example.com" in r[1].lower())
+        self.assertEqual(row[6], "Sim")
+
     def test_export_xlsx_format(self):
         self.client.force_authenticate(self.admin)
         response = self.client.get(f"{self.url}?file_format=xlsx")

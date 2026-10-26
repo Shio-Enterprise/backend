@@ -15,6 +15,10 @@ from .views import (
     CheckoutAPIView,
     CheckoutCalculationView,
     CouponDetailView,
+    CouponEmailPreviewView,
+    CouponEmailSendView,
+    CouponEmailSummaryView,
+    CouponEmailTestView,
     CouponListCreateView,
     DashboardDetailView,
     DashboardDrillDownView,
@@ -36,6 +40,26 @@ urlpatterns = [
         "admin/coupons/<uuid:uuid>/",
         CouponDetailView.as_view(),
         name="admin-coupons-detail",
+    ),
+    path(
+        "admin/coupons/<uuid:uuid>/email/",
+        CouponEmailSummaryView.as_view(),
+        name="admin-coupon-email",
+    ),
+    path(
+        "admin/coupons/<uuid:uuid>/email/preview/",
+        CouponEmailPreviewView.as_view(),
+        name="admin-coupon-email-preview",
+    ),
+    path(
+        "admin/coupons/<uuid:uuid>/email/test/",
+        CouponEmailTestView.as_view(),
+        name="admin-coupon-email-test",
+    ),
+    path(
+        "admin/coupons/<uuid:uuid>/email/send/",
+        CouponEmailSendView.as_view(),
+        name="admin-coupon-email-send",
     ),
     path(
         "infinitepay/webhook/",
