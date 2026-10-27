@@ -455,3 +455,139 @@ class Refund(models.Model):
 
     def __str__(self):
         return f"Refund(order={self.order_id}, status={self.status})"
+
+
+class ExchangeStatus(models.TextChoices):
+    REQUESTED = "REQUESTED", "Solicitada"
+    APPROVED = "APPROVED", "Aprovada"
+    RECEIVED = "RECEIVED", "Recebida"
+    COMPLETED = "COMPLETED", "Concluída"
+    REJECTED = "REJECTED", "Recusada"
+    CANCELED = "CANCELED", "Cancelada"
+
+
+# Trocas que ainda seguram itens do pedido (e travam o reembolso).
+EXCHANGE_OPEN_STATUSES = (
+    ExchangeStatus.REQUESTED,
+    ExchangeStatus.APPROVED,
+    ExchangeStatus.RECEIVED,
+)
+
+
+class ExchangeReason(models.TextChoices):
+    SIZE_OR_COLOR = "SIZE_OR_COLOR", "Tamanho ou cor"
+    DEFECT = "DEFECT", "Defeito"
+
+
+class ExchangeItemCondition(models.TextChoices):
+    RESTOCK = "RESTOCK", "Volta ao estoque"
+    LOSS = "LOSS", "Perda/avaria"
+
+
+class ExchangeRequest(models.Model):
+    """Troca de itens de um pedido entregue por outra variação do mesmo produto.
+
+    As variações de um produto têm o mesmo preço: a troca não movimenta dinheiro.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    order = models.ForeignKey(
+        CustomerOrder, on_delete=models.PROTECT, related_name="exchanges"
+    )
+    status = models.CharField(max_length=20, choices=ExchangeStatus.choices)
+    reason = models.CharField(max_length=20, choices=ExchangeReason.choices)
+    customer_comment = models.CharField(max_length=1000, blank=True)
+    # Visível ao cliente: instruções de envio, recusa ou cancelamento.
+    review_message = models.TextField(blank=True)
+    internal_note = models.TextField(blank=True)
+    tracking_code = models.CharField(max_length=100, blank=True)
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    received_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    completed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    canceled_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    received_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    canceled_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            # Recusadas, canceladas e concluídas ficam no histórico.
+            models.UniqueConstraint(
+                fields=["order"],
+                condition=models.Q(status__in=EXCHANGE_OPEN_STATUSES),
+                name="exchange_one_open_per_order",
+            ),
+            models.CheckConstraint(
+                check=~models.Q(status=ExchangeStatus.COMPLETED)
+                | ~models.Q(tracking_code=""),
+                name="exchange_completed_has_tracking",
+            ),
+        ]
+
+    def __str__(self):
+        return f"ExchangeRequest(order={self.order_id}, status={self.status})"
+
+
+class ExchangeItem(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    exchange = models.ForeignKey(
+        ExchangeRequest, on_delete=models.CASCADE, related_name="items"
+    )
+    order_item = models.ForeignKey(
+        OrderItem, on_delete=models.PROTECT, related_name="exchange_items"
+    )
+    replacement_variation = models.ForeignKey(
+        "products.ProductVariation", on_delete=models.PROTECT, related_name="+"
+    )
+    quantity = models.PositiveIntegerField()
+    # Preenchida ao receber a peça devolvida.
+    condition = models.CharField(
+        max_length=10, choices=ExchangeItemCondition.choices, blank=True
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["exchange", "order_item"], name="exchange_item_unique"
+            ),
+            models.CheckConstraint(
+                check=models.Q(quantity__gt=0), name="exchange_item_quantity_positive"
+            ),
+        ]
+
+    def __str__(self):
+        return f"ExchangeItem(item={self.order_item_id}, qty={self.quantity})"
