@@ -16,7 +16,7 @@ def make_drop(slug="drop-teste", launch_date=None, **kwargs):
         "name": "Drop Teste",
         "is_public": True,
         "is_active": True,
-        "launch_date": timezone.now() + timedelta(days=7),
+        "launch_date": launch_date if launch_date is not None else (timezone.now() + timedelta(days=7)),
     }
     defaults.update(kwargs)
     return DropCampaign.objects.create(slug=slug, **defaults)
