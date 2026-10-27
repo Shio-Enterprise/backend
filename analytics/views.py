@@ -206,14 +206,18 @@ class SharedProductInterestView(APIView):
         ),
         parameters=CALENDAR_PARAMETERS,
         responses={
-            200: OpenApiResponse(description="Produtos e as contas reunidas em cada um."),
+            200: OpenApiResponse(
+                description="Produtos e as contas reunidas em cada um."
+            ),
             400: OpenApiResponse(description="Período inválido."),
             403: OpenApiResponse(description="Apenas administradores."),
         },
     )
     def get(self, request):
         period_name, year, month = _selection(request)
-        return Response({"products": build_shared_interest(period_name, year=year, month=month)})
+        return Response(
+            {"products": build_shared_interest(period_name, year=year, month=month)}
+        )
 
 
 class ProductSearchView(APIView):
@@ -290,7 +294,9 @@ class UserProductAccessView(APIView):
     def get(self, request, user_id):
         user = get_object_or_404(User, pk=user_id)
         period_name, year, month = _selection(request)
-        return Response({"products": build_user_products(user, period_name, year=year, month=month)})
+        return Response(
+            {"products": build_user_products(user, period_name, year=year, month=month)}
+        )
 
 
 class SiteEventTimelineSerializer(serializers.ModelSerializer):
@@ -355,7 +361,9 @@ class UserSiteEventTimelineView(generics.ListAPIView):
         period_name, year, month = _selection(self.request)
         start, end, _group_by = resolve_period(period_name, year=year, month=month)
         return (
-            SiteEvent.objects.filter(user=user, occurred_at__gte=start, occurred_at__lte=end)
+            SiteEvent.objects.filter(
+                user=user, occurred_at__gte=start, occurred_at__lte=end
+            )
             .select_related("product", "variation")
             .order_by("-occurred_at")
         )

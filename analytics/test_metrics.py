@@ -36,7 +36,9 @@ class SiteEventMetricsTests(APITestCase):
         )
 
     def _event(self, days_ago, event_type=SiteEventType.PAGE_VIEW, **kwargs):
-        occurred_at = kwargs.pop("occurred_at", timezone.now() - timedelta(days=days_ago))
+        occurred_at = kwargs.pop(
+            "occurred_at", timezone.now() - timedelta(days=days_ago)
+        )
         return SiteEvent.objects.create(
             event_type=event_type,
             occurred_at=occurred_at,
@@ -194,7 +196,9 @@ class SiteEventMetricsTests(APITestCase):
             product=self.product,
             anonymous_id="sem-conta",
         )
-        sozinho = Product.objects.create(name="Camiseta", description="x", base_price=80)
+        sozinho = Product.objects.create(
+            name="Camiseta", description="x", base_price=80
+        )
         self._event(
             days_ago=1,
             event_type=SiteEventType.PRODUCT_VIEW,
@@ -252,7 +256,9 @@ class SiteEventMetricsTests(APITestCase):
         )
         self.client.force_authenticate(user=self.admin)
 
-        response = self.client.get(f"/api/analytics/products/{self.product.pk}/accesses/")
+        response = self.client.get(
+            f"/api/analytics/products/{self.product.pk}/accesses/"
+        )
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         data = response.json()
@@ -360,7 +366,9 @@ class SiteEventMetricsTests(APITestCase):
         data = response.json()
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(data["group_by"], "day")
-        self.assertEqual(len(data["series"]), monthrange(previous.year, previous.month)[1])
+        self.assertEqual(
+            len(data["series"]), monthrange(previous.year, previous.month)[1]
+        )
         self.assertEqual(data["series"][0]["date"], previous.replace(day=1).isoformat())
         self.assertEqual(sum(point["total"] for point in data["series"]), 1)
 

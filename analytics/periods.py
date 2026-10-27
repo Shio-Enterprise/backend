@@ -29,7 +29,9 @@ def resolve_period(period_name, *, year=None, month=None):
 
     if year is None and month is None:
         start_date = today - timedelta(days=config["days"] - 1)
-        start = datetime.combine(start_date, datetime.min.time(), tzinfo=BUSINESS_TIMEZONE)
+        start = datetime.combine(
+            start_date, datetime.min.time(), tzinfo=BUSINESS_TIMEZONE
+        )
         return start, timezone.now(), config["group_by"]
 
     if year is None or year < today.year - 20 or year > today.year:
