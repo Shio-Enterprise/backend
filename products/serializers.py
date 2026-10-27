@@ -20,6 +20,7 @@ from .models import (
     Product,
     ProductImage,
     ProductVariation,
+    SizeGuide,
     StockAlert,
     StockMovement,
     Wishlist,
@@ -601,6 +602,13 @@ class StockAlertPendingVariationsSerializer(serializers.Serializer):
     variation_ids = serializers.ListField(child=serializers.UUIDField())
 
 
+class SizeGuideSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SizeGuide
+        fields = ["id", "name", "columns", "rows"]
+        read_only_fields = fields
+
+
 class ProductDetailSerializer(ProductPricingSerializer):
     """Detalhe completo com variations, images e relações expandidas."""
 
@@ -608,6 +616,9 @@ class ProductDetailSerializer(ProductPricingSerializer):
     images = ProductImageSerializer(many=True, read_only=True)
     category = CategoryNestedSerializer(read_only=True)
     drop = DropNestedSerializer(read_only=True)
+    size_guide = SizeGuideSerializer(
+        source="category.size_guide", read_only=True, allow_null=True
+    )
     is_sellable = serializers.SerializerMethodField()
 
     class Meta:
@@ -624,6 +635,7 @@ class ProductDetailSerializer(ProductPricingSerializer):
             "rating_count",
             "category",
             "drop",
+            "size_guide",
             "variations",
             "images",
             "created_at",

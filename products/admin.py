@@ -6,6 +6,7 @@ from .models import (
     Product,
     ProductImage,
     ProductVariation,
+    SizeGuide,
     StockAlert,
     StockMovement,
 )
@@ -74,7 +75,14 @@ class ProductImageAdmin(admin.ModelAdmin):
 
 @admin.register(Category)
 class CategoryAdmin(admin.ModelAdmin):
+    list_display = ("name", "slug", "size_guide")
     prepopulated_fields = {"slug": ("name",)}
+
+
+@admin.register(SizeGuide)
+class SizeGuideAdmin(admin.ModelAdmin):
+    list_display = ("name", "updated_at")
+    search_fields = ("name",)
 
 
 @admin.register(DropCampaign)

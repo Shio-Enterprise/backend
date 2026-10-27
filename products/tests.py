@@ -42,6 +42,7 @@ from .models import (
     Product,
     ProductImage,
     ProductVariation,
+    SizeGuide,
     StockMovement,
 )
 from .serializers import StockMovementSerializer
@@ -2901,3 +2902,83 @@ class InventoryConcurrencyTests(TransactionTestCase):
             ),
             [5, 1],
         )
+
+
+class SizeGuideTests(APITestCase):
+    columns = [{"key": "waist", "label": "Cintura"}]
+    rows = [
+        {"size": "P", "measures": {"waist": [74, 80]}},
+        {"size": "M", "measures": {"waist": [80, 86]}},
+    ]
+
+    def setUp(self):
+        self.guide = SizeGuide.objects.create(
+            name="Teste", columns=self.columns, rows=self.rows
+        )
+
+    def test_detalhe_expoe_guia_da_categoria(self):
+        category = Category.objects.create(
+            name="Calças X", slug="calcas-x", size_guide=self.guide
+        )
+        product = make_product(name="Calça", category=category)
+        body = self.client.get(f"/api/catalog/products/{product.id}/").json()
+        self.assertEqual(body["size_guide"]["name"], "Teste")
+        self.assertEqual(body["size_guide"]["columns"], self.columns)
+        self.assertEqual(body["size_guide"]["rows"], self.rows)
+
+    def test_detalhe_sem_guia_retorna_null(self):
+        product = make_product(name="Meia")
+        body = self.client.get(f"/api/catalog/products/{product.id}/").json()
+        self.assertIsNone(body["size_guide"])
+
+    def test_detalhe_nao_faz_query_extra_pelo_guia(self):
+        category = Category.objects.create(
+            name="Calças Y", slug="calcas-y", size_guide=self.guide
+        )
+        sem_guia = make_product(name="Meia")
+        com_guia = make_product(name="Calça", category=category)
+        with self.assertNumQueries(3):
+            self.client.get(f"/api/catalog/products/{sem_guia.id}/")
+        with self.assertNumQueries(3):
+            self.client.get(f"/api/catalog/products/{com_guia.id}/")
+
+    def test_listagem_nao_inclui_guia(self):
+        category = Category.objects.create(
+            name="Calças Z", slug="calcas-z", size_guide=self.guide
+        )
+        make_stocked_product(name="Calça", category=category)
+        item = self.client.get("/api/catalog/products/").json()["results"][0]
+        self.assertNotIn("size_guide", item)
+
+    def test_validacao_rejeita_faixa_invalida(self):
+        guide = SizeGuide(
+            name="Ruim",
+            columns=self.columns,
+            rows=[{"size": "P", "measures": {"waist": [80, 74]}}],
+        )
+        with self.assertRaises(ModelValidationError):
+            guide.full_clean()
+
+    def test_validacao_rejeita_tamanhos_fora_de_ordem(self):
+        guide = SizeGuide(name="Ruim", columns=self.columns, rows=self.rows[::-1])
+        with self.assertRaises(ModelValidationError):
+            guide.full_clean()
+
+    def test_validacao_rejeita_medida_faltando(self):
+        guide = SizeGuide(
+            name="Ruim",
+            columns=self.columns + [{"key": "hip", "label": "Quadril"}],
+            rows=self.rows,
+        )
+        with self.assertRaises(ModelValidationError):
+            guide.full_clean()
+
+    def test_guias_padrao_semeados_pela_migration(self):
+        self.assertTrue(
+            SizeGuide.objects.filter(name__startswith="Parte de cima").exists()
+        )
+        self.assertTrue(
+            SizeGuide.objects.filter(name__startswith="Parte de baixo").exists()
+        )
+        for guide in SizeGuide.objects.exclude(name="Teste"):
+            guide.full_clean()
