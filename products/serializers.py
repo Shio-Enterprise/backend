@@ -1,6 +1,7 @@
 import re
 from decimal import ROUND_HALF_UP, Decimal
 
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 from django.utils.text import slugify
@@ -24,6 +25,7 @@ from .models import (
     StockAlert,
     StockMovement,
     Wishlist,
+    validate_size_guide_content,
 )
 from .services import create_variation, move_stock, normalize_color, normalize_variation
 
@@ -607,6 +609,75 @@ class SizeGuideSerializer(serializers.ModelSerializer):
         model = SizeGuide
         fields = ["id", "name", "columns", "rows"]
         read_only_fields = fields
+
+
+class SizeGuideAdminSerializer(serializers.ModelSerializer):
+    """Guia de medidas no painel admin, com as categorias que o usam.
+
+    `categories` (ids) define quais categorias usam o guia: as listadas passam a
+    usar este guia (saindo do anterior) e as que ficaram de fora são desligadas.
+    """
+
+    categories = serializers.PrimaryKeyRelatedField(
+        many=True, queryset=Category.objects.all(), required=False
+    )
+    category_details = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SizeGuide
+        fields = [
+            "id",
+            "name",
+            "columns",
+            "rows",
+            "categories",
+            "category_details",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "created_at", "updated_at"]
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["categories"] = [c["id"] for c in data["category_details"]]
+        return data
+
+    @extend_schema_field(CategoryNestedSerializer(many=True))
+    def get_category_details(self, obj):
+        return CategoryNestedSerializer(obj.categories.order_by("name"), many=True).data
+
+    def validate(self, attrs):
+        columns = attrs.get("columns", getattr(self.instance, "columns", None))
+        rows = attrs.get("rows", getattr(self.instance, "rows", None))
+        try:
+            validate_size_guide_content(columns, rows)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(exc.message_dict) from None
+        return attrs
+
+    @transaction.atomic
+    def create(self, validated_data):
+        categories = validated_data.pop("categories", None)
+        guide = super().create(validated_data)
+        self._link_categories(guide, categories)
+        return guide
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        categories = validated_data.pop("categories", None)
+        guide = super().update(instance, validated_data)
+        self._link_categories(guide, categories)
+        return guide
+
+    @staticmethod
+    def _link_categories(guide, categories):
+        if categories is None:
+            return
+        ids = [c.pk for c in categories]
+        Category.objects.filter(size_guide=guide).exclude(pk__in=ids).update(
+            size_guide=None
+        )
+        Category.objects.filter(pk__in=ids).update(size_guide=guide)
 
 
 class ProductDetailSerializer(ProductPricingSerializer):
