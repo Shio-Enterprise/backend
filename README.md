@@ -106,6 +106,19 @@ make expire ARGS=--dry-run   # só lista o que seria liberado
 python manage.py expire_stale_orders --batch-size 200
 ```
 
+## Lista de espera dos drops
+
+Usuários logados entram na lista de espera de um drop (`DropWaitlist`). Quando o drop abre (público, ativo e dentro da janela `launch_date`/`end_date`), cada pessoa da lista recebe um e-mail uma única vez, com o link para `/drop/<slug>`; `notified_at` marca quem já recebeu. Se o envio falhar, a pessoa volta para a fila.
+
+Como o projeto não tem fila de tarefas, o envio roda numa varredura na listagem pública de produtos e na página pública do drop, no máximo uma vez a cada `DROP_WAITLIST_SWEEP_INTERVAL_SECONDS` (padrão 60) por processo, numa thread fora da requisição.
+
+Para enviar sem depender de tráfego (por exemplo, num cron):
+
+```bash
+python manage.py notify_drop_openings            # envia os e-mails pendentes
+python manage.py notify_drop_openings --dry-run  # só lista os drops que seriam avisados
+```
+
 ## Integração com os Correios
 
 As funcionalidades de frete (preço/prazo), consulta de CEP, busca de agências,

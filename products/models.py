@@ -292,6 +292,39 @@ class StockAlert(models.Model):
         return f"{self.user} — {self.variation}"
 
 
+class DropWaitlist(models.Model):
+    """Lista de espera de um drop: avisa o usuário quando o drop abre.
+
+    Só usuário logado entra na lista. `notified_at` é do e-mail de abertura
+    (ver products.drop_waitlist); o aviso no site deve ter campo próprio.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="drop_waitlist_entries",
+    )
+    drop = models.ForeignKey(
+        DropCampaign,
+        on_delete=models.CASCADE,
+        related_name="waitlist_entries",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    notified_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "drop"], name="unique_drop_waitlist_user"
+            )
+        ]
+        ordering = ["created_at", "id"]
+
+    def __str__(self):
+        return f"{self.user} — {self.drop}"
+
+
 class ProductVariation(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     product = models.ForeignKey(

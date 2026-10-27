@@ -53,6 +53,7 @@ from .catalog import (
     filter_catalog,
     recommend_products,
 )
+from .drop_waitlist import sweep_drop_openings
 from .models import (
     Category,
     DropCampaign,
@@ -820,6 +821,7 @@ class PublicDropCampaignView(APIView):
         },
     )
     def get(self, request, slug):
+        sweep_drop_openings()
         drop = get_object_or_404(DropCampaign, slug=slug)
         if not is_drop_visible(drop):
             return Response(
@@ -979,6 +981,7 @@ class ProductListCreateView(APIView):
     def get(self, request):
         # Reserva abandonada esconde o produto (estoque 0) até ser liberada.
         sweep_expired_reservations()
+        sweep_drop_openings()
         # Evita tratar booleano ausente como checkbox HTML desmarcado.
         params = request.query_params.dict()
         if "color" in params:

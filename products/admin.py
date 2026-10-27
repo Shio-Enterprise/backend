@@ -3,6 +3,7 @@ from django.contrib import admin
 from .models import (
     Category,
     DropCampaign,
+    DropWaitlist,
     Product,
     ProductImage,
     ProductVariation,
@@ -129,6 +130,16 @@ class StockMovementAdmin(admin.ModelAdmin):
         return False
 
     def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(DropWaitlist)
+class DropWaitlistAdmin(admin.ModelAdmin):
+    list_display = ("user", "drop", "created_at", "notified_at")
+    list_filter = ("drop",)
+    readonly_fields = ("user", "drop", "created_at", "notified_at")
+
+    def has_add_permission(self, request):
         return False
 
 

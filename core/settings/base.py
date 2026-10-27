@@ -413,4 +413,11 @@ SPECTACULAR_SETTINGS = {
 # Avisos "Avise-me quando chegar": rodam em thread; nos testes, inline.
 STOCK_ALERTS_RUN_INLINE = False
 
+# E-mail de abertura do drop para a lista de espera: varredura nas
+# requisições, no máximo uma por intervalo em cada processo (ou num cron).
+DROP_WAITLIST_SWEEP_INTERVAL_SECONDS = config(
+    "DROP_WAITLIST_SWEEP_INTERVAL_SECONDS", default=60, cast=int
+)
+DROP_WAITLIST_RUN_INLINE = False
+
 FRONTEND_URL = config("FRONTEND_URL", default="http://localhost:5173")
