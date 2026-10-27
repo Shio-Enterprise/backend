@@ -7,6 +7,11 @@ from .views import (
     DropCampaignDetailView,
     DropCampaignListCreateView,
     DropProductManageView,
+    DropWaitlistJoinView,
+    DropWaitlistLeaveView,
+    DropWaitlistMarkSeenView,
+    DropWaitlistMyEntriesView,
+    DropWaitlistUnseenView,
     InventoryExportView,
     ProductDetailView,
     ProductDuplicateView,
@@ -156,4 +161,34 @@ urlpatterns = [
     path("inventory/export/", InventoryExportView.as_view(), name="inventory_export"),
     # GET (admin) - Resumo de stock (legado)
     path("inventory/", inventory_summary, name="inventory_summary"),
+    # GET (autenticado) - Lista entradas do usuário na lista de espera
+    path(
+        "drop-waitlist/",
+        DropWaitlistMyEntriesView.as_view(),
+        name="drop-waitlist-list",
+    ),
+    # GET (autenticado) - Drops abertos não vistos no modal
+    path(
+        "drop-waitlist/unseen/",
+        DropWaitlistUnseenView.as_view(),
+        name="drop-waitlist-unseen",
+    ),
+    # POST (autenticado) - Marcar aviso do drop como visto
+    path(
+        "drop-waitlist/<uuid:pk>/seen/",
+        DropWaitlistMarkSeenView.as_view(),
+        name="drop-waitlist-mark-seen",
+    ),
+    # POST (autenticado) - Entrar na lista de espera
+    path(
+        "drops/<uuid:pk>/waitlist/",
+        DropWaitlistJoinView.as_view(),
+        name="drop-waitlist-join",
+    ),
+    # DELETE (autenticado) - Sair da lista de espera
+    path(
+        "drops/<uuid:pk>/waitlist/delete/",
+        DropWaitlistLeaveView.as_view(),
+        name="drop-waitlist-leave",
+    ),
 ]

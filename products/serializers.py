@@ -17,6 +17,7 @@ from .availability import (
 from .models import (
     Category,
     DropCampaign,
+    DropWaitlist,
     Product,
     ProductImage,
     ProductVariation,
@@ -836,3 +837,36 @@ class ProductDuplicateSerializer(serializers.Serializer):
                 {k: "Campo desconhecido." for k in unknown}
             )
         return super().to_internal_value(data)
+
+
+# ─── Drop Waitlist ────────────────────────────────────────────────────────────
+
+
+class DropWaitlistDropSerializer(serializers.Serializer):
+    """Dados mínimos do drop expostos na entrada da lista de espera."""
+
+    id = serializers.UUIDField()
+    name = serializers.CharField()
+    slug = serializers.SlugField()
+    launch_date = serializers.DateTimeField(allow_null=True)
+
+
+class DropWaitlistSerializer(serializers.ModelSerializer):
+    """Serializa uma entrada da lista de espera do usuário logado."""
+
+    drop = DropWaitlistDropSerializer(read_only=True)
+
+    class Meta:
+        model = DropWaitlist
+        fields = ["id", "drop", "created_at", "notified_at", "seen_at"]
+        read_only_fields = fields
+
+
+class DropWaitlistListSerializer(serializers.Serializer):
+    results = DropWaitlistSerializer(many=True)
+
+
+class DropWaitlistUnseenSerializer(serializers.Serializer):
+    """Drops já abertos que o usuário ainda não viu no modal."""
+
+    results = DropWaitlistSerializer(many=True)
