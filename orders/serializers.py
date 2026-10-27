@@ -10,6 +10,10 @@ from .models import (
     Coupon,
     CouponDiscountType,
     CustomerOrder,
+    ExchangeItem,
+    ExchangeItemCondition,
+    ExchangeReason,
+    ExchangeRequest,
     OrderItem,
     OrderStatus,
     OrderStatusLog,
@@ -28,6 +32,10 @@ class DashboardRecentOrderSerializer(serializers.ModelSerializer):
     payment_status = serializers.CharField(source="payment.status", read_only=True)
     # Anotado por orders.refunds.with_refund_status nas listas de pedidos.
     refund_status = serializers.CharField(read_only=True, allow_null=True, default=None)
+    # Anotado por orders.exchanges.with_exchange_status nas listas de pedidos.
+    exchange_status = serializers.CharField(
+        read_only=True, allow_null=True, default=None
+    )
     revenue_value = serializers.SerializerMethodField()
 
     class Meta:
@@ -39,6 +47,7 @@ class DashboardRecentOrderSerializer(serializers.ModelSerializer):
             "status",
             "payment_status",
             "refund_status",
+            "exchange_status",
             "paid_at",
             "created_at",
             "revenue_value",
@@ -408,6 +417,122 @@ class RefundEligibilitySerializer(serializers.Serializer):
     deadline = serializers.DateTimeField(allow_null=True)
 
 
+class ExchangeVariationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProductVariation
+        fields = ["id", "size", "color", "sku"]
+
+
+class ExchangeItemSerializer(serializers.ModelSerializer):
+    order_item_id = serializers.UUIDField(read_only=True)
+    product_name = serializers.CharField(source="order_item.product_name")
+    variation = ExchangeVariationSerializer(
+        source="order_item.variation", read_only=True, allow_null=True
+    )
+    replacement_variation = ExchangeVariationSerializer(read_only=True)
+    condition_label = serializers.CharField(
+        source="get_condition_display", read_only=True
+    )
+
+    class Meta:
+        model = ExchangeItem
+        fields = [
+            "id",
+            "order_item_id",
+            "product_name",
+            "variation",
+            "replacement_variation",
+            "quantity",
+            "condition",
+            "condition_label",
+        ]
+
+
+class ExchangeSerializer(serializers.ModelSerializer):
+    """Visão administrativa: tudo, inclusive dados internos da troca."""
+
+    status_label = serializers.CharField(source="get_status_display", read_only=True)
+    reason_label = serializers.CharField(source="get_reason_display", read_only=True)
+    items = ExchangeItemSerializer(many=True, read_only=True)
+    requested_by = AdminUserSerializer(read_only=True, allow_null=True)
+    reviewed_by = AdminUserSerializer(read_only=True, allow_null=True)
+    received_by = AdminUserSerializer(read_only=True, allow_null=True)
+    completed_by = AdminUserSerializer(read_only=True, allow_null=True)
+    canceled_by = AdminUserSerializer(read_only=True, allow_null=True)
+
+    class Meta:
+        model = ExchangeRequest
+        fields = [
+            "id",
+            "status",
+            "status_label",
+            "reason",
+            "reason_label",
+            "customer_comment",
+            "review_message",
+            "internal_note",
+            "tracking_code",
+            "items",
+            "requested_by",
+            "reviewed_by",
+            "received_by",
+            "completed_by",
+            "canceled_by",
+            "created_at",
+            "reviewed_at",
+            "received_at",
+            "completed_at",
+            "canceled_at",
+        ]
+
+
+class CustomerExchangeSerializer(serializers.ModelSerializer):
+    status_label = serializers.CharField(source="get_status_display", read_only=True)
+    reason_label = serializers.CharField(source="get_reason_display", read_only=True)
+    items = ExchangeItemSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = ExchangeRequest
+        fields = [
+            "id",
+            "status",
+            "status_label",
+            "reason",
+            "reason_label",
+            "customer_comment",
+            "review_message",
+            "tracking_code",
+            "items",
+            "created_at",
+            "reviewed_at",
+            "received_at",
+            "completed_at",
+            "canceled_at",
+        ]
+
+
+class ExchangeOptionSerializer(serializers.Serializer):
+    variation_id = serializers.UUIDField()
+    size = serializers.CharField()
+    color = serializers.CharField(allow_blank=True)
+    in_stock = serializers.BooleanField()
+
+
+class ExchangeEligibleItemSerializer(serializers.Serializer):
+    order_item_id = serializers.UUIDField()
+    available_quantity = serializers.IntegerField()
+    options = ExchangeOptionSerializer(many=True)
+
+
+class ExchangeEligibilitySerializer(serializers.Serializer):
+    can_request = serializers.BooleanField()
+    code = serializers.CharField(allow_null=True)
+    message = serializers.CharField(allow_null=True)
+    size_or_color_deadline = serializers.DateTimeField(allow_null=True)
+    defect_deadline = serializers.DateTimeField(allow_null=True)
+    items = ExchangeEligibleItemSerializer(many=True)
+
+
 class OrderDetailSerializer(serializers.ModelSerializer):
     """Detalhe administrativo do pedido."""
 
@@ -417,6 +542,15 @@ class OrderDetailSerializer(serializers.ModelSerializer):
     status_logs = serializers.SerializerMethodField()
     refund = serializers.SerializerMethodField()
     refund_serializer_class = RefundSerializer
+    exchanges = serializers.SerializerMethodField()
+    exchange_serializer_class = ExchangeSerializer
+
+    @extend_schema_field(ExchangeSerializer(many=True))
+    def get_exchanges(self, obj):
+        exchanges = obj.exchanges.order_by("-created_at").prefetch_related(
+            "items__order_item__variation", "items__replacement_variation"
+        )
+        return self.exchange_serializer_class(exchanges, many=True).data
 
     @extend_schema_field(RefundSerializer(allow_null=True))
     def get_refund(self, obj):
@@ -459,6 +593,7 @@ class OrderDetailSerializer(serializers.ModelSerializer):
             "payment",
             "status_logs",
             "refund",
+            "exchanges",
         ]
 
 
@@ -466,11 +601,37 @@ class CustomerOrderDetailSerializer(OrderDetailSerializer):
     """Detalhe do cliente: sem dados internos do reembolso."""
 
     refund_serializer_class = CustomerRefundSerializer
+    exchange_serializer_class = CustomerExchangeSerializer
     refund_eligibility = serializers.SerializerMethodField()
+    exchange_eligibility = serializers.SerializerMethodField()
 
     @extend_schema_field(CustomerRefundSerializer(allow_null=True))
     def get_refund(self, obj):
         return super().get_refund(obj)
+
+    @extend_schema_field(CustomerExchangeSerializer(many=True))
+    def get_exchanges(self, obj):
+        return super().get_exchanges(obj)
+
+    @extend_schema_field(ExchangeEligibilitySerializer)
+    def get_exchange_eligibility(self, obj):
+        from .exchanges import (
+            EXCHANGE_ERROR_MESSAGES,
+            exchange_eligibility,
+            exchange_options,
+        )
+
+        eligibility = exchange_eligibility(obj)
+        return ExchangeEligibilitySerializer(
+            {
+                "can_request": eligibility.can_request,
+                "code": eligibility.code,
+                "message": EXCHANGE_ERROR_MESSAGES.get(eligibility.code),
+                "size_or_color_deadline": eligibility.size_or_color_deadline,
+                "defect_deadline": eligibility.defect_deadline,
+                "items": exchange_options(obj) if eligibility.can_request else [],
+            }
+        ).data
 
     @extend_schema_field(RefundEligibilitySerializer)
     def get_refund_eligibility(self, obj):
@@ -487,7 +648,11 @@ class CustomerOrderDetailSerializer(OrderDetailSerializer):
         ).data
 
     class Meta(OrderDetailSerializer.Meta):
-        fields = [*OrderDetailSerializer.Meta.fields, "refund_eligibility"]
+        fields = [
+            *OrderDetailSerializer.Meta.fields,
+            "refund_eligibility",
+            "exchange_eligibility",
+        ]
 
 
 class RefundRequestSerializer(serializers.Serializer):
@@ -531,6 +696,60 @@ class RefundCompleteSerializer(serializers.Serializer):
     reason = serializers.ChoiceField(
         choices=RefundReason.choices, required=False, allow_null=True, default=None
     )
+
+
+class ExchangeRequestItemSerializer(serializers.Serializer):
+    order_item_id = serializers.UUIDField()
+    replacement_variation_id = serializers.UUIDField()
+    quantity = serializers.IntegerField(min_value=1)
+
+
+class ExchangeRequestSerializer(serializers.Serializer):
+    reason = serializers.ChoiceField(choices=ExchangeReason.choices)
+    items = ExchangeRequestItemSerializer(many=True, allow_empty=False)
+    comment = serializers.CharField(
+        max_length=1000, allow_blank=True, required=False, default=""
+    )
+
+    def validate(self, attrs):
+        attrs["comment"] = attrs["comment"].strip()
+        if attrs["reason"] == ExchangeReason.DEFECT and not attrs["comment"]:
+            raise serializers.ValidationError({"comment": "Descreva o defeito."})
+        return attrs
+
+
+class ExchangeApproveSerializer(serializers.Serializer):
+    message = serializers.CharField(
+        max_length=2000, allow_blank=True, required=False, default=""
+    )
+
+
+class ExchangeMessageSerializer(serializers.Serializer):
+    """Recusa e cancelamento: justificativa visível ao cliente."""
+
+    message = serializers.CharField(max_length=2000)
+
+
+class ExchangeReceiveItemSerializer(serializers.Serializer):
+    id = serializers.UUIDField()
+    condition = serializers.ChoiceField(choices=ExchangeItemCondition.choices)
+
+
+class ExchangeReceiveSerializer(serializers.Serializer):
+    items = ExchangeReceiveItemSerializer(many=True, allow_empty=False)
+    internal_note = serializers.CharField(
+        max_length=2000, allow_blank=True, required=False, default=""
+    )
+
+    def validate_items(self, items):
+        ids = [item["id"] for item in items]
+        if len(ids) != len(set(ids)):
+            raise serializers.ValidationError("Cada item só pode aparecer uma vez.")
+        return items
+
+
+class ExchangeCompleteSerializer(serializers.Serializer):
+    tracking_code = serializers.CharField(max_length=100)
 
 
 class OrderStatusUpdateSerializer(serializers.Serializer):

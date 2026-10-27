@@ -108,6 +108,12 @@ def move_stock(
         or order_item.variation_id != variation.pk
     ):
         raise ValidationError({"order_item": "Item incompatível com a origem."})
+    if (
+        origin_type == "EXCHANGE"
+        and order_item
+        and order_item.variation_id != variation.pk
+    ):
+        raise ValidationError({"order_item": "Item incompatível com a origem."})
     if reverses_movement:
         if (
             reverses_movement.variation_id != variation.pk

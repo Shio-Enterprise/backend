@@ -787,7 +787,7 @@ class StockMovementSerializer(StrictSerializer):
     def validate(self, attrs):
         if not attrs.get("note", "").strip():
             raise serializers.ValidationError({"note": "Informe a justificativa."})
-        if attrs.get("reason") in ("VENDA", "ESTOQUE_INICIAL"):
+        if attrs.get("reason") in ("VENDA", "ESTOQUE_INICIAL", "TROCA"):
             raise serializers.ValidationError(
                 {"reason": "Motivo reservado para operações automáticas."}
             )

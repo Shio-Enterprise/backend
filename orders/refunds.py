@@ -25,6 +25,7 @@ from notifications.email import send_email
 from .metrics import METRICS_TIMEZONE
 from .models import (
     CustomerOrder,
+    ExchangeStatus,
     OrderStatus,
     Payment,
     PaymentStatus,
@@ -55,6 +56,7 @@ ACTIVE_STATUSES = (RefundStatus.REQUESTED, RefundStatus.APPROVED)
 REFUND_ERROR_MESSAGES = {
     "refund_in_progress": "Este pedido já tem um reembolso.",
     "refund_rejected": "O pedido de reembolso foi recusado. Fale com a loja.",
+    "exchange_exists": "Este pedido tem uma troca. Fale com a loja.",
     "payment_not_confirmed": (
         "O reembolso fica disponível depois da confirmação do pagamento."
     ),
@@ -65,7 +67,12 @@ REFUND_ERROR_MESSAGES = {
     "deadline_passed": "O prazo de 7 dias após a entrega terminou. Fale com a loja.",
     "no_pending_request": "Não há pedido de reembolso aguardando análise.",
 }
-CONFLICT_CODES = {"refund_in_progress", "refund_rejected", "no_pending_request"}
+CONFLICT_CODES = {
+    "refund_in_progress",
+    "refund_rejected",
+    "exchange_exists",
+    "no_pending_request",
+}
 
 
 class RefundNotAllowed(APIException):
@@ -104,6 +111,16 @@ def withdrawal_deadline(delivered):
     )
 
 
+def has_exchange(order):
+    """Troca em andamento ou concluída impede o reembolso integral.
+
+    Recusadas e canceladas não contam.
+    """
+    return order.exchanges.exclude(
+        status__in=(ExchangeStatus.REJECTED, ExchangeStatus.CANCELED)
+    ).exists()
+
+
 def _payment_or_none(order):
     try:
         return order.payment
@@ -126,6 +143,8 @@ def refund_eligibility(order, now=None):
         return blocked("refund_in_progress")
     if RefundStatus.REJECTED in statuses:
         return blocked("refund_rejected")
+    if has_exchange(order):
+        return blocked("exchange_exists")
     if payment is None or payment.status != PaymentStatus.PAID:
         return blocked("payment_not_confirmed")
     if order.status in (
@@ -263,6 +282,8 @@ def complete_refund(
             raise RefundNotAllowed("refund_in_progress")
         if payment is None or payment.status != PaymentStatus.PAID:
             raise RefundNotAllowed("payment_not_confirmed")
+        if has_exchange(order):
+            raise RefundNotAllowed("exchange_exists")
 
         refund = _active_refund(order)
         created = refund is None

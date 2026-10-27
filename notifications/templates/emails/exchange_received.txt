@@ -1,0 +1,12 @@
+{% extends "emails/base.txt" %}
+
+{% block content %}
+Olá, {{ nome|default:"cliente" }}!
+
+Recebemos a peça da sua troca referente ao pedido {{ pedido }}.
+
+Você receberá outro e-mail com o código de rastreio da nova peça.
+
+Acompanhe pelo detalhe do pedido:
+{{ pedido_url }}
+{% endblock %}

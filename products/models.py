@@ -370,6 +370,7 @@ class StockMovementReason(models.TextChoices):
     AJUSTE = "AJUSTE", "Ajuste"
     PERDA = "PERDA", "Perda/Avaria"
     VENDA = "VENDA", "Venda"
+    TROCA = "TROCA", "Troca"
     OUTRO = "OUTRO", "Outro"
 
 
@@ -411,7 +412,14 @@ class StockMovement(models.Model):
     origin_type = models.CharField(
         max_length=30,
         choices=[
-            (v, v) for v in ("INITIAL_STOCK", "MANUAL_ADJUSTMENT", "ORDER", "LEGACY")
+            (v, v)
+            for v in (
+                "INITIAL_STOCK",
+                "MANUAL_ADJUSTMENT",
+                "ORDER",
+                "EXCHANGE",
+                "LEGACY",
+            )
         ],
     )
     origin_id = models.UUIDField()

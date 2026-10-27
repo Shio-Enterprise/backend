@@ -404,6 +404,9 @@ SPECTACULAR_SETTINGS = {
         # Se tiver outro enum de status dando conflito, adicione aqui embaixo
         "RefundStatusEnum": "orders.models.RefundStatus",
         "RefundReasonEnum": "orders.models.RefundReason",
+        "ExchangeStatusEnum": "orders.models.ExchangeStatus",
+        "ExchangeReasonEnum": "orders.models.ExchangeReason",
+        "ExchangeItemConditionEnum": "orders.models.ExchangeItemCondition",
     },
 }
 

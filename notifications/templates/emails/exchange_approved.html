@@ -1,0 +1,10 @@
+{% extends "emails/base.html" %}
+
+{% block content %}
+<p style="margin:0 0 16px;">Olá, {{ nome|default:"cliente" }}!</p>
+<p style="margin:0 0 16px;">Sua troca referente ao pedido <strong>{{ pedido }}</strong> foi aprovada. A nova peça já está reservada.</p>
+<p style="margin:0 0 16px;"><strong>Itens:</strong>{% for item in itens %}<br>{{ item.quantidade }}x {{ item.produto }}: {{ item.de }} → {{ item.para }}{% endfor %}</p>
+{% if exchange.review_message %}<p style="margin:0 0 16px;"><strong>Como enviar a peça:</strong><br>{{ exchange.review_message|linebreaksbr }}</p>{% endif %}
+<p style="margin:0 0 16px;">Assim que a peça chegar, avisaremos por e-mail.</p>
+<p style="margin:24px 0;"><a href="{{ pedido_url }}" style="display:inline-block;background-color:#000000;color:#ffffff;padding:12px 24px;text-decoration:none;font-weight:700;">Acompanhar pedido</a></p>
+{% endblock %}
