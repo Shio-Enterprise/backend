@@ -2,7 +2,6 @@ from datetime import timedelta
 
 from django.db.models import Count, Max, Q
 from django.db.models.functions import TruncDay, TruncMonth
-from django.utils import timezone
 
 from orders.models import OrderItem, PaymentStatus
 from products.models import Product
@@ -62,7 +61,8 @@ def _buckets(start, end, group_by):
 
     if group_by == "day":
         return [
-            start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)
+            start_date + timedelta(days=i)
+            for i in range((end_date - start_date).days + 1)
         ]
 
     buckets = []
@@ -203,7 +203,9 @@ def build_shared_interest(period_name, *, year=None, month=None):
         )
         product["anonymous"] = row["total"]
 
-    for item in _confirmed_purchases(start, end).filter(variation__product__isnull=False):
+    for item in _confirmed_purchases(start, end).filter(
+        variation__product__isnull=False
+    ):
         product = products.setdefault(
             item.variation.product_id,
             {
@@ -388,14 +390,18 @@ def build_user_products(user, period_name, *, year=None, month=None):
         item["purchases"] += 1
         if item["last_access"] is None or paid_at > item["last_access"]:
             item["last_access"] = paid_at
-    ranked = sorted(products.values(), key=lambda item: item["last_access"], reverse=True)
+    ranked = sorted(
+        products.values(), key=lambda item: item["last_access"], reverse=True
+    )
     return ranked
 
 
 def build_user_timeline(user, start, end):
     """Eventos da conta no período, com a compra confirmada lida do pagamento."""
     events = (
-        SiteEvent.objects.filter(user=user, occurred_at__gte=start, occurred_at__lte=end)
+        SiteEvent.objects.filter(
+            user=user, occurred_at__gte=start, occurred_at__lte=end
+        )
         .exclude(event_type=SiteEventType.PURCHASE)
         .select_related("product", "variation")
         .order_by("-occurred_at")

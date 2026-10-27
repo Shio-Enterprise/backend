@@ -2,10 +2,10 @@ from django.urls import path
 
 from .views import (
     LinkAnonymousEventsView,
-    SiteEventCreateView,
     ProductAccessView,
     ProductSearchView,
     SharedProductInterestView,
+    SiteEventCreateView,
     SiteEventOverviewView,
     UserProductAccessView,
     UserSearchView,
