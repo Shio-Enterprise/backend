@@ -59,6 +59,7 @@ from .models import (
     Product,
     ProductImage,
     ProductVariation,
+    SizeGuide,
     StockAlert,
     Wishlist,
 )
@@ -76,6 +77,7 @@ from .serializers import (
     ProductVariationSerializer,
     ProductWriteSerializer,
     PublicDropCampaignSerializer,
+    SizeGuideAdminSerializer,
     StockAlertCreateSerializer,
     StockAlertItemSerializer,
     StockAlertListSerializer,
@@ -602,6 +604,117 @@ class CategoryDetailView(APIView):
         category = self._get_object(pk)
         logger.info(f"Categoria removida: {category.name} ({category.id})")
         category.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ─── Size guides ──────────────────────────────────────────────────────────────
+
+
+class SizeGuideListCreateView(APIView):
+    """Listar e criar guias de medidas (admin de catálogo)."""
+
+    permission_classes = [CanManageCatalog]
+
+    @extend_schema(
+        tags=["Size guides"],
+        summary="Listar guias de medidas",
+        description="Lista os guias com as categorias que usam cada um.",
+        responses={200: SizeGuideAdminSerializer(many=True)},
+    )
+    def get(self, request):
+        guides = SizeGuide.objects.prefetch_related("categories").order_by("name")
+        return Response(SizeGuideAdminSerializer(guides, many=True).data)
+
+    @extend_schema(
+        tags=["Size guides"],
+        summary="Criar guia de medidas",
+        description=(
+            "Cria o guia e liga a ele as categorias de `categories`, que saem do "
+            "guia que usavam antes."
+        ),
+        request=SizeGuideAdminSerializer,
+        responses={
+            201: SizeGuideAdminSerializer,
+            400: OpenApiResponse(description="Dados inválidos."),
+            401: OpenApiResponse(description="Não autenticado."),
+            403: OpenApiResponse(description="Sem permissão de catálogo."),
+        },
+    )
+    def post(self, request):
+        serializer = SizeGuideAdminSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                {"error": "Dados inválidos.", "details": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        guide = serializer.save()
+        logger.info(f"Guia de medidas criado: {guide.name} ({guide.id})")
+        return Response(
+            SizeGuideAdminSerializer(guide).data, status=status.HTTP_201_CREATED
+        )
+
+
+class SizeGuideDetailView(APIView):
+    """Detalhar, atualizar e remover um guia de medidas (admin de catálogo)."""
+
+    permission_classes = [CanManageCatalog]
+
+    def _get_object(self, pk):
+        return get_object_or_404(SizeGuide, pk=pk)
+
+    @extend_schema(
+        tags=["Size guides"],
+        summary="Detalhe do guia de medidas",
+        responses={
+            200: SizeGuideAdminSerializer,
+            404: OpenApiResponse(description="Guia não encontrado."),
+        },
+    )
+    def get(self, request, pk):
+        return Response(SizeGuideAdminSerializer(self._get_object(pk)).data)
+
+    @extend_schema(
+        tags=["Size guides"],
+        summary="Atualizar guia de medidas (PUT)",
+        description=(
+            "Substitui o guia. Se `categories` for enviado, passa a ser a lista "
+            "completa de categorias do guia: as que ficarem de fora são desligadas."
+        ),
+        request=SizeGuideAdminSerializer,
+        responses={
+            200: SizeGuideAdminSerializer,
+            400: OpenApiResponse(description="Dados inválidos."),
+            401: OpenApiResponse(description="Não autenticado."),
+            403: OpenApiResponse(description="Sem permissão de catálogo."),
+            404: OpenApiResponse(description="Guia não encontrado."),
+        },
+    )
+    def put(self, request, pk):
+        guide = self._get_object(pk)
+        serializer = SizeGuideAdminSerializer(guide, data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                {"error": "Dados inválidos.", "details": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        guide = serializer.save()
+        return Response(SizeGuideAdminSerializer(guide).data)
+
+    @extend_schema(
+        tags=["Size guides"],
+        summary="Remover guia de medidas",
+        description="Remove o guia. As categorias que o usavam ficam sem guia.",
+        responses={
+            204: OpenApiResponse(description="Guia removido."),
+            401: OpenApiResponse(description="Não autenticado."),
+            403: OpenApiResponse(description="Sem permissão de catálogo."),
+            404: OpenApiResponse(description="Guia não encontrado."),
+        },
+    )
+    def delete(self, request, pk):
+        guide = self._get_object(pk)
+        logger.info(f"Guia de medidas removido: {guide.name} ({guide.id})")
+        guide.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 

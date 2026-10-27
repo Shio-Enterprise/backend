@@ -18,6 +18,8 @@ from .views import (
     ProductVariationCreateView,
     ProductVariationDetailView,
     PublicDropCampaignView,
+    SizeGuideDetailView,
+    SizeGuideListCreateView,
     StockAlertDeleteView,
     StockAlertListCreateView,
     StockAlertPendingVariationsView,
@@ -74,6 +76,18 @@ urlpatterns = [
         "categories/<uuid:pk>/",
         CategoryDetailView.as_view(),
         name="category-detail",
+    ),
+    # GET, POST (admin de catálogo) - Lista/cria guias de medidas
+    path(
+        "size-guides/",
+        SizeGuideListCreateView.as_view(),
+        name="size-guide-list-create",
+    ),
+    # GET, PUT, DELETE (admin de catálogo) - Detalhe/atualiza/remove guia
+    path(
+        "size-guides/<uuid:pk>/",
+        SizeGuideDetailView.as_view(),
+        name="size-guide-detail",
     ),
     # GET (público) - Lista drops / POST (admin) - Cria drop
     path(
