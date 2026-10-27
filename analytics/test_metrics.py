@@ -1,11 +1,13 @@
 from calendar import monthrange
 from datetime import datetime, time, timedelta
+from uuid import uuid4
 
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
+from orders.models import CustomerOrder, OrderItem, Payment, PaymentStatus
 from products.models import Product, ProductVariation
 
 from .models import SiteEvent, SiteEventType
@@ -40,6 +42,40 @@ class SiteEventMetricsTests(APITestCase):
             occurred_at=occurred_at,
             **kwargs,
         )
+
+    def _paid_item(self, user, product, *, paid_at=None, status=PaymentStatus.PAID):
+        variation = ProductVariation.objects.create(
+            product=product,
+            size=uuid4().hex[:12],
+            color="",
+            sku=f"sku-{uuid4().hex}",
+        )
+        order = CustomerOrder.objects.create(
+            user=user,
+            subtotal=50,
+            total_amount=50,
+            status="PAID",
+            shipping_zip_code="70000-000",
+            shipping_street="Rua",
+            shipping_number="1",
+            shipping_neighborhood="Asa",
+            shipping_city="Brasilia",
+            shipping_state="DF",
+        )
+        OrderItem.objects.create(
+            order=order,
+            variation=variation,
+            quantity=1,
+            unit_price=50,
+            product_name=product.name,
+        )
+        Payment.objects.create(
+            order=order,
+            status=status,
+            total_amount=50,
+            paid_at=paid_at or timezone.now() - timedelta(days=1),
+        )
+        return variation
 
     def test_overview_exige_administrador(self):
         self.client.force_authenticate(user=self.cliente)
@@ -145,12 +181,7 @@ class SiteEventMetricsTests(APITestCase):
             product=self.product,
             user=self.cliente,
         )
-        self._event(
-            days_ago=1,
-            event_type=SiteEventType.PURCHASE,
-            product=self.product,
-            user=self.cliente,
-        )
+        self._paid_item(self.cliente, self.product)
         self._event(
             days_ago=1,
             event_type=SiteEventType.ADD_TO_CART,
@@ -244,12 +275,7 @@ class SiteEventMetricsTests(APITestCase):
             product=self.product,
             user=self.cliente,
         )
-        self._event(
-            days_ago=1,
-            event_type=SiteEventType.PURCHASE,
-            product=self.product,
-            user=self.cliente,
-        )
+        self._paid_item(self.cliente, self.product)
         self._event(
             days_ago=2,
             event_type=SiteEventType.PRODUCT_VIEW,
@@ -367,3 +393,33 @@ class SiteEventMetricsTests(APITestCase):
         response = self.client.get(self.overview_url, params)
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_compra_confirmada_entra_na_navegacao_sem_evento(self):
+        self._paid_item(self.cliente, self.product)
+        self._paid_item(self.cliente, self.product, status=PaymentStatus.PENDING)
+        self._event(
+            days_ago=1,
+            event_type=SiteEventType.PURCHASE,
+            product=self.product,
+            user=self.cliente,
+        )
+        self.client.force_authenticate(user=self.admin)
+
+        overview = self.client.get(self.overview_url).json()
+        self.assertEqual(overview["events_by_type"]["PURCHASE"], 1)
+        self.assertEqual(sum(point["total"] for point in overview["series"]), 1)
+
+        timeline = self.client.get(
+            f"/api/analytics/users/{self.cliente.pk}/events/"
+        ).json()
+        purchases = [
+            item for item in timeline["results"] if item["event_type"] == "PURCHASE"
+        ]
+        self.assertEqual(len(purchases), 1)
+        self.assertEqual(purchases[0]["product_name"], "Boné")
+
+        products = self.client.get(
+            f"/api/analytics/users/{self.cliente.pk}/products/"
+        ).json()["products"]
+        self.assertEqual(products[0]["purchases"], 1)
+        self.assertEqual(products[0]["views"], 0)

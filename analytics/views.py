@@ -18,6 +18,7 @@ from .services import (
     build_product_access,
     build_shared_interest,
     build_user_products,
+    build_user_timeline,
     link_anonymous_events,
     search_products,
 )
@@ -334,6 +335,18 @@ class UserSiteEventTimelineView(generics.ListAPIView):
     )
     def get(self, request, *args, **kwargs):
         return super().get(request, *args, **kwargs)
+
+    def list(self, request, *args, **kwargs):
+        if getattr(self, "swagger_fake_view", False):
+            return Response([])
+        user = get_object_or_404(User, pk=self.kwargs["user_id"])
+        period_name, year, month = _selection(request)
+        start, end, _group_by = resolve_period(period_name, year=year, month=month)
+        rows = build_user_timeline(user, start, end)
+        page = self.paginate_queryset(rows)
+        if page is not None:
+            return self.get_paginated_response(page)
+        return Response(rows)
 
     def get_queryset(self):
         if getattr(self, "swagger_fake_view", False):
