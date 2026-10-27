@@ -75,6 +75,7 @@ from .serializers import (
     ProductListSerializer,
     ProductVariationSerializer,
     ProductWriteSerializer,
+    PublicDropCampaignSerializer,
     StockAlertCreateSerializer,
     StockAlertItemSerializer,
     StockAlertListSerializer,
@@ -794,6 +795,39 @@ class DropCampaignDetailView(APIView):
         with watch_sellable(list(drop.products.select_related("drop"))):
             drop.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class PublicDropCampaignView(APIView):
+    """Detalhe público do drop por slug, usado pela página pública (`/drop/:slug`)."""
+
+    permission_classes = [AllowAny]
+
+    @extend_schema(
+        tags=["Drops"],
+        summary="Detalhe público do drop (por slug)",
+        description=(
+            "Usado pela página pública do drop, em vez do detalhe por UUID "
+            "(que é de uso administrativo). Aplica sempre a política de "
+            "visibilidade pública (`is_public`), mesmo para administradores — "
+            "para pré-visualizar um drop privado, use o detalhe por UUID.\n\n"
+            "`products` só inclui produtos ativos, no mesmo formato de card do "
+            "catálogo público. `remaining_quantity` é `null` quando o drop não "
+            "tem limite de unidades (`max_quantity` nulo)."
+        ),
+        responses={
+            200: PublicDropCampaignSerializer,
+            404: OpenApiResponse(description="Drop não encontrado ou privado."),
+        },
+    )
+    def get(self, request, slug):
+        drop = get_object_or_404(DropCampaign, slug=slug)
+        if not is_drop_visible(drop):
+            return Response(
+                {"error": "Drop não encontrado."}, status=status.HTTP_404_NOT_FOUND
+            )
+        return Response(
+            PublicDropCampaignSerializer(drop, context={"request": request}).data
+        )
 
 
 class DropProductManageView(APIView):

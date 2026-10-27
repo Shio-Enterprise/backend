@@ -17,6 +17,7 @@ from .views import (
     ProductRecommendationsView,
     ProductVariationCreateView,
     ProductVariationDetailView,
+    PublicDropCampaignView,
     StockAlertDeleteView,
     StockAlertListCreateView,
     StockAlertPendingVariationsView,
@@ -79,6 +80,12 @@ urlpatterns = [
         "drops/",
         DropCampaignListCreateView.as_view(),
         name="drop-list-create",
+    ),
+    # GET (público) - Detalhe por slug para a página pública (/drop/:slug)
+    path(
+        "drops/slug/<slug:slug>/",
+        PublicDropCampaignView.as_view(),
+        name="drop-public-detail",
     ),
     # GET (público) - Detalhe com produtos / PUT, DELETE (admin)
     path(
