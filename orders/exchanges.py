@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 from django.conf import settings
 from django.db import IntegrityError, transaction
-from django.db.models import Sum
+from django.db.models import OuterRef, Subquery, Sum
 from django.utils import timezone
 from rest_framework.exceptions import APIException, ValidationError
 
@@ -178,8 +178,45 @@ def exchange_eligibility(order, now=None):
     return ExchangeEligibility(True, None, size, defect)
 
 
-def latest_exchange(order):
-    return order.exchanges.order_by("-created_at").first()
+def exchange_options(order):
+    """Para cada item ainda trocável, as outras variações do mesmo produto."""
+    available = available_quantities(order)
+    items = [
+        item
+        for item in order.items.select_related("variation")
+        if available.get(item.pk)
+    ]
+    product_ids = {item.variation.product_id for item in items}
+    siblings = defaultdict(list)
+    for variation in ProductVariation.objects.filter(
+        product_id__in=product_ids, product__is_active=True
+    ).order_by("size", "color"):
+        siblings[variation.product_id].append(variation)
+    return [
+        {
+            "order_item_id": item.pk,
+            "available_quantity": available[item.pk],
+            "options": [
+                {
+                    "variation_id": v.pk,
+                    "size": v.size,
+                    "color": v.color,
+                    "in_stock": v.stock_quantity > 0,
+                }
+                for v in siblings[item.variation.product_id]
+                if v.pk != item.variation_id
+            ],
+        }
+        for item in items
+    ]
+
+
+def with_exchange_status(queryset):
+    """Anota o status da troca mais recente, sem consulta por pedido."""
+    latest = ExchangeRequest.objects.filter(order=OuterRef("pk")).order_by(
+        "-created_at"
+    )
+    return queryset.annotate(exchange_status=Subquery(latest.values("status")[:1]))
 
 
 def _lock(order):

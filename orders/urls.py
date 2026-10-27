@@ -3,6 +3,11 @@ from django.urls import path
 from .correios_views import AgencySearchView, CepLookupView, ShippingOptionsView
 from .views import (
     AdminDashboardView,
+    AdminExchangeApproveView,
+    AdminExchangeCancelView,
+    AdminExchangeCompleteView,
+    AdminExchangeReceiveView,
+    AdminExchangeRejectView,
     AdminOrderDetailView,
     AdminOrderExportView,
     AdminOrderListView,
@@ -27,6 +32,7 @@ from .views import (
     OrderDispatchView,
     OrderTrackingView,
     PaymentSuccessRedirectView,
+    UserExchangeRequestView,
     UserOrderDetailView,
     UserOrderListView,
     UserRefundRequestView,
@@ -98,6 +104,11 @@ urlpatterns = [
         UserRefundRequestView.as_view(),
         name="user_order_refund_request",
     ),
+    path(
+        "my-orders/<uuid:order_id>/exchange-request/",
+        UserExchangeRequestView.as_view(),
+        name="user_order_exchange_request",
+    ),
     path("admin/", AdminOrderListView.as_view(), name="admin_orders_list"),
     path("admin/export/", AdminOrderExportView.as_view(), name="admin_orders_export"),
     path(
@@ -119,6 +130,31 @@ urlpatterns = [
         "admin/<uuid:order_id>/refund/reject/",
         AdminRefundRejectView.as_view(),
         name="admin_order_refund_reject",
+    ),
+    path(
+        "admin/<uuid:order_id>/exchange/approve/",
+        AdminExchangeApproveView.as_view(),
+        name="admin_order_exchange_approve",
+    ),
+    path(
+        "admin/<uuid:order_id>/exchange/reject/",
+        AdminExchangeRejectView.as_view(),
+        name="admin_order_exchange_reject",
+    ),
+    path(
+        "admin/<uuid:order_id>/exchange/receive/",
+        AdminExchangeReceiveView.as_view(),
+        name="admin_order_exchange_receive",
+    ),
+    path(
+        "admin/<uuid:order_id>/exchange/complete/",
+        AdminExchangeCompleteView.as_view(),
+        name="admin_order_exchange_complete",
+    ),
+    path(
+        "admin/<uuid:order_id>/exchange/cancel/",
+        AdminExchangeCancelView.as_view(),
+        name="admin_order_exchange_cancel",
     ),
     path("correios/cep/<str:cep>/", CepLookupView.as_view(), name="cep-lookup"),
     path("correios/frete/", ShippingOptionsView.as_view(), name="shipping-options"),

@@ -50,6 +50,15 @@ from .coupon_email import (
 from .coupons import valid_order_q
 from .dashboard_aggregates import dashboard_detail_aggregates
 from .dashboard_drilldown import DETAIL_FILTERS, ORDER_METRICS, dashboard_order_queryset
+from .exchanges import (
+    approve_exchange,
+    cancel_exchange,
+    complete_exchange,
+    receive_exchange,
+    reject_exchange,
+    request_exchange,
+    with_exchange_status,
+)
 from .expiration import (
     cart_variation_ids,
     release_quietly,
@@ -67,6 +76,7 @@ from .metrics import (
 from .models import (
     Coupon,
     CustomerOrder,
+    ExchangeStatus,
     OrderStatus,
     PaymentMethod,
     PaymentStatus,
@@ -94,6 +104,11 @@ from .serializers import (
     DashboardOrderDrillDownSerializer,
     DashboardOrderPageSerializer,
     DashboardRecentOrderSerializer,
+    ExchangeApproveSerializer,
+    ExchangeCompleteSerializer,
+    ExchangeMessageSerializer,
+    ExchangeReceiveSerializer,
+    ExchangeRequestSerializer,
     OrderDetailSerializer,
     OrderStatusUpdateSerializer,
     PaymentReturnSerializer,
@@ -539,10 +554,12 @@ class UserOrderListView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        qs = with_refund_status(
-            CustomerOrder.objects.filter(user=request.user)
-            .select_related("user", "payment")
-            .order_by("-created_at")
+        qs = with_exchange_status(
+            with_refund_status(
+                CustomerOrder.objects.filter(user=request.user)
+                .select_related("user", "payment")
+                .order_by("-created_at")
+            )
         )
         data = DashboardRecentOrderSerializer(qs, many=True).data
         return Response(data, status=status.HTTP_200_OK)
@@ -595,15 +612,25 @@ class AdminOrderListView(APIView):
                 description="Filtra pelo status do reembolso mais recente do pedido",
                 location=OpenApiParameter.QUERY,
             ),
+            OpenApiParameter(
+                name="exchange_status",
+                type=OpenApiTypes.STR,
+                enum=ExchangeStatus.values,
+                description="Filtra pelo status da troca mais recente do pedido",
+                location=OpenApiParameter.QUERY,
+            ),
         ],
         responses={200: DashboardRecentOrderSerializer(many=True)},
     )
     def get(self, request):
         status_q = request.query_params.get("status")
         refund_status_q = request.query_params.get("refund_status")
-        qs = with_refund_status(
-            CustomerOrder.objects.select_related("user", "payment").order_by(
-                "-created_at"
+        exchange_status_q = request.query_params.get("exchange_status")
+        qs = with_exchange_status(
+            with_refund_status(
+                CustomerOrder.objects.select_related("user", "payment").order_by(
+                    "-created_at"
+                )
             )
         )
         if status_q:
@@ -614,6 +641,10 @@ class AdminOrderListView(APIView):
                     {"refund_status": "Status de reembolso inválido."}
                 )
             qs = qs.filter(refund_status=refund_status_q)
+        if exchange_status_q:
+            if exchange_status_q not in ExchangeStatus.values:
+                raise ValidationError({"exchange_status": "Status de troca inválido."})
+            qs = qs.filter(exchange_status=exchange_status_q)
 
         data = DashboardRecentOrderSerializer(qs, many=True).data
         return Response(data, status=status.HTTP_200_OK)
@@ -1013,6 +1044,179 @@ class AdminRefundView(APIView):
             OrderDetailSerializer(_order_for_detail(order.pk)).data,
             status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
         )
+
+
+EXCHANGE_ERROR_RESPONSES = {
+    400: OpenApiResponse(description="Dados inválidos ou troca não permitida."),
+    404: OpenApiResponse(description="Pedido não encontrado."),
+    409: OpenApiResponse(description="Conflito com a troca atual do pedido."),
+}
+
+
+class UserExchangeRequestView(APIView):
+    """
+    POST /api/orders/my-orders/<order_id>/exchange-request/
+    O cliente solicita a troca de itens do próprio pedido entregue.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        summary="Solicitar troca",
+        description=(
+            "Troca por outra variação do mesmo produto, em pedido entregue e pago: "
+            "tamanho ou cor até o fim do 30º dia após a entrega e defeito até o fim "
+            "do 90º (America/Sao_Paulo). A variação precisa ter estoque. Erros de "
+            'regra respondem `{"message": "...", "code": "..."}`; os códigos são os '
+            "de `exchange_eligibility.code`, `size_deadline_passed` e "
+            "`replacement_out_of_stock`."
+        ),
+        request=ExchangeRequestSerializer,
+        responses={201: CustomerOrderDetailSerializer, **EXCHANGE_ERROR_RESPONSES},
+    )
+    def post(self, request, order_id):
+        order = CustomerOrder.objects.filter(id=order_id, user=request.user).first()
+        if order is None:
+            return Response({"message": "Pedido não encontrado."}, status=404)
+        serializer = ExchangeRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        request_exchange(order, request.user, **serializer.validated_data)
+        return Response(
+            CustomerOrderDetailSerializer(_order_for_detail(order.pk)).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class _AdminExchangeView(APIView):
+    """Base das ações do administrador sobre a troca aberta do pedido."""
+
+    permission_classes = [CanManageOrders]
+    serializer_class = None
+
+    def act(self, order, admin, data):
+        raise NotImplementedError
+
+    def post(self, request, order_id):
+        order = CustomerOrder.objects.filter(id=order_id).first()
+        if order is None:
+            return Response({"message": "Pedido não encontrado."}, status=404)
+        serializer = self.serializer_class(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.act(order, request.user, serializer.validated_data)
+        return Response(OrderDetailSerializer(_order_for_detail(order.pk)).data)
+
+
+class AdminExchangeApproveView(_AdminExchangeView):
+    """
+    POST /api/orders/admin/<order_id>/exchange/approve/
+    Aprova a troca e reserva a reposição no estoque.
+    """
+
+    serializer_class = ExchangeApproveSerializer
+
+    @extend_schema(
+        summary="Aprovar troca",
+        description=(
+            "Reserva a reposição com saída TROCA. Sem estoque, nada é gravado e "
+            "responde `replacement_out_of_stock`."
+        ),
+        request=ExchangeApproveSerializer,
+        responses={200: OrderDetailSerializer, **EXCHANGE_ERROR_RESPONSES},
+    )
+    def post(self, request, order_id):
+        return super().post(request, order_id)
+
+    def act(self, order, admin, data):
+        approve_exchange(order, admin, data["message"])
+
+
+class AdminExchangeRejectView(_AdminExchangeView):
+    """
+    POST /api/orders/admin/<order_id>/exchange/reject/
+    Recusa a troca com justificativa visível ao cliente.
+    """
+
+    serializer_class = ExchangeMessageSerializer
+
+    @extend_schema(
+        summary="Recusar troca",
+        request=ExchangeMessageSerializer,
+        responses={200: OrderDetailSerializer, **EXCHANGE_ERROR_RESPONSES},
+    )
+    def post(self, request, order_id):
+        return super().post(request, order_id)
+
+    def act(self, order, admin, data):
+        reject_exchange(order, admin, data["message"])
+
+
+class AdminExchangeReceiveView(_AdminExchangeView):
+    """
+    POST /api/orders/admin/<order_id>/exchange/receive/
+    Confirma a chegada da peça e informa se ela volta ao estoque.
+    """
+
+    serializer_class = ExchangeReceiveSerializer
+
+    @extend_schema(
+        summary="Confirmar recebimento da troca",
+        description=(
+            "Cada item da troca precisa de `condition`: RESTOCK registra entrada "
+            "DEVOLUCAO; LOSS registra a entrada e, em seguida, saída PERDA."
+        ),
+        request=ExchangeReceiveSerializer,
+        responses={200: OrderDetailSerializer, **EXCHANGE_ERROR_RESPONSES},
+    )
+    def post(self, request, order_id):
+        return super().post(request, order_id)
+
+    def act(self, order, admin, data):
+        receive_exchange(
+            order,
+            admin,
+            {item["id"]: item["condition"] for item in data["items"]},
+            data["internal_note"],
+        )
+
+
+class AdminExchangeCompleteView(_AdminExchangeView):
+    """
+    POST /api/orders/admin/<order_id>/exchange/complete/
+    Registra o envio da reposição e conclui a troca.
+    """
+
+    serializer_class = ExchangeCompleteSerializer
+
+    @extend_schema(
+        summary="Registrar envio da troca",
+        request=ExchangeCompleteSerializer,
+        responses={200: OrderDetailSerializer, **EXCHANGE_ERROR_RESPONSES},
+    )
+    def post(self, request, order_id):
+        return super().post(request, order_id)
+
+    def act(self, order, admin, data):
+        complete_exchange(order, admin, data["tracking_code"])
+
+
+class AdminExchangeCancelView(_AdminExchangeView):
+    """
+    POST /api/orders/admin/<order_id>/exchange/cancel/
+    Cancela a troca antes do recebimento e devolve a reserva ao estoque.
+    """
+
+    serializer_class = ExchangeMessageSerializer
+
+    @extend_schema(
+        summary="Cancelar troca",
+        request=ExchangeMessageSerializer,
+        responses={200: OrderDetailSerializer, **EXCHANGE_ERROR_RESPONSES},
+    )
+    def post(self, request, order_id):
+        return super().post(request, order_id)
+
+    def act(self, order, admin, data):
+        cancel_exchange(order, admin, data["message"])
 
 
 class CheckoutCalculationView(APIView):
