@@ -2,9 +2,19 @@ import logging
 import uuid
 
 from django.core.files.base import ContentFile
-from django.db import transaction
-from django.db.models import Exists, Max, OuterRef, Sum
+from django.db import IntegrityError, transaction
+from django.db.models import (
+    Case,
+    Exists,
+    IntegerField,
+    Max,
+    OuterRef,
+    Q,
+    Value,
+    When,
+)
 from django.db.models.deletion import ProtectedError
+from django.http import Http404
 from django.shortcuts import get_object_or_404
 from drf_spectacular.utils import (
     OpenApiParameter,
@@ -17,7 +27,7 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.exceptions import ValidationError
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -26,10 +36,12 @@ from authentication.permissions import (
     CanManageDrops,
     user_has_admin_permission,
 )
+from core.exports import export_data_response
 from orders.expiration import sweep_expired_reservations
 
 from .availability import (
     is_drop_visible,
+    is_product_sellable,
     is_product_visible,
     visible_drops_queryset,
     visible_products_queryset,
@@ -41,12 +53,16 @@ from .catalog import (
     filter_catalog,
     recommend_products,
 )
+from .drop_waitlist import sweep_drop_openings
 from .models import (
     Category,
     DropCampaign,
     Product,
     ProductImage,
     ProductVariation,
+    SizeGuide,
+    StockAlert,
+    Wishlist,
 )
 from .serializers import (
     CatalogFilterOptionsSerializer,
@@ -61,28 +77,414 @@ from .serializers import (
     ProductListSerializer,
     ProductVariationSerializer,
     ProductWriteSerializer,
+    PublicDropCampaignSerializer,
+    SizeGuideAdminSerializer,
+    StockAlertCreateSerializer,
+    StockAlertItemSerializer,
+    StockAlertListSerializer,
+    StockAlertPendingVariationsSerializer,
+    StockAlertSerializer,
     StockMovementSerializer,
+    WishlistCreateSerializer,
+    WishlistIdsSerializer,
+    WishlistPageSerializer,
+    WishlistSerializer,
 )
+from .services import get_inventory_summary
+from .stock_alerts import watch_sellable
 
 logger = logging.getLogger(__name__)
+
+
+def wishlist_products_queryset():
+    return visible_products_queryset(
+        Product.objects.select_related("category", "drop").prefetch_related(
+            "variations", "images"
+        )
+    )
+
+
+class WishlistListCreateView(APIView):
+    permission_classes = [IsAuthenticated]
+    pagination_class = CatalogPagination
+
+    @extend_schema(
+        tags=["Wishlist"],
+        summary="Listar favoritos",
+        parameters=[
+            OpenApiParameter(
+                "page", OpenApiTypes.INT, description="Página, a partir de 1."
+            ),
+            OpenApiParameter(
+                "page_size",
+                OpenApiTypes.INT,
+                description="Itens por página: padrão 20, máximo 50.",
+            ),
+        ],
+        responses={
+            200: WishlistPageSerializer,
+            404: OpenApiResponse(description="Página inexistente."),
+            401: OpenApiResponse(description="Não autenticado."),
+        },
+    )
+    def get(self, request):
+        queryset = (
+            Wishlist.objects.filter(
+                user=request.user, product__in=wishlist_products_queryset()
+            )
+            .select_related("product", "product__category", "product__drop")
+            .prefetch_related("product__variations", "product__images")
+            .order_by("-created_at", "id")
+        )
+        paginator = self.pagination_class()
+        page = paginator.paginate_queryset(queryset, request, view=self)
+        serializer = WishlistSerializer(page, many=True, context={"request": request})
+        return paginator.get_paginated_response(serializer.data)
+
+    @extend_schema(
+        tags=["Wishlist"],
+        summary="Adicionar produto aos favoritos",
+        request=WishlistCreateSerializer,
+        responses={
+            200: WishlistSerializer,
+            201: WishlistSerializer,
+            400: OpenApiResponse(description="Produto inválido."),
+            401: OpenApiResponse(description="Não autenticado."),
+            404: OpenApiResponse(description="Produto não visível."),
+        },
+    )
+    def post(self, request):
+        input_serializer = WishlistCreateSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+        product = get_object_or_404(
+            wishlist_products_queryset(), pk=input_serializer.validated_data["product"]
+        )
+        entry, created = Wishlist.objects.get_or_create(
+            user=request.user, product=product
+        )
+        entry = (
+            Wishlist.objects.select_related(
+                "product", "product__category", "product__drop"
+            )
+            .prefetch_related("product__variations", "product__images")
+            .get(pk=entry.pk)
+        )
+        return Response(
+            WishlistSerializer(entry, context={"request": request}).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+class WishlistIdsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["Wishlist"],
+        summary="Listar IDs dos produtos favoritos",
+        responses={
+            200: WishlistIdsSerializer,
+            401: OpenApiResponse(description="Não autenticado."),
+        },
+    )
+    def get(self, request):
+        product_ids = Wishlist.objects.filter(
+            user=request.user, product__in=wishlist_products_queryset()
+        ).values_list("product_id", flat=True)
+        return Response(
+            {"product_ids": [str(product_id) for product_id in product_ids]}
+        )
+
+
+class WishlistDeleteView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["Wishlist"],
+        summary="Remover produto dos favoritos",
+        responses={
+            204: OpenApiResponse(description="Favorito removido."),
+            401: OpenApiResponse(description="Não autenticado."),
+        },
+    )
+    def delete(self, request, product_id):
+        Wishlist.objects.filter(user=request.user, product_id=product_id).delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+def stock_alerts_queryset():
+    return StockAlert.objects.select_related(
+        "variation", "variation__product", "variation__product__drop"
+    ).prefetch_related("variation__product__images")
+
+
+class StockAlertListCreateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["Stock alerts"],
+        summary="Listar avisos de reposição",
+        responses={
+            200: StockAlertListSerializer,
+            401: OpenApiResponse(description="Não autenticado."),
+        },
+    )
+    def get(self, request):
+        queryset = (
+            stock_alerts_queryset()
+            .filter(user=request.user)
+            .annotate(
+                is_notified=Case(
+                    When(notified_at__isnull=True, then=Value(0)),
+                    default=Value(1),
+                    output_field=IntegerField(),
+                )
+            )
+            .order_by("is_notified", "-created_at", "id")
+        )
+        serializer = StockAlertSerializer(
+            queryset, many=True, context={"request": request}
+        )
+        return Response({"results": serializer.data})
+
+    @extend_schema(
+        tags=["Stock alerts"],
+        summary="Pedir aviso de reposição",
+        request=StockAlertCreateSerializer,
+        responses={
+            200: StockAlertItemSerializer,
+            201: StockAlertItemSerializer,
+            400: OpenApiResponse(
+                description="Variação com estoque ou produto fora de venda."
+            ),
+            401: OpenApiResponse(description="Não autenticado."),
+            404: OpenApiResponse(description="Variação inexistente ou não visível."),
+        },
+    )
+    def post(self, request):
+        input_serializer = StockAlertCreateSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+        variation = get_object_or_404(
+            ProductVariation.objects.select_related("product", "product__drop"),
+            pk=input_serializer.validated_data["variation_id"],
+        )
+        if not is_product_visible(variation.product):
+            raise Http404
+        if not is_product_sellable(variation.product):
+            raise ValidationError(
+                {"variation_id": ["Este produto não está à venda no momento."]}
+            )
+        if variation.stock_quantity > 0:
+            raise ValidationError({"variation_id": ["Este tamanho está disponível."]})
+
+        created = False
+        alert = StockAlert.objects.filter(
+            user=request.user, variation=variation, notified_at__isnull=True
+        ).first()
+        if alert is None:
+            for _ in range(2):
+                try:
+                    with transaction.atomic():
+                        alert = StockAlert.objects.create(
+                            user=request.user, variation=variation
+                        )
+                    created = True
+                    break
+                except IntegrityError:
+                    alert = StockAlert.objects.filter(
+                        user=request.user, variation=variation, notified_at__isnull=True
+                    ).first()
+                    if alert is not None:
+                        break
+            if alert is None:
+                return Response(
+                    {"error": "Não foi possível registrar o aviso. Tente novamente."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+        alert = stock_alerts_queryset().get(pk=alert.pk)
+        alert.already_pending = not created
+        return Response(
+            StockAlertItemSerializer(alert, context={"request": request}).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+class StockAlertPendingVariationsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["Stock alerts"],
+        summary="Listar variações com aviso pendente",
+        responses={
+            200: StockAlertPendingVariationsSerializer,
+            401: OpenApiResponse(description="Não autenticado."),
+        },
+    )
+    def get(self, request):
+        ids = StockAlert.objects.filter(
+            user=request.user, notified_at__isnull=True
+        ).values_list("variation_id", flat=True)
+        return Response({"variation_ids": [str(pk) for pk in ids]})
+
+
+class StockAlertDeleteView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["Stock alerts"],
+        summary="Cancelar aviso de reposição pendente",
+        responses={
+            204: OpenApiResponse(description="Aviso cancelado."),
+            401: OpenApiResponse(description="Não autenticado."),
+            404: OpenApiResponse(description="Aviso pendente não encontrado."),
+        },
+    )
+    def delete(self, request, pk):
+        alert = get_object_or_404(
+            StockAlert, pk=pk, user=request.user, notified_at__isnull=True
+        )
+        alert.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 @api_view(["GET"])
 @permission_classes([CanManageCatalog])
 def inventory_summary(request):
-    products = Product.objects.all()
-    data = []
-    for product in products:
-        total_stock = (
-            product.variations.aggregate(total=Sum("stock_quantity"))["total"] or 0
+    return Response({"inventory": get_inventory_summary()})
+
+
+class InventoryExportView(APIView):
+    """
+    GET /api/catalog/inventory/export/
+    Exporta variações de produtos (estoque) para CSV ou Excel (.xlsx).
+    Requer a permissão CanManageCatalog.
+    """
+
+    permission_classes = [CanManageCatalog]
+
+    @extend_schema(
+        tags=["Catalog Admin"],
+        summary="Exportar estoque",
+        parameters=[
+            OpenApiParameter(
+                name="file_format",
+                type=OpenApiTypes.STR,
+                description="Formato de exportação: 'csv' (padrão) ou 'xlsx'",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
+            OpenApiParameter(
+                name="search",
+                type=OpenApiTypes.STR,
+                description="Busca pelo nome do produto",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
+            OpenApiParameter(
+                name="drop",
+                type=OpenApiTypes.STR,
+                description="Filtro por ID ou nome do drop",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
+            OpenApiParameter(
+                name="category",
+                type=OpenApiTypes.STR,
+                description="Filtro por ID ou nome da categoria",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
+        ],
+        responses={
+            200: OpenApiResponse(description="Arquivo exportado (CSV ou XLSX)"),
+            400: OpenApiResponse(description="Formato inválido"),
+            403: OpenApiResponse(description="Acesso negado"),
+        },
+    )
+    def get(self, request):
+        file_format = request.query_params.get("file_format", "csv")
+        search_q = request.query_params.get("search")
+        drop_q = request.query_params.get("drop")
+        category_q = request.query_params.get("category")
+
+        qs = ProductVariation.objects.select_related(
+            "product", "product__drop", "product__category"
+        ).order_by("product__name", "size")
+
+        if search_q:
+            clean_search = search_q.strip()
+            # Mesma busca da tela de Produtos do painel (só pelo nome)
+            qs = qs.filter(product__name__icontains=clean_search)
+
+        if drop_q:
+            clean_drop = drop_q.strip()
+            drop_filter = Q(product__drop__name__icontains=clean_drop)
+            try:
+                drop_uuid = uuid.UUID(clean_drop)
+                drop_filter = drop_filter | Q(product__drop_id=drop_uuid)
+            except ValueError:
+                pass
+            qs = qs.filter(drop_filter)
+
+        if category_q:
+            clean_category = category_q.strip()
+            category_filter = Q(product__category__name__icontains=clean_category)
+            try:
+                cat_uuid = uuid.UUID(clean_category)
+                category_filter = category_filter | Q(product__category_id=cat_uuid)
+            except ValueError:
+                pass
+            qs = qs.filter(category_filter)
+
+        headers = [
+            "Produto",
+            "Drop",
+            "Categoria",
+            "Tamanho",
+            "Cor",
+            "Quantidade em Estoque",
+            "Preço de Custo",
+            "Preço de Venda",
+        ]
+        column_types = [
+            "text",
+            "text",
+            "text",
+            "text",
+            "text",
+            "number",
+            "currency",
+            "currency",
+        ]
+
+        rows = []
+        for variation in qs:
+            product = variation.product
+            drop_name = product.drop.name if product.drop else "—"
+            cat_name = product.category.name if product.category else "—"
+            # Custo não informado sai como célula vazia, não como R$ 0,00
+            cost_price = product.cost_price
+            selling_price = product.effective_price
+
+            rows.append(
+                [
+                    product.name,
+                    drop_name,
+                    cat_name,
+                    variation.size,
+                    variation.color or "—",
+                    variation.stock_quantity,
+                    cost_price,
+                    selling_price,
+                ]
+            )
+
+        return export_data_response(
+            filename_base="estoque",
+            headers=headers,
+            rows=rows,
+            file_format=file_format,
+            column_types=column_types,
         )
-        data.append(
-            {
-                "name": product.name,
-                "total_stock": total_stock,
-            }
-        )
-    return Response({"inventory": data})
 
 
 # ─── Categories ───────────────────────────────────────────────────────────────
@@ -203,6 +605,117 @@ class CategoryDetailView(APIView):
         category = self._get_object(pk)
         logger.info(f"Categoria removida: {category.name} ({category.id})")
         category.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ─── Size guides ──────────────────────────────────────────────────────────────
+
+
+class SizeGuideListCreateView(APIView):
+    """Listar e criar guias de medidas (admin de catálogo)."""
+
+    permission_classes = [CanManageCatalog]
+
+    @extend_schema(
+        tags=["Size guides"],
+        summary="Listar guias de medidas",
+        description="Lista os guias com as categorias que usam cada um.",
+        responses={200: SizeGuideAdminSerializer(many=True)},
+    )
+    def get(self, request):
+        guides = SizeGuide.objects.prefetch_related("categories").order_by("name")
+        return Response(SizeGuideAdminSerializer(guides, many=True).data)
+
+    @extend_schema(
+        tags=["Size guides"],
+        summary="Criar guia de medidas",
+        description=(
+            "Cria o guia e liga a ele as categorias de `categories`, que saem do "
+            "guia que usavam antes."
+        ),
+        request=SizeGuideAdminSerializer,
+        responses={
+            201: SizeGuideAdminSerializer,
+            400: OpenApiResponse(description="Dados inválidos."),
+            401: OpenApiResponse(description="Não autenticado."),
+            403: OpenApiResponse(description="Sem permissão de catálogo."),
+        },
+    )
+    def post(self, request):
+        serializer = SizeGuideAdminSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                {"error": "Dados inválidos.", "details": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        guide = serializer.save()
+        logger.info(f"Guia de medidas criado: {guide.name} ({guide.id})")
+        return Response(
+            SizeGuideAdminSerializer(guide).data, status=status.HTTP_201_CREATED
+        )
+
+
+class SizeGuideDetailView(APIView):
+    """Detalhar, atualizar e remover um guia de medidas (admin de catálogo)."""
+
+    permission_classes = [CanManageCatalog]
+
+    def _get_object(self, pk):
+        return get_object_or_404(SizeGuide, pk=pk)
+
+    @extend_schema(
+        tags=["Size guides"],
+        summary="Detalhe do guia de medidas",
+        responses={
+            200: SizeGuideAdminSerializer,
+            404: OpenApiResponse(description="Guia não encontrado."),
+        },
+    )
+    def get(self, request, pk):
+        return Response(SizeGuideAdminSerializer(self._get_object(pk)).data)
+
+    @extend_schema(
+        tags=["Size guides"],
+        summary="Atualizar guia de medidas (PUT)",
+        description=(
+            "Substitui o guia. Se `categories` for enviado, passa a ser a lista "
+            "completa de categorias do guia: as que ficarem de fora são desligadas."
+        ),
+        request=SizeGuideAdminSerializer,
+        responses={
+            200: SizeGuideAdminSerializer,
+            400: OpenApiResponse(description="Dados inválidos."),
+            401: OpenApiResponse(description="Não autenticado."),
+            403: OpenApiResponse(description="Sem permissão de catálogo."),
+            404: OpenApiResponse(description="Guia não encontrado."),
+        },
+    )
+    def put(self, request, pk):
+        guide = self._get_object(pk)
+        serializer = SizeGuideAdminSerializer(guide, data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                {"error": "Dados inválidos.", "details": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        guide = serializer.save()
+        return Response(SizeGuideAdminSerializer(guide).data)
+
+    @extend_schema(
+        tags=["Size guides"],
+        summary="Remover guia de medidas",
+        description="Remove o guia. As categorias que o usavam ficam sem guia.",
+        responses={
+            204: OpenApiResponse(description="Guia removido."),
+            401: OpenApiResponse(description="Não autenticado."),
+            403: OpenApiResponse(description="Sem permissão de catálogo."),
+            404: OpenApiResponse(description="Guia não encontrado."),
+        },
+    )
+    def delete(self, request, pk):
+        guide = self._get_object(pk)
+        logger.info(f"Guia de medidas removido: {guide.name} ({guide.id})")
+        guide.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -372,7 +885,8 @@ class DropCampaignDetailView(APIView):
                 {"error": "Dados inválidos.", "details": serializer.errors},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        serializer.save()
+        with watch_sellable(list(drop.products.select_related("drop"))):
+            serializer.save()
         return Response(serializer.data)
 
     @extend_schema(
@@ -392,8 +906,43 @@ class DropCampaignDetailView(APIView):
     def delete(self, request, pk):
         drop = self._get_object(pk)
         logger.info(f"Drop removido: {drop.name} ({drop.id})")
-        drop.delete()
+        with watch_sellable(list(drop.products.select_related("drop"))):
+            drop.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class PublicDropCampaignView(APIView):
+    """Detalhe público do drop por slug, usado pela página pública (`/drop/:slug`)."""
+
+    permission_classes = [AllowAny]
+
+    @extend_schema(
+        tags=["Drops"],
+        summary="Detalhe público do drop (por slug)",
+        description=(
+            "Usado pela página pública do drop, em vez do detalhe por UUID "
+            "(que é de uso administrativo). Aplica sempre a política de "
+            "visibilidade pública (`is_public`), mesmo para administradores — "
+            "para pré-visualizar um drop privado, use o detalhe por UUID.\n\n"
+            "`products` só inclui produtos ativos, no mesmo formato de card do "
+            "catálogo público. `remaining_quantity` é `null` quando o drop não "
+            "tem limite de unidades (`max_quantity` nulo)."
+        ),
+        responses={
+            200: PublicDropCampaignSerializer,
+            404: OpenApiResponse(description="Drop não encontrado ou privado."),
+        },
+    )
+    def get(self, request, slug):
+        sweep_drop_openings()
+        drop = get_object_or_404(DropCampaign, slug=slug)
+        if not is_drop_visible(drop):
+            return Response(
+                {"error": "Drop não encontrado."}, status=status.HTTP_404_NOT_FOUND
+            )
+        return Response(
+            PublicDropCampaignSerializer(drop, context={"request": request}).data
+        )
 
 
 class DropProductManageView(APIView):
@@ -426,8 +975,9 @@ class DropProductManageView(APIView):
     def post(self, request, drop_id, product_id):
         drop = self._get_drop(drop_id)
         product = self._get_product(product_id)
-        product.drop = drop
-        product.save(update_fields=["drop", "updated_at"])
+        with watch_sellable([product]):
+            product.drop = drop
+            product.save(update_fields=["drop", "updated_at"])
         logger.info(f"Produto {product.id} vinculado ao drop {drop.id}")
         return Response(
             DropCampaignDetailSerializer(drop, context={"request": request}).data
@@ -458,8 +1008,9 @@ class DropProductManageView(APIView):
                 {"error": "Produto não pertence a este drop."},
                 status=status.HTTP_404_NOT_FOUND,
             )
-        product.drop = None
-        product.save(update_fields=["drop", "updated_at"])
+        with watch_sellable([product]):
+            product.drop = None
+            product.save(update_fields=["drop", "updated_at"])
         logger.info(f"Produto {product.id} desvinculado do drop {drop.id}")
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -543,6 +1094,7 @@ class ProductListCreateView(APIView):
     def get(self, request):
         # Reserva abandonada esconde o produto (estoque 0) até ser liberada.
         sweep_expired_reservations()
+        sweep_drop_openings()
         # Evita tratar booleano ausente como checkbox HTML desmarcado.
         params = request.query_params.dict()
         if "color" in params:
@@ -666,9 +1218,9 @@ class ProductDetailView(APIView):
 
     def _get_object(self, pk, request, allow_inactive_for_admin=True):
         product = get_object_or_404(
-            Product.objects.select_related("category", "drop").prefetch_related(
-                "variations", "images"
-            ),
+            Product.objects.select_related(
+                "category__size_guide", "drop"
+            ).prefetch_related("variations", "images"),
             pk=pk,
         )
         is_admin = user_has_admin_permission(
@@ -735,7 +1287,8 @@ class ProductDetailView(APIView):
                 {"error": "Dados inválidos.", "details": serializer.errors},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        product = serializer.save()
+        with watch_sellable([product]):
+            product = serializer.save()
         return Response(
             ProductDetailSerializer(product, context={"request": request}).data
         )

@@ -72,7 +72,8 @@ O modo recomendado é rodar a aplicação via Docker Compose.
 docker compose up --build
 ```
 
-O container já executa as migrações e cria o administrador automaticamente.
+O container aguarda a conexão com o banco e executa as migrações. O administrador
+é provisionado explicitamente pelo operador com `python manage.py initadmin`.
 
 
 ## Variáveis de ambiente importantes
@@ -80,7 +81,7 @@ O container já executa as migrações e cria o administrador automaticamente.
 - `SETTINGS_FILE_PATH`: caminho do settings, por exemplo `core.settings.dev`.
 - `DJANGO_SECRET_KEY`: chave secreta do Django.
 - `GOOGLE_CLIENT_ID`: client ID do OAuth do Google usado para validar `id_token`.
-- `ADMIN_NAME`, `ADMIN_PASS`, `ADMIN_EMAIL`: credenciais para o superusuário inicial.
+- `ADMIN_NAME`, `ADMIN_PASS`, `ADMIN_EMAIL`: credenciais usadas pelo comando explícito `initadmin`.
 - `RESEND_API_KEY`, `DEFAULT_FROM_EMAIL`: envio de e-mails (veja [E-mails](#e-mails)).
 - `STOCK_RESERVATION_TTL_MINUTES`, `STOCK_RESERVATION_GRACE_SECONDS`, `RESERVATION_SWEEP_INTERVAL_SECONDS`: prazos da reserva de estoque (veja [Reserva de estoque](#reserva-de-estoque)).
 
@@ -105,6 +106,19 @@ make expire ARGS=--dry-run   # só lista o que seria liberado
 python manage.py expire_stale_orders --batch-size 200
 ```
 
+## Lista de espera dos drops
+
+Usuários logados entram na lista de espera de um drop (`DropWaitlist`). Quando o drop abre (público, ativo e dentro da janela `launch_date`/`end_date`), cada pessoa da lista recebe um e-mail uma única vez, com o link para `/drop/<slug>`; `notified_at` marca quem já recebeu. Se o envio falhar, a pessoa volta para a fila.
+
+Como o projeto não tem fila de tarefas, o envio roda numa varredura na listagem pública de produtos e na página pública do drop, no máximo uma vez a cada `DROP_WAITLIST_SWEEP_INTERVAL_SECONDS` (padrão 60) por processo, numa thread fora da requisição.
+
+Para enviar sem depender de tráfego (por exemplo, num cron):
+
+```bash
+python manage.py notify_drop_openings            # envia os e-mails pendentes
+python manage.py notify_drop_openings --dry-run  # só lista os drops que seriam avisados
+```
+
 ## Integração com os Correios
 
 As funcionalidades de frete (preço/prazo), consulta de CEP, busca de agências,
@@ -121,6 +135,67 @@ Variáveis de ambiente:
 - `CORREIOS_USERNAME`: login de acesso ao Meu Correios / CWS.
 - `CORREIOS_PASSWORD`: código de acesso da API gerado no CWS (não é a senha de login).
 - `CORREIOS_CARTAO_POSTAGEM`: número do cartão de postagem do contrato.
+
+### Parâmetros logísticos da O10
+
+A origem (`CORREIOS_REMETENTE_CEP`), o serviço (`CORREIOS_CODIGO_SERVICO`),
+o peso (`CORREIOS_PESO_PADRAO_GRAMAS`) e as dimensões do pacote
+(`CORREIOS_COMPRIMENTO_CM`, `CORREIOS_LARGURA_CM`, `CORREIOS_ALTURA_CM`)
+são definidos no servidor. Peso e dimensões devem ser positivos; os valores
+padrão representam um pacote, sem dimensões individuais por produto.
+
+O snapshot da cotação registra esses parâmetros, o valor declarado calculado
+a partir dos itens após descontos e `SHIPPING_POLICY_VERSION`. Atualize essa
+versão ao alterar a política logística; o checkout exige recálculo quando o
+snapshot deixa de corresponder aos parâmetros atuais.
+
+A rota `/api/orders/correios/frete/` exige autenticação e recebe `cep_destino`.
+Enviar `cep_origem`, `peso` ou `codigo_servico` retorna `400`.
+
+### Redis compartilhado — Render Key Value Free
+
+A Sprint 1 usa o backend nativo `RedisCache` do Django no alias `correios` e um
+lock Redis para coordenar a renovação do token entre os workers. O cache padrão
+da aplicação continua separado, para que uma falha da integração não indisponibilize
+as demais funções do catálogo.
+
+No Render, crie uma instância **Key Value / Free**, na mesma região do backend,
+selecione a política **`noeviction`** e defina `REDIS_URL` com a URL interna
+fornecida pelo serviço. Bloqueie acesso externo se ele não for necessário.
+O frontend na Vercel não recebe essa URL. A produção exige
+`SETTINGS_FILE_PATH=core.settings.prod` e uma `REDIS_URL` válida; não há fallback
+para cache local em produção.
+
+O orçamento considera 25 MB e 50 conexões. Cada worker utiliza até cinco conexões
+para cache e cinco para locks: até 30 para os três workers atuais. As chaves de
+token expiram conforme a validade informada pelos Correios; o lock expira em
+30 segundos e a espera por ele é limitada a 12 segundos. Indisponibilidade,
+memória esgotada ou falha de lock resultam em erro da integração, sem uma chamada
+externa de renovação desprotegida.
+
+O Docker Compose inclui um Redis descartável limitado a 25 MB, 50 conexões e
+`noeviction`, sem persistência. Em desenvolvimento fora do Compose, configure
+`REDIS_URL=redis://127.0.0.1:6379/0`; sem URL, apenas desenvolvimento/testes podem
+usar o cache local.
+
+Para testar a integração, use somente Redis descartável:
+
+```bash
+TEST_REDIS_URL=redis://127.0.0.1:6379/0 pytest -q orders/test_redis_shipping.py
+```
+
+A CI sobe Redis e executa esses testes, incluindo concorrência entre processos,
+perda do cache, invalidação e falhas controladas. Sem `TEST_REDIS_URL`, os quatro
+testes que dependem do serviço são ignorados; os testes unitários continuam rodando.
+
+O Free pode reiniciar e perder todas as chaves. Tokens são regenerados, mas locks
+não oferecem exclusão durante reinícios/perda de dados do serviço. Pedidos,
+pagamentos e idempotência continuam no PostgreSQL. Quotas comerciais duráveis,
+throttling e observabilidade seguem para as próximas etapas da O10; não devem
+depender exclusivamente de contadores voláteis do Redis Free.
+
+Referências: [limites do Free](https://render.com/docs/free#free-key-value) e
+[Key Value](https://render.com/docs/key-value).
 
 ### Modo mock
 

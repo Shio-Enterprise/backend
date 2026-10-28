@@ -12,7 +12,8 @@ from .models import CustomerOrder, OrderItem, OrderStatus, PaymentStatus
 
 METRICS_TIMEZONE = ZoneInfo("America/Sao_Paulo")
 VALID_SALE_Q = Q(status=OrderStatus.DELIVERED, payment__status=PaymentStatus.PAID)
-REFUND_Q = Q(payment__status=PaymentStatus.REFUNDED)
+# Só pedido entregue entra na receita, então só ele tem reembolso a descontar.
+REFUND_Q = Q(status=OrderStatus.DELIVERED, payment__status=PaymentStatus.REFUNDED)
 
 
 def _local_midnight(value: datetime.date) -> datetime.datetime:
@@ -115,7 +116,11 @@ def _item_filters(filters):
 
 
 def metric_orders(params, start=None, end=None) -> QuerySet:
-    """Pedidos comerciais na janela de pagamento: venda válida ou reembolso."""
+    """Pedidos comerciais na janela de pagamento: venda válida ou reembolso.
+
+    É a base da receita bruta: o pedido reembolsado entra nela e volta a sair
+    pelos reembolsos, contribuindo zero para a receita líquida.
+    """
     if start is None or end is None:
         start, end, _ = resolve_period(params)
     queryset = CustomerOrder.objects.filter(
@@ -150,8 +155,15 @@ def sale_items(params, start=None, end=None) -> QuerySet:
 
 
 def revenue_value(order: CustomerOrder) -> Decimal:
-    value = Decimal(order.total_amount)
-    return -value if order.payment.status == PaymentStatus.REFUNDED else value
+    """Contribuição do pedido para a receita líquida."""
+    payment = getattr(order, "payment", None)
+    if (
+        payment
+        and payment.status == PaymentStatus.PAID
+        and order.status == OrderStatus.DELIVERED
+    ):
+        return Decimal(order.total_amount)
+    return Decimal("0.00")
 
 
 def is_recurring_customer(user, params=None) -> bool:

@@ -3,9 +3,12 @@ from django.contrib import admin
 from .models import (
     Category,
     DropCampaign,
+    DropWaitlist,
     Product,
     ProductImage,
     ProductVariation,
+    SizeGuide,
+    StockAlert,
     StockMovement,
 )
 
@@ -73,7 +76,14 @@ class ProductImageAdmin(admin.ModelAdmin):
 
 @admin.register(Category)
 class CategoryAdmin(admin.ModelAdmin):
+    list_display = ("name", "slug", "size_guide")
     prepopulated_fields = {"slug": ("name",)}
+
+
+@admin.register(SizeGuide)
+class SizeGuideAdmin(admin.ModelAdmin):
+    list_display = ("name", "updated_at")
+    search_fields = ("name",)
 
 
 @admin.register(DropCampaign)
@@ -120,4 +130,23 @@ class StockMovementAdmin(admin.ModelAdmin):
         return False
 
     def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(DropWaitlist)
+class DropWaitlistAdmin(admin.ModelAdmin):
+    list_display = ("user", "drop", "created_at", "notified_at")
+    list_filter = ("drop",)
+    readonly_fields = ("user", "drop", "created_at", "notified_at")
+
+    def has_add_permission(self, request):
+        return False
+
+
+@admin.register(StockAlert)
+class StockAlertAdmin(admin.ModelAdmin):
+    list_display = ("user", "variation", "created_at", "notified_at")
+    readonly_fields = ("user", "variation", "created_at", "notified_at")
+
+    def has_add_permission(self, request):
         return False

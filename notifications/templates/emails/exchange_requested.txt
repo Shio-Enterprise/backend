@@ -1,0 +1,15 @@
+{% extends "emails/base.txt" %}
+
+{% block content %}
+Olá, {{ nome|default:"cliente" }}!
+
+Recebemos seu pedido de troca referente ao pedido {{ pedido }}.
+
+Itens:{% for item in itens %}
+- {{ item.quantidade }}x {{ item.produto }}: {{ item.de }} -> {{ item.para }}{% endfor %}
+
+Vamos analisar e avisar por e-mail. Não envie a peça antes da aprovação.
+
+Acompanhe pelo detalhe do pedido:
+{{ pedido_url }}
+{% endblock %}

@@ -246,6 +246,8 @@ class CheckoutAttempt(models.Model):
         default=CheckoutAttemptStatus.PROCESSING,
     )
     checkout_url = models.URLField(max_length=2048, blank=True)
+    last_error_code = models.CharField(max_length=64, blank=True)
+    last_error_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -342,3 +344,250 @@ class OrderStatusLog(models.Model):
 
     def __str__(self):
         return f"OrderStatusLog(order={self.order_id}, from={self.previous_status}, to={self.new_status})"
+
+
+class CouponEmailSend(models.Model):
+    """Histórico de envios de um cupom por e-mail (um registro por campanha)."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    coupon = models.ForeignKey(
+        Coupon, on_delete=models.CASCADE, related_name="email_sends"
+    )
+    sent_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="coupon_email_sends",
+    )
+    sent_at = models.DateTimeField(auto_now_add=True)
+    message = models.TextField(blank=True)
+    sent_count = models.PositiveIntegerField(default=0)
+    failed_count = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ["-sent_at"]
+
+    def __str__(self):
+        return f"CouponEmailSend(coupon={self.coupon_id}, sent={self.sent_count}, failed={self.failed_count})"
+
+
+class RefundStatus(models.TextChoices):
+    REQUESTED = "REQUESTED", "Solicitado"
+    APPROVED = "APPROVED", "Aprovado"
+    REJECTED = "REJECTED", "Recusado"
+    COMPLETED = "COMPLETED", "Reembolsado"
+
+
+class RefundReason(models.TextChoices):
+    CUSTOMER_REQUEST = "CUSTOMER_REQUEST", "Desistência do cliente"
+    PRODUCT_ISSUE = "PRODUCT_ISSUE", "Problema com o produto"
+    DELIVERY_ISSUE = "DELIVERY_ISSUE", "Problema na entrega"
+    PAID_AFTER_CANCELLATION = "PAID_AFTER_CANCELLATION", "Pagamento após cancelamento"
+    OTHER = "OTHER", "Outro"
+
+
+class Refund(models.Model):
+    """Reembolso integral de um pedido, do pedido do cliente ao estorno.
+
+    O estorno é feito no painel da InfinitePay; aqui fica só o registro.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    order = models.ForeignKey(
+        CustomerOrder, on_delete=models.PROTECT, related_name="refunds"
+    )
+    status = models.CharField(max_length=20, choices=RefundStatus.choices)
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    reason = models.CharField(max_length=30, choices=RefundReason.choices)
+    customer_comment = models.CharField(max_length=1000, blank=True)
+    # Visível ao cliente: instruções da aprovação ou justificativa da recusa.
+    review_message = models.TextField(blank=True)
+    internal_note = models.TextField(blank=True)
+    gateway_reference = models.CharField(max_length=255, blank=True)
+    refunded_at = models.DateTimeField(null=True, blank=True)
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    completed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            # Recusas ficam no histórico; só um reembolso vivo por pedido.
+            models.UniqueConstraint(
+                fields=["order"],
+                condition=~models.Q(status=RefundStatus.REJECTED),
+                name="refund_one_active_per_order",
+            ),
+            models.CheckConstraint(
+                check=models.Q(amount__gt=0), name="refund_amount_positive"
+            ),
+            models.CheckConstraint(
+                check=~models.Q(status=RefundStatus.COMPLETED)
+                | (
+                    models.Q(refunded_at__isnull=False)
+                    & ~models.Q(gateway_reference="")
+                ),
+                name="refund_completed_has_gateway_data",
+            ),
+        ]
+
+    def __str__(self):
+        return f"Refund(order={self.order_id}, status={self.status})"
+
+
+class ExchangeStatus(models.TextChoices):
+    REQUESTED = "REQUESTED", "Solicitada"
+    APPROVED = "APPROVED", "Aprovada"
+    RECEIVED = "RECEIVED", "Recebida"
+    COMPLETED = "COMPLETED", "Concluída"
+    REJECTED = "REJECTED", "Recusada"
+    CANCELED = "CANCELED", "Cancelada"
+
+
+# Trocas que ainda seguram itens do pedido (e travam o reembolso).
+EXCHANGE_OPEN_STATUSES = (
+    ExchangeStatus.REQUESTED,
+    ExchangeStatus.APPROVED,
+    ExchangeStatus.RECEIVED,
+)
+
+
+class ExchangeReason(models.TextChoices):
+    SIZE_OR_COLOR = "SIZE_OR_COLOR", "Tamanho ou cor"
+    DEFECT = "DEFECT", "Defeito"
+
+
+class ExchangeItemCondition(models.TextChoices):
+    RESTOCK = "RESTOCK", "Volta ao estoque"
+    LOSS = "LOSS", "Perda/avaria"
+
+
+class ExchangeRequest(models.Model):
+    """Troca de itens de um pedido entregue por outra variação do mesmo produto.
+
+    As variações de um produto têm o mesmo preço: a troca não movimenta dinheiro.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    order = models.ForeignKey(
+        CustomerOrder, on_delete=models.PROTECT, related_name="exchanges"
+    )
+    status = models.CharField(max_length=20, choices=ExchangeStatus.choices)
+    reason = models.CharField(max_length=20, choices=ExchangeReason.choices)
+    customer_comment = models.CharField(max_length=1000, blank=True)
+    # Visível ao cliente: instruções de envio, recusa ou cancelamento.
+    review_message = models.TextField(blank=True)
+    internal_note = models.TextField(blank=True)
+    tracking_code = models.CharField(max_length=100, blank=True)
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    received_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    completed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    canceled_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    received_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    canceled_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            # Recusadas, canceladas e concluídas ficam no histórico.
+            models.UniqueConstraint(
+                fields=["order"],
+                condition=models.Q(status__in=EXCHANGE_OPEN_STATUSES),
+                name="exchange_one_open_per_order",
+            ),
+            models.CheckConstraint(
+                check=~models.Q(status=ExchangeStatus.COMPLETED)
+                | ~models.Q(tracking_code=""),
+                name="exchange_completed_has_tracking",
+            ),
+        ]
+
+    def __str__(self):
+        return f"ExchangeRequest(order={self.order_id}, status={self.status})"
+
+
+class ExchangeItem(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    exchange = models.ForeignKey(
+        ExchangeRequest, on_delete=models.CASCADE, related_name="items"
+    )
+    order_item = models.ForeignKey(
+        OrderItem, on_delete=models.PROTECT, related_name="exchange_items"
+    )
+    replacement_variation = models.ForeignKey(
+        "products.ProductVariation", on_delete=models.PROTECT, related_name="+"
+    )
+    quantity = models.PositiveIntegerField()
+    # Preenchida ao receber a peça devolvida.
+    condition = models.CharField(
+        max_length=10, choices=ExchangeItemCondition.choices, blank=True
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["exchange", "order_item"], name="exchange_item_unique"
+            ),
+            models.CheckConstraint(
+                check=models.Q(quantity__gt=0), name="exchange_item_quantity_positive"
+            ),
+        ]
+
+    def __str__(self):
+        return f"ExchangeItem(item={self.order_item_id}, qty={self.quantity})"

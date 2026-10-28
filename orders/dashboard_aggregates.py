@@ -33,8 +33,8 @@ def _item_revenue_expression():
     )
 
 
-def _financial(sales, refunded):
-    gross = sales.aggregate(total=Sum("total_amount"))["total"] or ZERO
+def _financial(orders, sales, refunded):
+    gross = orders.aggregate(total=Sum("total_amount"))["total"] or ZERO
     refund_total = refunded.aggregate(total=Sum("total_amount"))["total"] or ZERO
     count = sales.count()
     net = gross - refund_total
@@ -63,17 +63,23 @@ def _bucket_dates(start, end, granularity):
             current += datetime.timedelta(days=1)
 
 
-def _sales_series(sales, refunded, start, end, granularity):
+def _sales_series(orders, sales, refunded, start, end, granularity):
     trunc = (
         TruncMonth("payment__paid_at", tzinfo=METRICS_TIMEZONE)
         if granularity == "month"
         else TruncDay("payment__paid_at", tzinfo=METRICS_TIMEZONE)
     )
     gross_points = {
-        row["bucket"].date(): row
+        row["bucket"].date(): row["gross_revenue"]
+        for row in orders.annotate(bucket=trunc)
+        .values("bucket")
+        .annotate(gross_revenue=Sum("total_amount"))
+    }
+    sales_points = {
+        row["bucket"].date(): row["valid_sales"]
         for row in sales.annotate(bucket=trunc)
         .values("bucket")
-        .annotate(valid_sales=Count("id"), gross_revenue=Sum("total_amount"))
+        .annotate(valid_sales=Count("id"))
     }
     refund_points = {
         row["bucket"].date(): row["refunds"]
@@ -83,8 +89,7 @@ def _sales_series(sales, refunded, start, end, granularity):
     }
     series = []
     for bucket in _bucket_dates(start, end, granularity):
-        gross_point = gross_points.get(bucket, {})
-        gross = gross_point.get("gross_revenue") or ZERO
+        gross = gross_points.get(bucket) or ZERO
         refund_total = refund_points.get(bucket) or ZERO
         series.append(
             {
@@ -92,7 +97,7 @@ def _sales_series(sales, refunded, start, end, granularity):
                 "gross_revenue": gross,
                 "refunds": refund_total,
                 "net_revenue": gross - refund_total,
-                "valid_sales": gross_point.get("valid_sales", 0),
+                "valid_sales": sales_points.get(bucket, 0),
             }
         )
     return series
@@ -263,8 +268,8 @@ def dashboard_detail_aggregates(params):
             "granularity": granularity,
             "timezone": "America/Sao_Paulo",
         },
-        "financial": _financial(sales, refunded),
-        "sales_series": _sales_series(sales, refunded, start, end, granularity),
+        "financial": _financial(orders, sales, refunded),
+        "sales_series": _sales_series(orders, sales, refunded, start, end, granularity),
         "product_rankings": _product_rankings(items),
         "item_revenue": {
             "by_drop": _dimension_revenue(items, "drop"),

@@ -27,8 +27,11 @@ from rest_framework.views import APIView
 from authentication.permissions import (
     CanAccessAdminDashboard,
     CanManageOrders,
+    IsStaffOrSuperUser,
     user_has_admin_permission,
 )
+from core.exports import export_data_response
+from notifications.marketing import build_audience
 from products.models import ProductVariation
 
 from .correios import (
@@ -38,8 +41,24 @@ from .correios import (
     dispatch_order_and_get_tracking_code,
     get_order_tracking_data,
 )
+from .coupon_email import (
+    coupon_send_block_reason,
+    render_coupon_preview,
+    send_coupon_campaign,
+    send_coupon_test,
+)
+from .coupons import valid_order_q
 from .dashboard_aggregates import dashboard_detail_aggregates
 from .dashboard_drilldown import DETAIL_FILTERS, ORDER_METRICS, dashboard_order_queryset
+from .exchanges import (
+    approve_exchange,
+    cancel_exchange,
+    complete_exchange,
+    receive_exchange,
+    reject_exchange,
+    request_exchange,
+    with_exchange_status,
+)
 from .expiration import (
     cart_variation_ids,
     release_quietly,
@@ -55,10 +74,20 @@ from .metrics import (
     sale_items,
 )
 from .models import (
+    Coupon,
     CustomerOrder,
+    ExchangeStatus,
     OrderStatus,
     PaymentMethod,
     PaymentStatus,
+    RefundStatus,
+)
+from .refunds import (
+    approve_refund,
+    complete_refund,
+    reject_refund,
+    request_refund,
+    with_refund_status,
 )
 from .serializers import (
     CartItemAddSerializer,
@@ -67,27 +96,40 @@ from .serializers import (
     CheckoutCalculationInputSerializer,
     CheckoutCalculationSerializer,
     CheckoutInputSerializer,
+    CouponAdminSerializer,
+    CouponEmailMessageSerializer,
+    CustomerOrderDetailSerializer,
     DashboardDetailSerializer,
     DashboardLowStockSerializer,
     DashboardOrderDrillDownSerializer,
     DashboardOrderPageSerializer,
     DashboardRecentOrderSerializer,
+    ExchangeApproveSerializer,
+    ExchangeCompleteSerializer,
+    ExchangeMessageSerializer,
+    ExchangeReceiveSerializer,
+    ExchangeRequestSerializer,
     OrderDetailSerializer,
     OrderStatusUpdateSerializer,
     PaymentReturnSerializer,
     PaymentWebhookSerializer,
+    RefundApproveSerializer,
+    RefundCompleteSerializer,
+    RefundRejectSerializer,
+    RefundRequestSerializer,
 )
 from .services import (
+    PENDING_REFUND_SHIPPING_MESSAGE,
     add_item_to_cart,
     clear_cart,
     complete_checkout_attempt,
     confirm_infinitepay_payment,
     create_shipping_quote,
     get_cart_data,
+    has_pending_refund_request,
     prepare_checkout_attempt,
     release_if_expired,
     remove_item_from_cart,
-    restore_order_stock,
     update_item_quantity,
     update_status,
     update_tracking_code,
@@ -192,10 +234,10 @@ class DashboardDetailView(APIView):
     @extend_schema(
         description=(
             "Vendas válidas: pedido DELIVERED e pagamento PAID; reembolsos: "
-            "pagamento REFUNDED. Financeiro e séries usam payment.paid_at em "
-            "America/Sao_Paulo; receita líquida = total_amount das vendas válidas "
-            "menos total_amount dos reembolsos; ticket = líquido / vendas válidas "
-            "(zero sem vendas). Pedidos por status incluem todos os pedidos e usam "
+            "pedido DELIVERED e pagamento REFUNDED. Financeiro e séries usam "
+            "payment.paid_at em America/Sao_Paulo; receita bruta = total_amount "
+            "das vendas válidas e dos reembolsos; receita líquida = bruta menos "
+            "reembolsos; ticket = líquido / vendas válidas (zero sem vendas). Pedidos por status incluem todos os pedidos e usam "
             "CustomerOrder.created_at. Drops e categorias selecionam pedidos que "
             "tenham um mesmo item correspondente; rankings e distribuições somam "
             "somente esses itens por quantity × unit_price, sem rateio de frete ou "
@@ -238,8 +280,9 @@ class AdminDashboardView(APIView):
     @extend_schema(
         description=(
             "Dashboard comercial. Venda positiva exige pagamento PAID e pedido "
-            "DELIVERED; reembolsos subtraem CustomerOrder.total_amount. A competência "
-            "é payment.paid_at em America/Sao_Paulo."
+            "DELIVERED. A receita bruta inclui pedidos entregues e reembolsados, "
+            "que os reembolsos subtraem. A competência é payment.paid_at em "
+            "America/Sao_Paulo."
         ),
         parameters=METRIC_PARAMETERS,
         responses={
@@ -287,7 +330,7 @@ class AdminDashboardView(APIView):
         sales = positive_sales(orders)
         refunded = refunds(orders)
 
-        gross_revenue = sales.aggregate(total=Sum("total_amount"))["total"] or Decimal(
+        gross_revenue = orders.aggregate(total=Sum("total_amount"))["total"] or Decimal(
             "0"
         )
         refunded_revenue = refunded.aggregate(total=Sum("total_amount"))[
@@ -324,13 +367,17 @@ class AdminDashboardView(APIView):
             if granularity == "month"
             else TruncDay("payment__paid_at", tzinfo=METRICS_TIMEZONE)
         )
-        positive_points = {
-            row["bucket"]: row
+        gross_points = {
+            row["bucket"]: row["revenue"]
+            for row in orders.annotate(bucket=trunc)
+            .values("bucket")
+            .annotate(revenue=Sum("total_amount"))
+        }
+        sales_points = {
+            row["bucket"]: row["total_orders"]
             for row in sales.annotate(bucket=trunc)
             .values("bucket")
-            .annotate(
-                total_orders=Count("id", distinct=True), revenue=Sum("total_amount")
-            )
+            .annotate(total_orders=Count("id", distinct=True))
         }
         refund_points = {
             row["bucket"]: row["revenue"]
@@ -339,15 +386,14 @@ class AdminDashboardView(APIView):
             .annotate(revenue=Sum("total_amount"))
         }
         series = []
-        for bucket in sorted(set(positive_points) | set(refund_points)):
-            positive = positive_points.get(bucket, {})
-            net = (positive.get("revenue") or Decimal("0")) - (
+        for bucket in sorted(gross_points):
+            net = (gross_points.get(bucket) or Decimal("0")) - (
                 refund_points.get(bucket) or Decimal("0")
             )
             series.append(
                 {
                     "period": bucket.date().isoformat(),
-                    "total_orders": positive.get("total_orders", 0),
+                    "total_orders": sales_points.get(bucket, 0),
                     "total_revenue": f"{net:.2f}",
                 }
             )
@@ -404,9 +450,9 @@ class DashboardDrillDownView(APIView):
     @extend_schema(
         description=(
             "all mantém a lista comercial anterior e seus filtros customer/search. "
-            "valid_sales/gross_revenue usam vendas DELIVERED + PAID; refunds "
-            "usa pagamentos REFUNDED; net_revenue/average_ticket incluem ambos "
-            "os conjuntos que compõem o numerador. status requer status e usa "
+            "valid_sales usa vendas DELIVERED + PAID; refunds usa pedidos "
+            "DELIVERED com pagamento REFUNDED; gross_revenue, net_revenue e "
+            "average_ticket incluem ambos os conjuntos que compõem o numerador. status requer status e usa "
             "CustomerOrder.created_at, incluindo pedidos sem pagamento. "
             "payment_method requer payment_method e usa apenas vendas válidas. "
             "product_units/product_revenue requerem product_id; "
@@ -508,10 +554,12 @@ class UserOrderListView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        qs = (
-            CustomerOrder.objects.filter(user=request.user)
-            .select_related("user")
-            .order_by("-created_at")
+        qs = with_exchange_status(
+            with_refund_status(
+                CustomerOrder.objects.filter(user=request.user)
+                .select_related("user", "payment")
+                .order_by("-created_at")
+            )
         )
         data = DashboardRecentOrderSerializer(qs, many=True).data
         return Response(data, status=status.HTTP_200_OK)
@@ -525,6 +573,7 @@ class UserOrderDetailView(APIView):
 
     permission_classes = [IsAuthenticated]
 
+    @extend_schema(responses={200: CustomerOrderDetailSerializer})
     def get(self, request, order_id):
         try:
             order = (
@@ -535,7 +584,9 @@ class UserOrderDetailView(APIView):
         except CustomerOrder.DoesNotExist:
             return Response({"message": "Pedido não encontrado."}, status=404)
         release_if_expired(order)
-        return Response(OrderDetailSerializer(order).data, status=status.HTTP_200_OK)
+        return Response(
+            CustomerOrderDetailSerializer(order).data, status=status.HTTP_200_OK
+        )
 
 
 class AdminOrderListView(APIView):
@@ -554,17 +605,217 @@ class AdminOrderListView(APIView):
                 description="Filtra pedidos pelo status (ex: PAID, SHIPPED)",
                 location=OpenApiParameter.QUERY,
             ),
+            OpenApiParameter(
+                name="refund_status",
+                type=OpenApiTypes.STR,
+                enum=RefundStatus.values,
+                description="Filtra pelo status do reembolso mais recente do pedido",
+                location=OpenApiParameter.QUERY,
+            ),
+            OpenApiParameter(
+                name="exchange_status",
+                type=OpenApiTypes.STR,
+                enum=ExchangeStatus.values,
+                description="Filtra pelo status da troca mais recente do pedido",
+                location=OpenApiParameter.QUERY,
+            ),
         ],
         responses={200: DashboardRecentOrderSerializer(many=True)},
     )
     def get(self, request):
         status_q = request.query_params.get("status")
-        qs = CustomerOrder.objects.select_related("user").order_by("-created_at")
+        refund_status_q = request.query_params.get("refund_status")
+        exchange_status_q = request.query_params.get("exchange_status")
+        qs = with_exchange_status(
+            with_refund_status(
+                CustomerOrder.objects.select_related("user", "payment").order_by(
+                    "-created_at"
+                )
+            )
+        )
         if status_q:
             qs = qs.filter(status=status_q)
+        if refund_status_q:
+            if refund_status_q not in RefundStatus.values:
+                raise ValidationError(
+                    {"refund_status": "Status de reembolso inválido."}
+                )
+            qs = qs.filter(refund_status=refund_status_q)
+        if exchange_status_q:
+            if exchange_status_q not in ExchangeStatus.values:
+                raise ValidationError({"exchange_status": "Status de troca inválido."})
+            qs = qs.filter(exchange_status=exchange_status_q)
 
         data = DashboardRecentOrderSerializer(qs, many=True).data
         return Response(data, status=status.HTTP_200_OK)
+
+
+class AdminOrderExportView(APIView):
+    """
+    GET /api/orders/admin/export/
+    Exporta pedidos para CSV ou Excel (.xlsx) respeitando filtros de busca e status.
+    Requer a permissão CanManageOrders.
+    """
+
+    permission_classes = [CanManageOrders]
+
+    @extend_schema(
+        tags=["Orders Admin"],
+        summary="Exportar pedidos",
+        parameters=[
+            OpenApiParameter(
+                name="file_format",
+                type=OpenApiTypes.STR,
+                description="Formato de exportação: 'csv' (padrão) ou 'xlsx'",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
+            OpenApiParameter(
+                name="status",
+                type=OpenApiTypes.STR,
+                description="Filtra pedidos pelo status (ex: PAID, SHIPPED)",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
+            OpenApiParameter(
+                name="search",
+                type=OpenApiTypes.STR,
+                description="Busca por ID do pedido ou nome do cliente",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
+        ],
+        responses={
+            200: OpenApiResponse(description="Arquivo exportado (CSV ou XLSX)"),
+            400: OpenApiResponse(description="Formato inválido"),
+            403: OpenApiResponse(description="Acesso negado"),
+        },
+    )
+    def get(self, request):
+        status_q = request.query_params.get("status")
+        search_q = request.query_params.get("search")
+        file_format = request.query_params.get("file_format", "csv")
+
+        qs = (
+            CustomerOrder.objects.select_related("user", "payment", "coupon")
+            .prefetch_related("items__variation__product")
+            .order_by("-created_at")
+        )
+        if status_q:
+            qs = qs.filter(status=status_q)
+        if search_q:
+            clean_search = search_q.strip()
+            id_filter = Q(id__icontains=clean_search)
+            if clean_search.startswith("#"):
+                clean_no_hash = clean_search[1:].strip()
+                id_filter = Q(id__icontains=clean_no_hash)
+            # Mesma busca da tela de Pedidos: ID ou nome exibido do cliente
+            # (o e-mail só aparece como nome quando o cliente não tem nome)
+            no_name = Q(user__name="") | Q(user__name__isnull=True)
+            qs = qs.filter(
+                id_filter
+                | Q(user__name__icontains=clean_search)
+                | (no_name & Q(user__email__icontains=clean_search))
+            )
+
+        headers = [
+            "Número",
+            "Data",
+            "Cliente",
+            "E-mail",
+            "Itens",
+            "Subtotal",
+            "Desconto",
+            "Cupom",
+            "Frete",
+            "Total",
+            "Status do Pedido",
+            "Status do Pagamento",
+        ]
+        column_types = [
+            "text",
+            "datetime",
+            "text",
+            "text",
+            "text",
+            "currency",
+            "currency",
+            "text",
+            "currency",
+            "currency",
+            "text",
+            "text",
+        ]
+
+        order_status_labels = {
+            OrderStatus.AWAITING_PAYMENT: "Aguardando Pagamento",
+            OrderStatus.PAID: "Pago",
+            OrderStatus.PREPARING: "Preparando",
+            OrderStatus.SHIPPED: "Em transporte",
+            OrderStatus.DELIVERED: "Entregue",
+            OrderStatus.CANCELED: "Cancelado",
+        }
+
+        payment_status_labels = {
+            PaymentStatus.PENDING: "Pendente",
+            PaymentStatus.PROCESSING: "Processando",
+            PaymentStatus.PAID: "Pago",
+            PaymentStatus.FAILED: "Falhou",
+            PaymentStatus.REFUNDED: "Reembolsado",
+        }
+
+        rows = []
+        for order in qs:
+            item_summaries = []
+            for item in order.items.all():
+                # No checkout, product_name já inclui a variação
+                # ("Camisa Azul - GG / Azul"); usa o nome do produto para não
+                # repetir a variação entre parênteses.
+                name = item.product_name
+                var_desc = ""
+                if item.variation:
+                    name = item.variation.product.name
+                    attrs = [item.variation.size, item.variation.color]
+                    attrs = [a for a in attrs if a]
+                    if attrs:
+                        var_desc = f" ({' / '.join(attrs)})"
+                item_summaries.append(f"{item.quantity}x {name}{var_desc}")
+            items_text = ", ".join(item_summaries) if item_summaries else "Sem itens"
+
+            coupon_code = order.coupon.code if order.coupon else None
+
+            order_status = order_status_labels.get(order.status, order.status)
+            if hasattr(order, "payment") and order.payment:
+                payment_status = payment_status_labels.get(
+                    order.payment.status, order.payment.status
+                )
+            else:
+                payment_status = "Sem pagamento"
+
+            rows.append(
+                [
+                    str(order.id),
+                    order.created_at,
+                    getattr(order.user, "name", None) or order.user.email,
+                    order.user.email,
+                    items_text,
+                    order.subtotal,
+                    order.discount_amount,
+                    coupon_code,
+                    order.shipping_cost,
+                    order.total_amount,
+                    order_status,
+                    payment_status,
+                ]
+            )
+
+        return export_data_response(
+            filename_base="pedidos",
+            headers=headers,
+            rows=rows,
+            file_format=file_format,
+            column_types=column_types,
+        )
 
 
 class AdminOrderDetailView(APIView):
@@ -620,7 +871,10 @@ class AdminOrderDetailView(APIView):
             ):
                 return Response(
                     {
-                        "message": "Não é possível cancelar um pedido com pagamento confirmado."
+                        "message": (
+                            "Não é possível cancelar um pedido com pagamento "
+                            "confirmado. Use o fluxo de reembolso."
+                        )
                     },
                     status=status.HTTP_400_BAD_REQUEST,
                 )
@@ -631,16 +885,6 @@ class AdminOrderDetailView(APIView):
         ):
             return Response(
                 {"message": "Tracking code obrigatório ao enviar pedido."}, status=400
-            )
-
-        if serializer.validated_data.get("physical_return_confirmed") and not (
-            order.status in (OrderStatus.SHIPPED, OrderStatus.DELIVERED)
-            or order.status_logs.filter(
-                new_status__in=[OrderStatus.SHIPPED, OrderStatus.DELIVERED]
-            ).exists()
-        ):
-            return Response(
-                {"message": "Retorno físico exige expedição anterior."}, status=400
             )
 
         if order.status == OrderStatus.SHIPPED and status_value == OrderStatus.SHIPPED:
@@ -668,10 +912,311 @@ class AdminOrderDetailView(APIView):
                 order.payment.status = PaymentStatus.FAILED
                 order.payment.save()
 
-        if serializer.validated_data.get("physical_return_confirmed"):
-            restore_order_stock(order, changed_by=request.user, physical_return=True)
-
         return Response(OrderDetailSerializer(order).data, status=status.HTTP_200_OK)
+
+
+def _order_for_detail(order_id):
+    return (
+        CustomerOrder.objects.select_related("user", "address", "payment")
+        .prefetch_related("items__variation__product")
+        .get(id=order_id)
+    )
+
+
+REFUND_ERROR_RESPONSES = {
+    400: OpenApiResponse(description="Dados inválidos ou reembolso não permitido."),
+    404: OpenApiResponse(description="Pedido não encontrado."),
+    409: OpenApiResponse(description="Conflito com o reembolso atual do pedido."),
+}
+
+
+class UserRefundRequestView(APIView):
+    """
+    POST /api/orders/my-orders/<order_id>/refund-request/
+    O cliente solicita o reembolso integral do próprio pedido.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        summary="Solicitar reembolso",
+        description=(
+            "Permitido com pagamento confirmado: antes do envio, para pedido "
+            "cancelado após o pagamento ou até o fim do 7º dia após a entrega "
+            "(America/Sao_Paulo). Erros de regra respondem "
+            '`{"message": "...", "code": "..."}`; os códigos são os de '
+            "`refund_eligibility.code`."
+        ),
+        request=RefundRequestSerializer,
+        responses={201: CustomerOrderDetailSerializer, **REFUND_ERROR_RESPONSES},
+    )
+    def post(self, request, order_id):
+        order = CustomerOrder.objects.filter(id=order_id, user=request.user).first()
+        if order is None:
+            return Response({"message": "Pedido não encontrado."}, status=404)
+        serializer = RefundRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        request_refund(order, request.user, **serializer.validated_data)
+        return Response(
+            CustomerOrderDetailSerializer(_order_for_detail(order.pk)).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class AdminRefundApproveView(APIView):
+    """
+    POST /api/orders/admin/<order_id>/refund/approve/
+    Aprova o pedido de reembolso; pedido pago e não enviado é cancelado.
+    """
+
+    permission_classes = [CanManageOrders]
+
+    @extend_schema(
+        summary="Aprovar pedido de reembolso",
+        request=RefundApproveSerializer,
+        responses={200: OrderDetailSerializer, **REFUND_ERROR_RESPONSES},
+    )
+    def post(self, request, order_id):
+        order = CustomerOrder.objects.filter(id=order_id).first()
+        if order is None:
+            return Response({"message": "Pedido não encontrado."}, status=404)
+        serializer = RefundApproveSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        approve_refund(order, request.user, serializer.validated_data["message"])
+        return Response(OrderDetailSerializer(_order_for_detail(order.pk)).data)
+
+
+class AdminRefundRejectView(APIView):
+    """
+    POST /api/orders/admin/<order_id>/refund/reject/
+    Recusa o pedido de reembolso com justificativa visível ao cliente.
+    """
+
+    permission_classes = [CanManageOrders]
+
+    @extend_schema(
+        summary="Recusar pedido de reembolso",
+        request=RefundRejectSerializer,
+        responses={200: OrderDetailSerializer, **REFUND_ERROR_RESPONSES},
+    )
+    def post(self, request, order_id):
+        order = CustomerOrder.objects.filter(id=order_id).first()
+        if order is None:
+            return Response({"message": "Pedido não encontrado."}, status=404)
+        serializer = RefundRejectSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        reject_refund(order, request.user, serializer.validated_data["message"])
+        return Response(OrderDetailSerializer(_order_for_detail(order.pk)).data)
+
+
+class AdminRefundView(APIView):
+    """
+    POST /api/orders/admin/<order_id>/refund/
+    Registra o estorno já feito no painel da InfinitePay.
+    """
+
+    permission_classes = [CanManageOrders]
+
+    @extend_schema(
+        summary="Registrar estorno",
+        description=(
+            "Conclui o reembolso solicitado ou aprovado do pedido; sem nenhum, "
+            "cria um registro direto e exige `reason`. O estorno deve ter sido "
+            "feito antes no painel da InfinitePay: este endpoint não movimenta "
+            "dinheiro. `items_returned` é obrigatório para pedido SHIPPED e "
+            "opcional para DELIVERED; nos demais status é ignorado."
+        ),
+        request=RefundCompleteSerializer,
+        responses={
+            200: OrderDetailSerializer,
+            201: OrderDetailSerializer,
+            **REFUND_ERROR_RESPONSES,
+        },
+    )
+    def post(self, request, order_id):
+        order = CustomerOrder.objects.filter(id=order_id).first()
+        if order is None:
+            return Response({"message": "Pedido não encontrado."}, status=404)
+        serializer = RefundCompleteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        _, created = complete_refund(order, request.user, **serializer.validated_data)
+        return Response(
+            OrderDetailSerializer(_order_for_detail(order.pk)).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+EXCHANGE_ERROR_RESPONSES = {
+    400: OpenApiResponse(description="Dados inválidos ou troca não permitida."),
+    404: OpenApiResponse(description="Pedido não encontrado."),
+    409: OpenApiResponse(description="Conflito com a troca atual do pedido."),
+}
+
+
+class UserExchangeRequestView(APIView):
+    """
+    POST /api/orders/my-orders/<order_id>/exchange-request/
+    O cliente solicita a troca de itens do próprio pedido entregue.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        summary="Solicitar troca",
+        description=(
+            "Troca por outra variação do mesmo produto, em pedido entregue e pago: "
+            "tamanho ou cor até o fim do 30º dia após a entrega e defeito até o fim "
+            "do 90º (America/Sao_Paulo). A variação precisa ter estoque. Erros de "
+            'regra respondem `{"message": "...", "code": "..."}`; os códigos são os '
+            "de `exchange_eligibility.code`, `size_deadline_passed` e "
+            "`replacement_out_of_stock`."
+        ),
+        request=ExchangeRequestSerializer,
+        responses={201: CustomerOrderDetailSerializer, **EXCHANGE_ERROR_RESPONSES},
+    )
+    def post(self, request, order_id):
+        order = CustomerOrder.objects.filter(id=order_id, user=request.user).first()
+        if order is None:
+            return Response({"message": "Pedido não encontrado."}, status=404)
+        serializer = ExchangeRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        request_exchange(order, request.user, **serializer.validated_data)
+        return Response(
+            CustomerOrderDetailSerializer(_order_for_detail(order.pk)).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class _AdminExchangeView(APIView):
+    """Base das ações do administrador sobre a troca aberta do pedido."""
+
+    permission_classes = [CanManageOrders]
+    serializer_class = None
+
+    def act(self, order, admin, data):
+        raise NotImplementedError
+
+    def post(self, request, order_id):
+        order = CustomerOrder.objects.filter(id=order_id).first()
+        if order is None:
+            return Response({"message": "Pedido não encontrado."}, status=404)
+        serializer = self.serializer_class(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.act(order, request.user, serializer.validated_data)
+        return Response(OrderDetailSerializer(_order_for_detail(order.pk)).data)
+
+
+class AdminExchangeApproveView(_AdminExchangeView):
+    """
+    POST /api/orders/admin/<order_id>/exchange/approve/
+    Aprova a troca e reserva a reposição no estoque.
+    """
+
+    serializer_class = ExchangeApproveSerializer
+
+    @extend_schema(
+        summary="Aprovar troca",
+        description=(
+            "Reserva a reposição com saída TROCA. Sem estoque, nada é gravado e "
+            "responde `replacement_out_of_stock`."
+        ),
+        request=ExchangeApproveSerializer,
+        responses={200: OrderDetailSerializer, **EXCHANGE_ERROR_RESPONSES},
+    )
+    def post(self, request, order_id):
+        return super().post(request, order_id)
+
+    def act(self, order, admin, data):
+        approve_exchange(order, admin, data["message"])
+
+
+class AdminExchangeRejectView(_AdminExchangeView):
+    """
+    POST /api/orders/admin/<order_id>/exchange/reject/
+    Recusa a troca com justificativa visível ao cliente.
+    """
+
+    serializer_class = ExchangeMessageSerializer
+
+    @extend_schema(
+        summary="Recusar troca",
+        request=ExchangeMessageSerializer,
+        responses={200: OrderDetailSerializer, **EXCHANGE_ERROR_RESPONSES},
+    )
+    def post(self, request, order_id):
+        return super().post(request, order_id)
+
+    def act(self, order, admin, data):
+        reject_exchange(order, admin, data["message"])
+
+
+class AdminExchangeReceiveView(_AdminExchangeView):
+    """
+    POST /api/orders/admin/<order_id>/exchange/receive/
+    Confirma a chegada da peça e informa se ela volta ao estoque.
+    """
+
+    serializer_class = ExchangeReceiveSerializer
+
+    @extend_schema(
+        summary="Confirmar recebimento da troca",
+        description=(
+            "Cada item da troca precisa de `condition`: RESTOCK registra entrada "
+            "DEVOLUCAO; LOSS registra a entrada e, em seguida, saída PERDA."
+        ),
+        request=ExchangeReceiveSerializer,
+        responses={200: OrderDetailSerializer, **EXCHANGE_ERROR_RESPONSES},
+    )
+    def post(self, request, order_id):
+        return super().post(request, order_id)
+
+    def act(self, order, admin, data):
+        receive_exchange(
+            order,
+            admin,
+            {item["id"]: item["condition"] for item in data["items"]},
+            data["internal_note"],
+        )
+
+
+class AdminExchangeCompleteView(_AdminExchangeView):
+    """
+    POST /api/orders/admin/<order_id>/exchange/complete/
+    Registra o envio da reposição e conclui a troca.
+    """
+
+    serializer_class = ExchangeCompleteSerializer
+
+    @extend_schema(
+        summary="Registrar envio da troca",
+        request=ExchangeCompleteSerializer,
+        responses={200: OrderDetailSerializer, **EXCHANGE_ERROR_RESPONSES},
+    )
+    def post(self, request, order_id):
+        return super().post(request, order_id)
+
+    def act(self, order, admin, data):
+        complete_exchange(order, admin, data["tracking_code"])
+
+
+class AdminExchangeCancelView(_AdminExchangeView):
+    """
+    POST /api/orders/admin/<order_id>/exchange/cancel/
+    Cancela a troca antes do recebimento e devolve a reserva ao estoque.
+    """
+
+    serializer_class = ExchangeMessageSerializer
+
+    @extend_schema(
+        summary="Cancelar troca",
+        request=ExchangeMessageSerializer,
+        responses={200: OrderDetailSerializer, **EXCHANGE_ERROR_RESPONSES},
+    )
+    def post(self, request, order_id):
+        return super().post(request, order_id)
+
+    def act(self, order, admin, data):
+        cancel_exchange(order, admin, data["message"])
 
 
 class CheckoutCalculationView(APIView):
@@ -1028,6 +1573,13 @@ class OrderDispatchView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # Antes dos Correios: a etiqueta é gerada antes de update_status.
+        if has_pending_refund_request(order):
+            return Response(
+                {"message": PENDING_REFUND_SHIPPING_MESSAGE},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         try:
             tracking_code = dispatch_order_and_get_tracking_code(order)
         except (CorreiosAuthenticationError, CorreiosPrePostagemError) as e:
@@ -1212,4 +1764,202 @@ class CartItemDetailAPIView(APIView):
         cart_data = get_cart_data(request)
         return Response(
             CartRepresentationSerializer(cart_data).data, status=status.HTTP_200_OK
+        )
+
+
+class CouponListCreateView(APIView):
+    permission_classes = [IsStaffOrSuperUser]
+
+    @extend_schema(responses=CouponAdminSerializer(many=True))
+    def get(self, request):
+        active = request.query_params.get("active")
+        search = request.query_params.get("search")
+        partner = request.query_params.get("partner")
+
+        qs = Coupon.objects.all()
+        if active == "true":
+            qs = qs.filter(is_active=True)
+        elif active == "false":
+            qs = qs.filter(is_active=False)
+
+        if search:
+            qs = qs.filter(Q(code__icontains=search) | Q(description__icontains=search))
+
+        if partner:
+            qs = qs.filter(partner=partner)
+
+        # Metrics
+        valid_orders = valid_order_q("orders__")
+        qs = qs.annotate(
+            uses_count=Count("orders", filter=valid_orders),
+            total_discount_given=Sum("orders__discount_amount", filter=valid_orders),
+            revenue=Sum("orders__total_amount", filter=valid_orders),
+        ).order_by("-created_at")
+
+        # Pagination using existing DRF pattern in project (PageNumberPagination is usually standard)
+        paginator = PageNumberPagination()
+        paginated_qs = paginator.paginate_queryset(qs, request)
+        serializer = CouponAdminSerializer(paginated_qs, many=True)
+        return paginator.get_paginated_response(serializer.data)
+
+    @extend_schema(request=CouponAdminSerializer, responses=CouponAdminSerializer)
+    def post(self, request):
+        serializer = CouponAdminSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        coupon = serializer.save()
+
+        valid_orders = valid_order_q("orders__")
+        qs = Coupon.objects.annotate(
+            uses_count=Count("orders", filter=valid_orders),
+            total_discount_given=Sum("orders__discount_amount", filter=valid_orders),
+            revenue=Sum("orders__total_amount", filter=valid_orders),
+        ).get(id=coupon.id)
+
+        resp_serializer = CouponAdminSerializer(qs)
+        return Response(resp_serializer.data, status=status.HTTP_201_CREATED)
+
+
+class CouponDetailView(APIView):
+    permission_classes = [IsStaffOrSuperUser]
+
+    def get_object(self, pk):
+        valid_orders = valid_order_q("orders__")
+        qs = Coupon.objects.annotate(
+            uses_count=Count("orders", filter=valid_orders),
+            total_discount_given=Sum("orders__discount_amount", filter=valid_orders),
+            revenue=Sum("orders__total_amount", filter=valid_orders),
+        )
+        from django.shortcuts import get_object_or_404
+
+        return get_object_or_404(qs, pk=pk)
+
+    @extend_schema(responses=CouponAdminSerializer)
+    def get(self, request, uuid):
+        coupon = self.get_object(uuid)
+        serializer = CouponAdminSerializer(coupon)
+        return Response(serializer.data)
+
+    @extend_schema(request=CouponAdminSerializer, responses=CouponAdminSerializer)
+    def patch(self, request, uuid):
+        coupon = self.get_object(uuid)
+        serializer = CouponAdminSerializer(coupon, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+
+        # O code não pode mudar depois do primeiro uso.
+        if "code" in request.data and coupon.uses_count > 0:
+            if request.data["code"].upper() != coupon.code:
+                from rest_framework.exceptions import ValidationError
+
+                raise ValidationError(
+                    {
+                        "code": "Não é possível alterar o código de um cupom que já foi usado."
+                    }
+                )
+
+        serializer.save()
+
+        coupon = self.get_object(uuid)
+        resp_serializer = CouponAdminSerializer(coupon)
+        return Response(resp_serializer.data)
+
+    @extend_schema(responses={200: dict, 204: None})
+    def delete(self, request, uuid):
+        coupon = self.get_object(uuid)
+        if coupon.uses_count > 0:
+            coupon.is_active = False
+            coupon.save()
+            return Response(
+                {"message": "Cupom desativado pois já possui usos."},
+                status=status.HTTP_200_OK,
+            )
+        else:
+            coupon.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class _CouponEmailBaseView(APIView):
+    permission_classes = [IsStaffOrSuperUser]
+
+    def get_coupon(self, uuid):
+        from django.shortcuts import get_object_or_404
+
+        return get_object_or_404(Coupon, pk=uuid)
+
+    def get_message(self, request) -> str:
+        serializer = CouponEmailMessageSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        return serializer.validated_data.get("message", "")
+
+
+class CouponEmailSummaryView(_CouponEmailBaseView):
+    @extend_schema(responses=dict)
+    def get(self, request, uuid):
+        coupon = self.get_coupon(uuid)
+        audience = build_audience(first_purchase_only=coupon.first_purchase_only)
+        history = [
+            {
+                "sent_at": send.sent_at,
+                "sent_by_name": send.sent_by.name if send.sent_by else None,
+                "sent_count": send.sent_count,
+                "failed_count": send.failed_count,
+            }
+            for send in coupon.email_sends.select_related("sent_by")
+        ]
+        return Response(
+            {
+                "block_reason": coupon_send_block_reason(coupon),
+                "audience": {
+                    "total": audience.total,
+                    "buyers": audience.buyers,
+                    "subscribers": audience.subscribers,
+                    "overlap": audience.overlap,
+                    "suppressed": audience.suppressed,
+                },
+                "history": history,
+            }
+        )
+
+
+class CouponEmailPreviewView(_CouponEmailBaseView):
+    @extend_schema(request=CouponEmailMessageSerializer, responses=dict)
+    def post(self, request, uuid):
+        coupon = self.get_coupon(uuid)
+        message = self.get_message(request)
+        return Response({"html": render_coupon_preview(coupon, message)})
+
+
+class CouponEmailTestView(_CouponEmailBaseView):
+    @extend_schema(request=CouponEmailMessageSerializer, responses=dict)
+    def post(self, request, uuid):
+        coupon = self.get_coupon(uuid)
+        message = self.get_message(request)
+        if send_coupon_test(coupon, request.user, message):
+            return Response({"sent": True})
+        return Response(
+            {"error": "Não foi possível enviar o teste."},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
+class CouponEmailSendView(_CouponEmailBaseView):
+    @extend_schema(request=CouponEmailMessageSerializer, responses=dict)
+    def post(self, request, uuid):
+        coupon = self.get_coupon(uuid)
+        message = self.get_message(request)
+        reason = coupon_send_block_reason(coupon)
+        if reason:
+            return Response({"error": reason}, status=status.HTTP_400_BAD_REQUEST)
+        audience = build_audience(first_purchase_only=coupon.first_purchase_only)
+        if audience.total == 0:
+            return Response(
+                {"error": "Ninguém para receber."}, status=status.HTTP_400_BAD_REQUEST
+            )
+        record = send_coupon_campaign(coupon, request.user, message)
+        return Response(
+            {
+                "sent_count": record.sent_count,
+                "failed_count": record.failed_count,
+                "sent_at": record.sent_at,
+            },
+            status=status.HTTP_201_CREATED,
         )

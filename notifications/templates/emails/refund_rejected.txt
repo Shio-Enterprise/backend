@@ -1,0 +1,15 @@
+{% extends "emails/base.txt" %}
+
+{% block content %}
+Olá, {{ nome|default:"cliente" }}!
+
+Seu pedido de reembolso referente ao pedido {{ pedido }} foi recusado.
+
+Justificativa da loja:
+{{ refund.review_message }}
+
+Se tiver dúvidas, fale com a loja.
+
+Detalhe do pedido:
+{{ pedido_url }}
+{% endblock %}

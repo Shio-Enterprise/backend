@@ -30,10 +30,12 @@ from orders.models import (
     Payment,
     PaymentMethod,
     PaymentStatus,
+    RefundStatus,
     ShippingQuote,
     normalize_coupon_code,
 )
 from orders.money import money_to_cents, normalize_money
+from orders.shipping import resolve_shipping_parameters
 from products.availability import (
     get_drop_sold_quantity,
     is_product_open_for_sale,
@@ -59,6 +61,22 @@ ALLOWED_TRANSITIONS = {
     OrderStatus.DELIVERED: set(),
     OrderStatus.CANCELED: set(),
 }
+
+# Pedido pago só é cancelado pelo fluxo de reembolso, nunca pelo PATCH genérico.
+REFUND_CANCELABLE_STATUSES = {
+    OrderStatus.PAID,
+    OrderStatus.PREPARING,
+    OrderStatus.SHIPPED,
+}
+
+PENDING_REFUND_SHIPPING_MESSAGE = (
+    "Pedido com reembolso solicitado não pode ser enviado. "
+    "Aprove, recuse ou registre o reembolso antes."
+)
+
+
+def has_pending_refund_request(order):
+    return order.refunds.filter(status=RefundStatus.REQUESTED).exists()
 
 
 class CheckoutShippingUnavailable(APIException):
@@ -151,6 +169,13 @@ def _get_checkout_contents(
     destination = address.zip_code.replace("-", "").strip()
     if len(destination) != 8 or not destination.isdigit():
         raise ValidationError({"message": "CEP do endereço inválido."})
+    try:
+        shipping_parameters = resolve_shipping_parameters(
+            destination,
+            declared_value=max(subtotal - coupon_result.discount, Decimal("0.00")),
+        )
+    except ValueError as exc:
+        raise CheckoutShippingUnavailable() from exc
     return {
         "cart": cart,
         "address": address,
@@ -166,33 +191,30 @@ def _get_checkout_contents(
             if coupon_result.error_code
             else None
         ),
-        "shipping_parameters": {
-            "origin": settings.CORREIOS_REMETENTE_CEP.replace("-", "").strip(),
-            "destination": destination,
-            "service": str(settings.CORREIOS_CODIGO_SERVICO),
-            "weight": str(settings.CORREIOS_PESO_PADRAO_GRAMAS),
-            "mock_enabled": settings.CORREIOS_MOCK_ENABLED,
-            "base_url": settings.CORREIOS_API_BASE_URL,
-        },
+        "shipping_parameters": shipping_parameters,
     }
 
 
 def _calculate_checkout(contents):
     shipping_parameters = contents["shipping_parameters"]
-    origin = shipping_parameters["origin"]
-    destination = shipping_parameters["destination"]
+    origin = shipping_parameters.origin
+    destination = shipping_parameters.destination
     try:
         if len(origin) != 8 or not origin.isdigit():
             raise ValueError("CEP do remetente inválido.")
         price = fetch_shipping_price_by_service_and_ceps(
-            shipping_parameters["service"],
+            shipping_parameters.service,
             origin,
             destination,
-            shipping_parameters["weight"],
+            shipping_parameters.weight_grams,
+            comprimento=shipping_parameters.length_cm,
+            largura=shipping_parameters.width_cm,
+            altura=shipping_parameters.height_cm,
+            vl_declarado=shipping_parameters.declared_value,
         )
         shipping_cost = normalize_money(price["pcFinal"])
         deadline = fetch_shipping_deadline_by_service_and_ceps(
-            shipping_parameters["service"],
+            shipping_parameters.service,
             origin,
             destination,
         )
@@ -267,7 +289,7 @@ def _shipping_quote_snapshot(contents):
             )
         },
         "address_updated_at": address.updated_at.isoformat(),
-        "shipping_parameters": contents["shipping_parameters"],
+        "shipping_parameters": contents["shipping_parameters"].as_snapshot(),
         "coupon": (
             {
                 "id": str(contents["coupon"].pk),
@@ -687,12 +709,17 @@ def complete_checkout_attempt(attempt, request):
             raise ValueError("URL de checkout inválida.")
     except Exception:
         CheckoutAttempt.objects.filter(pk=attempt.pk).update(
-            status=CheckoutAttemptStatus.UNCERTAIN, updated_at=timezone.now()
+            status=CheckoutAttemptStatus.UNCERTAIN,
+            last_error_code="gateway_error",
+            last_error_at=timezone.now(),
+            updated_at=timezone.now(),
         )
     else:
         CheckoutAttempt.objects.filter(pk=attempt.pk).update(
             status=CheckoutAttemptStatus.SUCCEEDED,
             checkout_url=checkout_url,
+            last_error_code="",
+            last_error_at=None,
             updated_at=timezone.now(),
         )
     attempt.refresh_from_db()
@@ -1184,7 +1211,15 @@ def release_if_expired(order):
 
 
 @transaction.atomic
-def update_status(order, new_status, changed_by=None, tracking_code=None, comment=None):
+def update_status(
+    order,
+    new_status,
+    changed_by=None,
+    tracking_code=None,
+    comment=None,
+    *,
+    refund_cancellation=False,
+):
     """Centraliza a atualização de status de pedidos e cria um log histórico.
 
     Args:
@@ -1193,6 +1228,7 @@ def update_status(order, new_status, changed_by=None, tracking_code=None, commen
         changed_by: User who made the change (optional)
         tracking_code: optional tracking code to save
         comment: optional comment/observation
+        refund_cancellation: só para orders.refunds; permite cancelar pedido pago
     """
     locked = CustomerOrder.objects.select_for_update().get(pk=order.pk)
     order.status = locked.status
@@ -1208,11 +1244,15 @@ def update_status(order, new_status, changed_by=None, tracking_code=None, commen
             restore_order_stock(order, changed_by=changed_by)
 
     allowed = ALLOWED_TRANSITIONS.get(previous_status, set())
+    if refund_cancellation and previous_status in REFUND_CANCELABLE_STATUSES:
+        allowed = allowed | {OrderStatus.CANCELED}
 
     if new_status not in allowed:
         raise ValidationError(
             {"status": (f"Transição inválida: {previous_status} -> {new_status}.")}
         )
+    if new_status == OrderStatus.SHIPPED and has_pending_refund_request(order):
+        raise ValidationError({"status": PENDING_REFUND_SHIPPING_MESSAGE})
 
     if tracking_code:
         order.tracking_code = tracking_code

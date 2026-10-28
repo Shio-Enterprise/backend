@@ -105,7 +105,6 @@ class DashboardAggregatesTests(TestCase):
             total="100.00", paid_at=jan_first_local.astimezone(datetime.UTC)
         )
         self.create_order(
-            status=OrderStatus.CANCELED,
             payment_status=PaymentStatus.REFUNDED,
             total="30.00",
             paid_at=jan_third_local,
@@ -122,10 +121,10 @@ class DashboardAggregatesTests(TestCase):
         self.assertEqual(
             result["financial"],
             {
-                "gross_revenue": Decimal("100.00"),
+                "gross_revenue": Decimal("130.00"),
                 "refunds": Decimal("30.00"),
-                "net_revenue": Decimal("70.00"),
-                "average_ticket": Decimal("70.00"),
+                "net_revenue": Decimal("100.00"),
+                "average_ticket": Decimal("100.00"),
                 "valid_sales": 1,
             },
         )
@@ -135,7 +134,10 @@ class DashboardAggregatesTests(TestCase):
         )
         self.assertEqual(result["sales_series"][0]["gross_revenue"], 100)
         self.assertEqual(result["sales_series"][1]["net_revenue"], 0)
-        self.assertEqual(result["sales_series"][2]["net_revenue"], -30)
+        self.assertEqual(result["sales_series"][2]["gross_revenue"], 30)
+        self.assertEqual(result["sales_series"][2]["refunds"], 30)
+        self.assertEqual(result["sales_series"][2]["net_revenue"], 0)
+        self.assertEqual(result["sales_series"][2]["valid_sales"], 0)
         self.assertEqual(
             result["sales_by_payment_method"],
             [{"method": PaymentMethod.PIX, "valid_sales": 1, "gross_revenue": 100}],
@@ -179,7 +181,6 @@ class DashboardAggregatesTests(TestCase):
         self.add_item(selected, matching, price="20.00")
         self.add_item(selected, None, price="5.00")
         refunded = self.create_order(
-            status=OrderStatus.CANCELED,
             payment_status=PaymentStatus.REFUNDED,
             total="40.00",
         )
@@ -192,9 +193,9 @@ class DashboardAggregatesTests(TestCase):
         self.add_item(pending, variation_b, price="25.00")
 
         result = dashboard_detail_aggregates(self.today_params())
-        self.assertEqual(result["financial"]["gross_revenue"], 160)
+        self.assertEqual(result["financial"]["gross_revenue"], 200)
         self.assertEqual(result["financial"]["refunds"], 40)
-        self.assertEqual(result["financial"]["net_revenue"], 120)
+        self.assertEqual(result["financial"]["net_revenue"], 160)
         self.assertEqual(result["financial"]["valid_sales"], 2)
         self.assertEqual(
             result["product_rankings"]["by_units"][0]["product_id"],
@@ -225,9 +226,9 @@ class DashboardAggregatesTests(TestCase):
             row["status"]: row["orders"] for row in result["orders_by_status"]["rows"]
         }
         self.assertEqual(result["orders_by_status"]["date_basis"], "order_created_at")
-        self.assertEqual(statuses[OrderStatus.DELIVERED], 2)
+        self.assertEqual(statuses[OrderStatus.DELIVERED], 3)
         self.assertEqual(statuses[OrderStatus.AWAITING_PAYMENT], 1)
-        self.assertEqual(statuses[OrderStatus.CANCELED], 1)
+        self.assertNotIn(OrderStatus.CANCELED, statuses)
 
         params = {
             **self.today_params(),
@@ -321,7 +322,7 @@ class DashboardAggregatesTests(TestCase):
         self.assertEqual(old_period["customers"]["total_registered"], 2)
         self.assertEqual(old_period["customers"]["new_in_period"], 0)
 
-    def test_reembolso_sem_venda_preserva_receita_negativa(self):
+    def test_reembolso_de_pedido_nao_entregue_nao_afeta_receita(self):
         self.create_order(
             status=OrderStatus.CANCELED,
             payment_status=PaymentStatus.REFUNDED,
@@ -330,10 +331,20 @@ class DashboardAggregatesTests(TestCase):
 
         result = dashboard_detail_aggregates(self.today_params())
         self.assertEqual(result["financial"]["gross_revenue"], 0)
-        self.assertEqual(result["financial"]["refunds"], 30)
-        self.assertEqual(result["financial"]["net_revenue"], -30)
+        self.assertEqual(result["financial"]["refunds"], 0)
+        self.assertEqual(result["financial"]["net_revenue"], 0)
         self.assertEqual(result["financial"]["average_ticket"], 0)
-        self.assertEqual(result["sales_series"][0]["net_revenue"], -30)
+
+    def test_venda_entregue_reembolsada_entra_no_bruto_e_zera_no_liquido(self):
+        self.create_order(payment_status=PaymentStatus.REFUNDED, total="30.00")
+
+        result = dashboard_detail_aggregates(self.today_params())
+        self.assertEqual(result["financial"]["gross_revenue"], 30)
+        self.assertEqual(result["financial"]["refunds"], 30)
+        self.assertEqual(result["financial"]["net_revenue"], 0)
+        self.assertEqual(result["financial"]["valid_sales"], 0)
+        self.assertEqual(result["financial"]["average_ticket"], 0)
+        self.assertEqual(result["sales_series"][-1]["net_revenue"], 0)
 
     def test_rankings_limitam_linhas_sem_limitar_totais(self):
         drop = DropCampaign.objects.create(name="Ranking", slug="detail-ranking")

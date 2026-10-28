@@ -4,7 +4,8 @@ import re
 import uuid
 
 from django.db import IntegrityError, transaction
-from django.db.models import Max
+from django.db.models import Max, Sum, Value
+from django.db.models.functions import Coalesce
 from rest_framework.exceptions import APIException, ValidationError
 
 from .models import Product, ProductVariation, StockMovement, StockOpeningBalance
@@ -24,6 +25,14 @@ COLOR_NAMES = {
         "Preto",
     )
 }
+
+
+def get_inventory_summary():
+    return list(
+        Product.objects.annotate(
+            total_stock=Coalesce(Sum("variations__stock_quantity"), Value(0))
+        ).values("name", "total_stock")
+    )
 
 
 def normalize_color(value):
@@ -99,6 +108,12 @@ def move_stock(
         or order_item.variation_id != variation.pk
     ):
         raise ValidationError({"order_item": "Item incompatível com a origem."})
+    if (
+        origin_type == "EXCHANGE"
+        and order_item
+        and order_item.variation_id != variation.pk
+    ):
+        raise ValidationError({"order_item": "Item incompatível com a origem."})
     if reverses_movement:
         if (
             reverses_movement.variation_id != variation.pk
@@ -132,7 +147,12 @@ def move_stock(
             )
     except IntegrityError:
         raise OperationConflict("Operação ou compensação já registrada.") from None
+    previous = variation.stock_quantity
     ProductVariation.objects.filter(pk=variation.pk).update(stock_quantity=balance)
+    if previous == 0 and balance > 0:
+        from .stock_alerts import schedule_variation_alerts
+
+        schedule_variation_alerts(variation.pk)
     return movement
 
 

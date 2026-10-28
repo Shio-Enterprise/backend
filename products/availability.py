@@ -24,7 +24,8 @@ Sem reservas/TTL: a contagem de unidades vendidas soma OrderItem.quantity de
 todos os pedidos não CANCELED (mesmo critério já usado para o estoque, que é
 debitado na criação do pedido e não na confirmação do pagamento). Por isso não
 há rotina de liberação por expiração — cancelar o pedido já libera a
-quantidade, pois deixa de ser contada.
+quantidade, pois deixa de ser contada. Pedido reembolsado também deixa de
+contar, mesmo quando continua entregue.
 """
 
 from django.db.models import Q, Sum
@@ -60,12 +61,13 @@ def is_drop_open_for_sale(drop) -> bool:
 
 
 def get_drop_sold_quantity(drop) -> int:
-    """Soma de unidades já vendidas do drop (pedidos não CANCELED)."""
-    from orders.models import OrderItem, OrderStatus
+    """Soma de unidades já vendidas do drop (pedidos não CANCELED nem reembolsados)."""
+    from orders.models import OrderItem, OrderStatus, PaymentStatus
 
     total = (
         OrderItem.objects.filter(variation__product__drop=drop)
         .exclude(order__status=OrderStatus.CANCELED)
+        .exclude(order__payment__status=PaymentStatus.REFUNDED)
         .aggregate(total=Sum("quantity"))["total"]
     )
     return total or 0

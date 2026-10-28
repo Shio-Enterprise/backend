@@ -17,3 +17,9 @@ def normalize_money(value):
 
 def money_to_cents(value):
     return int(normalize_money(value) * Decimal("100"))
+
+
+def format_brl(value):
+    """Decimal('1234.5') -> 'R$ 1.234,50'."""
+    text = f"{normalize_money(value):,.2f}"
+    return "R$ " + text.replace(",", "_").replace(".", ",").replace("_", ".")

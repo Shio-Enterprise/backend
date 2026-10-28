@@ -369,7 +369,7 @@ class O7MetricsTestCase(APITestCase):
         )
         self.assertEqual(set(metric_orders({}).values_list("id", flat=True)), {sold.id})
 
-    def test_reembolso_afeta_serie_temporal_e_total_gasto_do_crm(self):
+    def test_reembolso_sai_da_receita_liquida_da_serie_e_do_crm(self):
         paid_at = timezone.now().astimezone(SAO_PAULO) - datetime.timedelta(hours=1)
         self.create_order(total="100.00", paid_at=paid_at)
         self.create_order(
@@ -377,14 +377,15 @@ class O7MetricsTestCase(APITestCase):
         )
 
         dashboard = self.client.get(self.dashboard_url).json()
+        summary = dashboard["sales_summary"]
+        self.assertEqual(Decimal(summary["gross_revenue"]), Decimal("130.00"))
+        self.assertEqual(Decimal(summary["refunds"]), Decimal("30.00"))
+        self.assertEqual(Decimal(summary["total_revenue"]), Decimal("100.00"))
         self.assertEqual(
-            Decimal(dashboard["sales_summary"]["total_revenue"]), Decimal("70.00")
-        )
-        self.assertEqual(
-            Decimal(dashboard["series"][0]["total_revenue"]), Decimal("70.00")
+            Decimal(dashboard["series"][0]["total_revenue"]), Decimal("100.00")
         )
 
         crm = self.client.get(self.crm_url, {"search": self.customer.email}).json()
         customers = crm.get("results", crm)
         self.assertEqual(customers[0]["total_orders"], 1)
-        self.assertEqual(Decimal(customers[0]["total_spent"]), Decimal("70.00"))
+        self.assertEqual(Decimal(customers[0]["total_spent"]), Decimal("100.00"))

@@ -9,10 +9,109 @@ from django.db.models.functions import Lower
 from django.utils import timezone
 
 
+def validate_size_guide_content(columns, rows):
+    """Garante que `rows` só use medidas declaradas em `columns`, em faixas cm."""
+    if not isinstance(columns, list) or not columns:
+        raise ValidationError({"columns": "Informe ao menos uma medida."})
+    keys = []
+    for column in columns:
+        if (
+            not isinstance(column, dict)
+            or not isinstance(column.get("key"), str)
+            or not isinstance(column.get("label"), str)
+            or not column["key"]
+            or not column["label"]
+        ):
+            raise ValidationError(
+                {"columns": 'Cada medida precisa de "key" e "label" (texto).'}
+            )
+        keys.append(column["key"])
+    if len(set(keys)) != len(keys):
+        raise ValidationError({"columns": "As chaves das medidas devem ser únicas."})
+    if not isinstance(rows, list) or not rows:
+        raise ValidationError({"rows": "Informe ao menos um tamanho."})
+    previous = None
+    for row in rows:
+        if (
+            not isinstance(row, dict)
+            or not isinstance(row.get("size"), str)
+            or not row["size"]
+            or not isinstance(row.get("measures"), dict)
+        ):
+            raise ValidationError(
+                {"rows": 'Cada tamanho precisa de "size" e "measures".'}
+            )
+        if set(row["measures"]) != set(keys):
+            raise ValidationError(
+                {"rows": f"O tamanho {row['size']} deve ter todas as medidas."}
+            )
+        for key, faixa in row["measures"].items():
+            valido = (
+                isinstance(faixa, list)
+                and len(faixa) == 2
+                and all(
+                    isinstance(v, (int, float)) and not isinstance(v, bool)
+                    for v in faixa
+                )
+                and 0 < faixa[0] < faixa[1]
+            )
+            if not valido:
+                raise ValidationError(
+                    {
+                        "rows": f"{row['size']}/{key}: use [mín, máx] em cm, "
+                        "com mín menor que máx."
+                    }
+                )
+        if previous and any(
+            row["measures"][key][0] <= previous["measures"][key][0] for key in keys
+        ):
+            raise ValidationError(
+                {
+                    "rows": f"{row['size']} deve vir depois de {previous['size']} "
+                    "com medidas maiores (ordem crescente)."
+                }
+            )
+        previous = row
+
+
+class SizeGuide(models.Model):
+    """Tabela de medidas (em cm) compartilhada por uma ou mais categorias.
+
+    `columns`: [{"key": "chest", "label": "Tórax"}, ...]
+    `rows`: [{"size": "M", "measures": {"chest": [94, 100]}}, ...] em ordem
+    crescente de tamanho. A faixa é [mín, máx): o máx já é o mín do próximo.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=150, unique=True)
+    columns = models.JSONField()
+    rows = models.JSONField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Guia de medidas"
+        verbose_name_plural = "Guias de medidas"
+
+    def clean(self):
+        super().clean()
+        validate_size_guide_content(self.columns, self.rows)
+
+    def __str__(self):
+        return self.name
+
+
 class Category(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=150, unique=True)
     slug = models.SlugField(max_length=150, unique=True)
+    size_guide = models.ForeignKey(
+        SizeGuide,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="categories",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -136,6 +235,96 @@ class Product(models.Model):
         return self.name
 
 
+class Wishlist(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="wishlist_entries",
+    )
+    product = models.ForeignKey(
+        Product,
+        on_delete=models.CASCADE,
+        related_name="wishlist_entries",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "product"], name="unique_wishlist_user_product"
+            )
+        ]
+        ordering = ["-created_at", "id"]
+
+    def __str__(self):
+        return f"{self.user} — {self.product}"
+
+
+class StockAlert(models.Model):
+    """Pedido de aviso "Avise-me quando chegar" para uma variação sem estoque."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="stock_alerts",
+    )
+    variation = models.ForeignKey(
+        "ProductVariation",
+        on_delete=models.CASCADE,
+        related_name="stock_alerts",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    notified_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "variation"],
+                condition=models.Q(notified_at__isnull=True),
+                name="unique_pending_stock_alert",
+            )
+        ]
+        ordering = ["created_at", "id"]
+
+    def __str__(self):
+        return f"{self.user} — {self.variation}"
+
+
+class DropWaitlist(models.Model):
+    """Lista de espera de um drop: avisa o usuário quando o drop abre.
+
+    Só usuário logado entra na lista. `notified_at` é do e-mail de abertura
+    (ver products.drop_waitlist); o aviso no site deve ter campo próprio.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="drop_waitlist_entries",
+    )
+    drop = models.ForeignKey(
+        DropCampaign,
+        on_delete=models.CASCADE,
+        related_name="waitlist_entries",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    notified_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "drop"], name="unique_drop_waitlist_user"
+            )
+        ]
+        ordering = ["created_at", "id"]
+
+    def __str__(self):
+        return f"{self.user} — {self.drop}"
+
+
 class ProductVariation(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     product = models.ForeignKey(
@@ -214,6 +403,7 @@ class StockMovementReason(models.TextChoices):
     AJUSTE = "AJUSTE", "Ajuste"
     PERDA = "PERDA", "Perda/Avaria"
     VENDA = "VENDA", "Venda"
+    TROCA = "TROCA", "Troca"
     OUTRO = "OUTRO", "Outro"
 
 
@@ -255,7 +445,14 @@ class StockMovement(models.Model):
     origin_type = models.CharField(
         max_length=30,
         choices=[
-            (v, v) for v in ("INITIAL_STOCK", "MANUAL_ADJUSTMENT", "ORDER", "LEGACY")
+            (v, v)
+            for v in (
+                "INITIAL_STOCK",
+                "MANUAL_ADJUSTMENT",
+                "ORDER",
+                "EXCHANGE",
+                "LEGACY",
+            )
         ],
     )
     origin_id = models.UUIDField()

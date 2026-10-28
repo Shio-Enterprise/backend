@@ -1,19 +1,31 @@
 import re
 from decimal import ROUND_HALF_UP, Decimal
 
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 from django.utils.text import slugify
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
-from .availability import is_drop_sellable, is_drop_visible, is_product_sellable
+from .availability import (
+    get_drop_sold_quantity,
+    is_drop_sellable,
+    is_drop_visible,
+    is_product_sellable,
+    is_product_visible,
+)
 from .models import (
     Category,
     DropCampaign,
     Product,
     ProductImage,
     ProductVariation,
+    SizeGuide,
+    StockAlert,
     StockMovement,
+    Wishlist,
+    validate_size_guide_content,
 )
 from .services import create_variation, move_stock, normalize_color, normalize_variation
 
@@ -462,6 +474,212 @@ class ProductListSerializer(ProductPricingSerializer):
         return is_product_sellable(obj)
 
 
+class PublicDropCampaignSerializer(DropCampaignSerializer):
+    """Drop para a página pública (`/drop/:slug`).
+
+    `products` usa o mesmo formato de card do catálogo público (imagens,
+    variações, `is_sellable`) e só inclui produtos ativos — diferente de
+    `DropCampaignDetailSerializer.products`, que é de uso administrativo e
+    não filtra. `sold_quantity`/`remaining_quantity` dão o contador "X de Y
+    restantes"; `remaining_quantity` é `None` quando o drop não tem limite
+    (`max_quantity` nulo).
+    """
+
+    products = serializers.SerializerMethodField()
+    sold_quantity = serializers.SerializerMethodField()
+    remaining_quantity = serializers.SerializerMethodField()
+
+    class Meta(DropCampaignSerializer.Meta):
+        fields = DropCampaignSerializer.Meta.fields + [
+            "products",
+            "sold_quantity",
+            "remaining_quantity",
+        ]
+
+    def get_products(self, obj):
+        queryset = obj.products.filter(is_active=True).order_by("name")
+        return ProductListSerializer(queryset, many=True, context=self.context).data
+
+    def _sold_quantity(self, obj):
+        # Cacheado na própria instância: get_sold_quantity e get_remaining_quantity
+        # são chamados para o mesmo objeto, e a conta não muda durante a serialização.
+        if not hasattr(obj, "_sold_quantity_cache"):
+            obj._sold_quantity_cache = get_drop_sold_quantity(obj)
+        return obj._sold_quantity_cache
+
+    def get_sold_quantity(self, obj):
+        return self._sold_quantity(obj)
+
+    def get_remaining_quantity(self, obj):
+        if obj.max_quantity is None:
+            return None
+        return max(obj.max_quantity - self._sold_quantity(obj), 0)
+
+
+class WishlistSerializer(serializers.ModelSerializer):
+    product = ProductListSerializer(read_only=True)
+
+    class Meta:
+        model = Wishlist
+        fields = ["id", "product", "created_at"]
+        read_only_fields = fields
+
+
+class WishlistCreateSerializer(serializers.Serializer):
+    product = serializers.UUIDField()
+
+
+class WishlistPageSerializer(serializers.Serializer):
+    count = serializers.IntegerField()
+    next = serializers.URLField(allow_null=True)
+    previous = serializers.URLField(allow_null=True)
+    results = WishlistSerializer(many=True)
+
+
+class WishlistIdsSerializer(serializers.Serializer):
+    product_ids = serializers.ListField(child=serializers.UUIDField())
+
+
+class StockAlertCreateSerializer(serializers.Serializer):
+    variation_id = serializers.UUIDField()
+
+
+class StockAlertProductSerializer(serializers.Serializer):
+    id = serializers.UUIDField()
+    name = serializers.CharField()
+    image = serializers.URLField(allow_null=True)
+    is_visible = serializers.BooleanField()
+
+
+class StockAlertSerializer(serializers.ModelSerializer):
+    variation_id = serializers.UUIDField(read_only=True)
+    size = serializers.CharField(source="variation.size", read_only=True)
+    color = serializers.CharField(source="variation.color", read_only=True)
+    product = serializers.SerializerMethodField()
+
+    class Meta:
+        model = StockAlert
+        fields = [
+            "id",
+            "variation_id",
+            "size",
+            "color",
+            "created_at",
+            "notified_at",
+            "product",
+        ]
+        read_only_fields = fields
+
+    @extend_schema_field(StockAlertProductSerializer)
+    def get_product(self, obj):
+        product = obj.variation.product
+        first_image = next(iter(product.images.all()), None)
+        image = None
+        if first_image is not None and first_image.image:
+            image = first_image.image.url
+            request = self.context.get("request")
+            if request is not None:
+                image = request.build_absolute_uri(image)
+        return {
+            "id": str(product.id),
+            "name": product.name,
+            "image": image,
+            "is_visible": is_product_visible(product),
+        }
+
+
+class StockAlertItemSerializer(StockAlertSerializer):
+    already_pending = serializers.BooleanField(read_only=True)
+
+    class Meta(StockAlertSerializer.Meta):
+        fields = StockAlertSerializer.Meta.fields + ["already_pending"]
+        read_only_fields = fields
+
+
+class StockAlertListSerializer(serializers.Serializer):
+    results = StockAlertSerializer(many=True)
+
+
+class StockAlertPendingVariationsSerializer(serializers.Serializer):
+    variation_ids = serializers.ListField(child=serializers.UUIDField())
+
+
+class SizeGuideSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SizeGuide
+        fields = ["id", "name", "columns", "rows"]
+        read_only_fields = fields
+
+
+class SizeGuideAdminSerializer(serializers.ModelSerializer):
+    """Guia de medidas no painel admin, com as categorias que o usam.
+
+    `categories` (ids) define quais categorias usam o guia: as listadas passam a
+    usar este guia (saindo do anterior) e as que ficaram de fora são desligadas.
+    """
+
+    categories = serializers.PrimaryKeyRelatedField(
+        many=True, queryset=Category.objects.all(), required=False
+    )
+    category_details = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SizeGuide
+        fields = [
+            "id",
+            "name",
+            "columns",
+            "rows",
+            "categories",
+            "category_details",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "created_at", "updated_at"]
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["categories"] = [c["id"] for c in data["category_details"]]
+        return data
+
+    @extend_schema_field(CategoryNestedSerializer(many=True))
+    def get_category_details(self, obj):
+        return CategoryNestedSerializer(obj.categories.order_by("name"), many=True).data
+
+    def validate(self, attrs):
+        columns = attrs.get("columns", getattr(self.instance, "columns", None))
+        rows = attrs.get("rows", getattr(self.instance, "rows", None))
+        try:
+            validate_size_guide_content(columns, rows)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(exc.message_dict) from None
+        return attrs
+
+    @transaction.atomic
+    def create(self, validated_data):
+        categories = validated_data.pop("categories", None)
+        guide = super().create(validated_data)
+        self._link_categories(guide, categories)
+        return guide
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        categories = validated_data.pop("categories", None)
+        guide = super().update(instance, validated_data)
+        self._link_categories(guide, categories)
+        return guide
+
+    @staticmethod
+    def _link_categories(guide, categories):
+        if categories is None:
+            return
+        ids = [c.pk for c in categories]
+        Category.objects.filter(size_guide=guide).exclude(pk__in=ids).update(
+            size_guide=None
+        )
+        Category.objects.filter(pk__in=ids).update(size_guide=guide)
+
+
 class ProductDetailSerializer(ProductPricingSerializer):
     """Detalhe completo com variations, images e relações expandidas."""
 
@@ -469,6 +687,9 @@ class ProductDetailSerializer(ProductPricingSerializer):
     images = ProductImageSerializer(many=True, read_only=True)
     category = CategoryNestedSerializer(read_only=True)
     drop = DropNestedSerializer(read_only=True)
+    size_guide = SizeGuideSerializer(
+        source="category.size_guide", read_only=True, allow_null=True
+    )
     is_sellable = serializers.SerializerMethodField()
 
     class Meta:
@@ -485,6 +706,7 @@ class ProductDetailSerializer(ProductPricingSerializer):
             "rating_count",
             "category",
             "drop",
+            "size_guide",
             "variations",
             "images",
             "created_at",
@@ -636,7 +858,7 @@ class StockMovementSerializer(StrictSerializer):
     def validate(self, attrs):
         if not attrs.get("note", "").strip():
             raise serializers.ValidationError({"note": "Informe a justificativa."})
-        if attrs.get("reason") in ("VENDA", "ESTOQUE_INICIAL"):
+        if attrs.get("reason") in ("VENDA", "ESTOQUE_INICIAL", "TROCA"):
             raise serializers.ValidationError(
                 {"reason": "Motivo reservado para operações automáticas."}
             )

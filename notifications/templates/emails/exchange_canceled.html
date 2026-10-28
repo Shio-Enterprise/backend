@@ -1,0 +1,9 @@
+{% extends "emails/base.html" %}
+
+{% block content %}
+<p style="margin:0 0 16px;">Olá, {{ nome|default:"cliente" }}!</p>
+<p style="margin:0 0 16px;">Sua troca referente ao pedido <strong>{{ pedido }}</strong> foi cancelada.</p>
+{% if exchange.review_message %}<p style="margin:0 0 16px;"><strong>Mensagem da loja:</strong><br>{{ exchange.review_message|linebreaksbr }}</p>{% endif %}
+<p style="margin:0 0 16px;">Se tiver dúvidas, fale com a loja.</p>
+<p style="margin:24px 0;"><a href="{{ pedido_url }}" style="display:inline-block;background-color:#000000;color:#ffffff;padding:12px 24px;text-decoration:none;font-weight:700;">Ver pedido</a></p>
+{% endblock %}

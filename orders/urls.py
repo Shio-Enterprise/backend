@@ -3,13 +3,28 @@ from django.urls import path
 from .correios_views import AgencySearchView, CepLookupView, ShippingOptionsView
 from .views import (
     AdminDashboardView,
+    AdminExchangeApproveView,
+    AdminExchangeCancelView,
+    AdminExchangeCompleteView,
+    AdminExchangeReceiveView,
+    AdminExchangeRejectView,
     AdminOrderDetailView,
+    AdminOrderExportView,
     AdminOrderListView,
+    AdminRefundApproveView,
+    AdminRefundRejectView,
+    AdminRefundView,
     CartAPIView,
     CartItemAddAPIView,
     CartItemDetailAPIView,
     CheckoutAPIView,
     CheckoutCalculationView,
+    CouponDetailView,
+    CouponEmailPreviewView,
+    CouponEmailSendView,
+    CouponEmailSummaryView,
+    CouponEmailTestView,
+    CouponListCreateView,
     DashboardDetailView,
     DashboardDrillDownView,
     DashboardDropRevenueView,
@@ -17,13 +32,41 @@ from .views import (
     OrderDispatchView,
     OrderTrackingView,
     PaymentSuccessRedirectView,
+    UserExchangeRequestView,
     UserOrderDetailView,
     UserOrderListView,
+    UserRefundRequestView,
 )
 
 app_name = "orders"
 
 urlpatterns = [
+    path("admin/coupons/", CouponListCreateView.as_view(), name="admin-coupons-list"),
+    path(
+        "admin/coupons/<uuid:uuid>/",
+        CouponDetailView.as_view(),
+        name="admin-coupons-detail",
+    ),
+    path(
+        "admin/coupons/<uuid:uuid>/email/",
+        CouponEmailSummaryView.as_view(),
+        name="admin-coupon-email",
+    ),
+    path(
+        "admin/coupons/<uuid:uuid>/email/preview/",
+        CouponEmailPreviewView.as_view(),
+        name="admin-coupon-email-preview",
+    ),
+    path(
+        "admin/coupons/<uuid:uuid>/email/test/",
+        CouponEmailTestView.as_view(),
+        name="admin-coupon-email-test",
+    ),
+    path(
+        "admin/coupons/<uuid:uuid>/email/send/",
+        CouponEmailSendView.as_view(),
+        name="admin-coupon-email-send",
+    ),
     path(
         "infinitepay/webhook/",
         InfinitePayWebhookView.as_view(),
@@ -56,11 +99,62 @@ urlpatterns = [
         UserOrderDetailView.as_view(),
         name="user_orders_detail",
     ),
+    path(
+        "my-orders/<uuid:order_id>/refund-request/",
+        UserRefundRequestView.as_view(),
+        name="user_order_refund_request",
+    ),
+    path(
+        "my-orders/<uuid:order_id>/exchange-request/",
+        UserExchangeRequestView.as_view(),
+        name="user_order_exchange_request",
+    ),
     path("admin/", AdminOrderListView.as_view(), name="admin_orders_list"),
+    path("admin/export/", AdminOrderExportView.as_view(), name="admin_orders_export"),
     path(
         "admin/<uuid:order_id>/",
         AdminOrderDetailView.as_view(),
         name="admin_orders_detail",
+    ),
+    path(
+        "admin/<uuid:order_id>/refund/",
+        AdminRefundView.as_view(),
+        name="admin_order_refund",
+    ),
+    path(
+        "admin/<uuid:order_id>/refund/approve/",
+        AdminRefundApproveView.as_view(),
+        name="admin_order_refund_approve",
+    ),
+    path(
+        "admin/<uuid:order_id>/refund/reject/",
+        AdminRefundRejectView.as_view(),
+        name="admin_order_refund_reject",
+    ),
+    path(
+        "admin/<uuid:order_id>/exchange/approve/",
+        AdminExchangeApproveView.as_view(),
+        name="admin_order_exchange_approve",
+    ),
+    path(
+        "admin/<uuid:order_id>/exchange/reject/",
+        AdminExchangeRejectView.as_view(),
+        name="admin_order_exchange_reject",
+    ),
+    path(
+        "admin/<uuid:order_id>/exchange/receive/",
+        AdminExchangeReceiveView.as_view(),
+        name="admin_order_exchange_receive",
+    ),
+    path(
+        "admin/<uuid:order_id>/exchange/complete/",
+        AdminExchangeCompleteView.as_view(),
+        name="admin_order_exchange_complete",
+    ),
+    path(
+        "admin/<uuid:order_id>/exchange/cancel/",
+        AdminExchangeCancelView.as_view(),
+        name="admin_order_exchange_cancel",
     ),
     path("correios/cep/<str:cep>/", CepLookupView.as_view(), name="cep-lookup"),
     path("correios/frete/", ShippingOptionsView.as_view(), name="shipping-options"),

@@ -8,6 +8,8 @@ from .views import (
     CustomerCRMViewSet,
     GoogleLoginView,
     LogoutView,
+    MarketingUnsubscribeView,
+    MeMarketingView,
     MeView,
     NewsletterSubscribeView,
     PasswordLoginView,
@@ -36,6 +38,14 @@ urlpatterns = [
     path("logout/", LogoutView.as_view(), name="logout"),
     # GET - Retorna dados do utilizador autenticado
     path("me/", MeView.as_view(), name="me"),
+    # GET/PUT - Consulta e altera o aceite de promoções por e-mail
+    path("me/marketing/", MeMarketingView.as_view(), name="me-marketing"),
+    # GET/POST - Descadastro de promoções por link assinado (público)
+    path(
+        "marketing/unsubscribe/<str:token>/",
+        MarketingUnsubscribeView.as_view(),
+        name="marketing-unsubscribe",
+    ),
     # GET/POST - Lista e cria endereços do utilizador
     path("addresses/", AddressListCreateView.as_view(), name="addresses"),
     # PATCH/DELETE - Atualiza ou remove um endereço específico

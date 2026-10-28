@@ -7,6 +7,7 @@ from .views import (
     DropCampaignDetailView,
     DropCampaignListCreateView,
     DropProductManageView,
+    InventoryExportView,
     ProductDetailView,
     ProductDuplicateView,
     ProductImageCreateView,
@@ -16,13 +17,44 @@ from .views import (
     ProductRecommendationsView,
     ProductVariationCreateView,
     ProductVariationDetailView,
+    PublicDropCampaignView,
+    SizeGuideDetailView,
+    SizeGuideListCreateView,
+    StockAlertDeleteView,
+    StockAlertListCreateView,
+    StockAlertPendingVariationsView,
     StockMovementListCreateView,
+    WishlistDeleteView,
+    WishlistIdsView,
+    WishlistListCreateView,
     inventory_summary,
 )
 
 app_name = "products"
 
 urlpatterns = [
+    path(
+        "stock-alerts/",
+        StockAlertListCreateView.as_view(),
+        name="stock-alert-list-create",
+    ),
+    path(
+        "stock-alerts/pending-variations/",
+        StockAlertPendingVariationsView.as_view(),
+        name="stock-alert-pending-variations",
+    ),
+    path(
+        "stock-alerts/<uuid:pk>/",
+        StockAlertDeleteView.as_view(),
+        name="stock-alert-delete",
+    ),
+    path("wishlist/", WishlistListCreateView.as_view(), name="wishlist-list-create"),
+    path("wishlist/ids/", WishlistIdsView.as_view(), name="wishlist-ids"),
+    path(
+        "wishlist/<uuid:product_id>/",
+        WishlistDeleteView.as_view(),
+        name="wishlist-delete",
+    ),
     path(
         "products/<uuid:pk>/duplicate/",
         ProductDuplicateView.as_view(),
@@ -45,11 +77,29 @@ urlpatterns = [
         CategoryDetailView.as_view(),
         name="category-detail",
     ),
+    # GET, POST (admin de catálogo) - Lista/cria guias de medidas
+    path(
+        "size-guides/",
+        SizeGuideListCreateView.as_view(),
+        name="size-guide-list-create",
+    ),
+    # GET, PUT, DELETE (admin de catálogo) - Detalhe/atualiza/remove guia
+    path(
+        "size-guides/<uuid:pk>/",
+        SizeGuideDetailView.as_view(),
+        name="size-guide-detail",
+    ),
     # GET (público) - Lista drops / POST (admin) - Cria drop
     path(
         "drops/",
         DropCampaignListCreateView.as_view(),
         name="drop-list-create",
+    ),
+    # GET (público) - Detalhe por slug para a página pública (/drop/:slug)
+    path(
+        "drops/slug/<slug:slug>/",
+        PublicDropCampaignView.as_view(),
+        name="drop-public-detail",
     ),
     # GET (público) - Detalhe com produtos / PUT, DELETE (admin)
     path(
@@ -116,6 +166,8 @@ urlpatterns = [
         StockMovementListCreateView.as_view(),
         name="variation-stock-movements",
     ),
+    # GET (admin) - Exportar estoque para CSV/XLSX
+    path("inventory/export/", InventoryExportView.as_view(), name="inventory_export"),
     # GET (admin) - Resumo de stock (legado)
     path("inventory/", inventory_summary, name="inventory_summary"),
 ]

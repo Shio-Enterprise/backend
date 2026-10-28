@@ -100,8 +100,10 @@ def dashboard_order_queryset(params):
 
     orders = metric_orders(filters, start, end)
     sales = positive_sales(orders)
-    if metric in {"valid_sales", "gross_revenue"}:
+    if metric == "valid_sales":
         queryset = sales
+    elif metric == "gross_revenue":
+        queryset = orders
     elif metric == "refunds":
         queryset = refunds(orders)
     elif metric in {"net_revenue", "average_ticket"}:

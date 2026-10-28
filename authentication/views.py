@@ -7,7 +7,6 @@ from django.contrib.auth.tokens import default_token_generator
 from django.db import models
 from django.db.models import (
     Count,
-    F,
     IntegerField,
     Max,
     OuterRef,
@@ -21,7 +20,9 @@ from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from drf_spectacular.utils import (
     OpenApiExample,
+    OpenApiParameter,
     OpenApiResponse,
+    OpenApiTypes,
     extend_schema,
 )
 from rest_framework import filters, mixins, status, viewsets
@@ -32,7 +33,10 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from authentication.signals import google_login_completed
-from notifications.email import send_email
+from core.exports import export_data_response
+from notifications.email import mask_email, send_email
+from notifications.marketing import is_receiving, opt_in, opt_out
+from notifications.unsubscribe import read_unsubscribe_token
 from orders.models import CustomerOrder, OrderStatus, PaymentStatus
 
 from .admin_permissions import serialized_permission_definitions
@@ -411,6 +415,64 @@ class LogoutView(APIView):
             )
 
 
+class MarketingUnsubscribeView(APIView):
+    """Descadastro de promoções por e-mail a partir do link assinado."""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    @staticmethod
+    def _invalid():
+        return Response({"error": "Link inválido."}, status=status.HTTP_400_BAD_REQUEST)
+
+    @extend_schema(
+        tags=["Users"],
+        summary="Confirma o e-mail do link de descadastro",
+        responses={200: OpenApiTypes.OBJECT, 400: OpenApiTypes.OBJECT},
+    )
+    def get(self, request, token):
+        email = read_unsubscribe_token(token)
+        if email is None:
+            return self._invalid()
+        return Response({"email": mask_email(email)})
+
+    @extend_schema(
+        tags=["Users"],
+        summary="Descadastra o e-mail das promoções",
+        responses={200: OpenApiTypes.OBJECT, 400: OpenApiTypes.OBJECT},
+    )
+    def post(self, request, token):
+        email = read_unsubscribe_token(token)
+        if email is None:
+            return self._invalid()
+        opt_out(email)
+        return Response({"message": "Pronto, você não vai mais receber promoções."})
+
+
+class MeMarketingView(APIView):
+    """Aceite de promoções por e-mail do utilizador autenticado."""
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(tags=["Users"], summary="Consulta se recebe promoções por e-mail")
+    def get(self, request):
+        return Response({"receives": is_receiving(request.user.email)})
+
+    @extend_schema(tags=["Users"], summary="Ativa ou desativa promoções por e-mail")
+    def put(self, request):
+        receives = request.data.get("receives")
+        if not isinstance(receives, bool):
+            return Response(
+                {"receives": ["Informe true ou false."]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if receives:
+            opt_in(request.user.email)
+        else:
+            opt_out(request.user.email)
+        return Response({"receives": is_receiving(request.user.email)})
+
+
 class MeView(APIView):
     """Dados do utilizador autenticado."""
 
@@ -559,33 +621,22 @@ class CustomerCRMViewSet(viewsets.ReadOnlyModelViewSet):
             status=OrderStatus.DELIVERED,
             payment__status=PaymentStatus.PAID,
         ).distinct()
-        refunded_orders = base_orders.filter(
-            payment__status=PaymentStatus.REFUNDED
-        ).distinct()
         money_field = models.DecimalField(max_digits=14, decimal_places=2)
         sales_group = sales_orders.values("user")
-        refund_group = refunded_orders.values("user")
         qs = User.objects.filter(profile__role="CUSTOMER").annotate(
             total_orders=Coalesce(
                 Subquery(sales_group.annotate(value=Count("id")).values("value")[:1]),
                 Value(0),
                 output_field=IntegerField(),
             ),
-            positive_spent=Coalesce(
+            # Pedido reembolsado deixa de ser venda válida e já fica fora.
+            total_spent=Coalesce(
                 Subquery(
                     sales_group.annotate(value=Sum("total_amount")).values("value")[:1]
                 ),
                 Value(Decimal("0")),
                 output_field=money_field,
             ),
-            refunded_spent=Coalesce(
-                Subquery(
-                    refund_group.annotate(value=Sum("total_amount")).values("value")[:1]
-                ),
-                Value(Decimal("0")),
-                output_field=money_field,
-            ),
-            total_spent=F("positive_spent") - F("refunded_spent"),
             last_purchase_date=Subquery(
                 sales_group.annotate(value=Max("payment__paid_at")).values("value")[:1]
             ),
@@ -600,6 +651,100 @@ class CustomerCRMViewSet(viewsets.ReadOnlyModelViewSet):
         if self.action == "retrieve":
             return CustomerCRMDetailSerializer
         return CustomerCRMSerializer
+
+    @extend_schema(
+        tags=["CRM Clientes"],
+        summary="Exportar clientes",
+        parameters=[
+            OpenApiParameter(
+                name="file_format",
+                type=OpenApiTypes.STR,
+                description="Formato de exportação: 'csv' (padrão) ou 'xlsx'",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
+            OpenApiParameter(
+                name="search",
+                type=OpenApiTypes.STR,
+                description="Busca por nome ou e-mail",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
+            OpenApiParameter(
+                name="ordering",
+                type=OpenApiTypes.STR,
+                description="Ordenação por campo (ex: -created_at, total_spent)",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
+        ],
+        responses={
+            200: OpenApiResponse(description="Arquivo exportado (CSV ou XLSX)"),
+            400: OpenApiResponse(description="Formato inválido"),
+            403: OpenApiResponse(description="Acesso negado"),
+        },
+    )
+    @action(detail=False, methods=["get"], url_path="export")
+    def export(self, request):
+        file_format = request.query_params.get("file_format", "csv")
+        queryset = self.filter_queryset(self.get_queryset())
+
+        customers = list(queryset)
+        emails = [c.email.strip().lower() for c in customers]
+        subscribed_emails = set(
+            NewsletterSubscriber.objects.filter(
+                email__in=emails,
+                unsubscribed_at__isnull=True,
+            ).values_list("email", flat=True)
+        )
+
+        headers = [
+            "Nome",
+            "E-mail",
+            "Data de Cadastro",
+            "Pedidos Concluídos",
+            "Total Gasto",
+            "Última Compra",
+            "Inscrito na Newsletter",
+        ]
+        column_types = [
+            "text",
+            "text",
+            "datetime",
+            "number",
+            "currency",
+            "datetime",
+            "text",
+        ]
+
+        rows = []
+        for c in customers:
+            total_orders = getattr(c, "total_orders", 0) or 0
+            total_spent = getattr(c, "total_spent", Decimal("0.00")) or Decimal("0.00")
+            last_purchase = getattr(c, "last_purchase_date", None)
+            is_subscribed = (
+                "Sim" if c.email.strip().lower() in subscribed_emails else "Não"
+            )
+
+            rows.append(
+                [
+                    c.name or "—",
+                    c.email,
+                    c.created_at,
+                    total_orders,
+                    total_spent,
+                    last_purchase or "—",
+                    is_subscribed,
+                ]
+            )
+
+        return export_data_response(
+            filename_base="clientes",
+            headers=headers,
+            rows=rows,
+            file_format=file_format,
+            column_types=column_types,
+        )
 
 
 class AdminAccountViewSet(

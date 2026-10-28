@@ -1,0 +1,14 @@
+{% extends "emails/base.txt" %}
+
+{% block content %}
+Novo pedido de reembolso.
+
+Pedido: {{ pedido }}
+Cliente: {{ nome }}
+Valor: {{ valor }}
+Motivo: {{ motivo }}{% if comentario %}
+Comentário do cliente: {{ comentario }}{% endif %}
+
+Analise no painel:
+{{ pedido_url }}
+{% endblock %}
