@@ -4,7 +4,7 @@ from decimal import Decimal
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.tokens import default_token_generator
-from django.db import models
+from django.db import IntegrityError, models
 from django.db.models import (
     Count,
     IntegerField,
@@ -43,6 +43,7 @@ from .admin_permissions import serialized_permission_definitions
 from .models import NewsletterSubscriber, UserRole
 from .permissions import CanManageAdminPermissions, CanManageCustomers
 from .serializers import (
+    CPF_IN_USE_MESSAGE,
     AddressSerializer,
     AdminAccountSerializer,
     CustomerCRMDetailSerializer,
@@ -532,12 +533,11 @@ class MeView(APIView):
         # Salva campos do User e do perfil aninhado (phone_number, cpf).
         try:
             serializer.save()
-        except models.IntegrityError as exc:
+        except IntegrityError:
+            # Corrida: outra conta salvou o mesmo CPF depois da validação.
+            # Sem str(exc) na resposta: vazaria detalhes do banco.
             return Response(
-                {
-                    "error": "Erro de integridade ao atualizar o perfil.",
-                    "details": str(exc),
-                },
+                {"error": "Dados inválidos.", "details": {"cpf": [CPF_IN_USE_MESSAGE]}},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 

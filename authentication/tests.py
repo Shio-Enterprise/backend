@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.db import IntegrityError
 from django.test import TestCase
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
@@ -291,6 +292,76 @@ class MeViewTests(APITestCase):
         self.user.refresh_from_db()
         self.assertEqual(self.user.profile.phone_number, "61999999999")
         self.assertEqual(self.user.profile.cpf, "12345678910")
+
+    def _other_user_with_cpf(self, cpf):
+        other = User.objects.create_user(
+            email="outro@example.com", name="Outro", google_id="google-456"
+        )
+        UserProfile.objects.update_or_create(user=other, defaults={"cpf": cpf})
+        return other
+
+    def test_patch_cpf_de_outra_conta_retorna_400_sem_salvar_nada(self):
+        self._other_user_with_cpf("12345678910")
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.access_token}")
+
+        response = self.client.patch(
+            self.url, {"name": "Nome Novo", "cpf": "12345678910"}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.json()["details"]["cpf"],
+            ["Este CPF já está cadastrado em outra conta."],
+        )
+        self.assertNotIn("duplicate", str(response.json()).lower())
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.name, "Me User")
+
+    def test_patch_mantendo_o_proprio_cpf_funciona(self):
+        UserProfile.objects.update_or_create(
+            user=self.user, defaults={"cpf": "12345678910"}
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.access_token}")
+
+        response = self.client.patch(
+            self.url, {"name": "Nome Novo", "cpf": "12345678910"}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["name"], "Nome Novo")
+
+    def test_patch_com_cpf_vazio_em_duas_contas_funciona(self):
+        """O front sempre manda o cpf, vazio quando não preenchido."""
+        other = self._other_user_with_cpf(None)
+        other_token = str(RefreshToken.for_user(other).access_token)
+
+        for token in (other_token, self.access_token):
+            self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+            response = self.client.patch(
+                self.url, {"name": "Sem CPF", "cpf": ""}, format="json"
+            )
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertIsNone(response.json()["cpf"])
+
+    def test_corrida_no_cpf_vira_400_e_nao_500(self):
+        """Duas contas salvando o mesmo CPF ao mesmo tempo: o banco recusa a segunda."""
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.access_token}")
+        with patch(
+            "authentication.serializers.UserProfile.save",
+            side_effect=IntegrityError("duplicate key value violates unique"),
+        ):
+            response = self.client.patch(
+                self.url, {"name": "Nome Novo", "cpf": "98765432100"}, format="json"
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.json()["details"]["cpf"],
+            ["Este CPF já está cadastrado em outra conta."],
+        )
+        self.assertNotIn("duplicate", str(response.json()).lower())
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.name, "Me User")
 
 
 class TokenRefreshViewTests(APITestCase):
