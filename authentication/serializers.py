@@ -1,6 +1,7 @@
 from django.contrib.auth import authenticate
 from django.contrib.auth.models import Permission
 from django.contrib.auth.password_validation import validate_password
+from django.db import transaction
 from rest_framework import serializers
 
 from notifications.marketing import opt_in
@@ -8,6 +9,8 @@ from orders.models import CustomerOrder
 
 from .admin_permissions import ADMIN_PERMISSION_CODES, ADMIN_PERMISSION_SET
 from .models import Address, User, UserProfile
+
+CPF_IN_USE_MESSAGE = "Este CPF já está cadastrado em outra conta."
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -61,17 +64,32 @@ class UserSerializer(serializers.ModelSerializer):
             ).values_list("codename", flat=True)
         )
 
+    def validate_cpf(self, value):
+        # A coluna é única: CPF vazio vira NULL, senão a segunda conta sem CPF
+        # colide com a primeira no "".
+        value = (value or "").strip() or None
+        if value is None:
+            return None
+        in_use = UserProfile.objects.filter(cpf=value)
+        if self.instance is not None:
+            in_use = in_use.exclude(user=self.instance)
+        if in_use.exists():
+            raise serializers.ValidationError(CPF_IN_USE_MESSAGE)
+        return value
+
     def update(self, instance, validated_data):
         profile_data = validated_data.pop("profile", {})
-        instance = super().update(instance, validated_data)
+        # Usuário e perfil juntos: se o perfil falhar, o nome não fica salvo.
+        with transaction.atomic():
+            instance = super().update(instance, validated_data)
 
-        if profile_data:
-            profile, _ = UserProfile.objects.get_or_create(user=instance)
-            if "phone_number" in profile_data:
-                profile.phone_number = profile_data.get("phone_number")
-            if "cpf" in profile_data:
-                profile.cpf = profile_data.get("cpf")
-            profile.save()
+            if profile_data:
+                profile, _ = UserProfile.objects.get_or_create(user=instance)
+                if "phone_number" in profile_data:
+                    profile.phone_number = profile_data.get("phone_number")
+                if "cpf" in profile_data:
+                    profile.cpf = profile_data.get("cpf")
+                profile.save()
 
         return instance
 
