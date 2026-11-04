@@ -1,5 +1,8 @@
 from django.dispatch import Signal
 
-# Sent after a successful Google login that created/returned a user
-# receivers should accept: sender, request, user
-google_login_completed = Signal()
+# Sent after any successful sign-in that returns tokens (password, sign-up or Google).
+# Receivers should accept: sender, request, user
+login_completed = Signal()
+
+# Kept for compatibility: Google login used to have its own signal.
+google_login_completed = login_completed

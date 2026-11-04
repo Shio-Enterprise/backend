@@ -32,7 +32,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from authentication.signals import google_login_completed
+from authentication.signals import login_completed
 from core.exports import export_data_response
 from notifications.email import mask_email, send_email
 from notifications.marketing import is_receiving, opt_in, opt_out
@@ -217,10 +217,7 @@ class GoogleLoginView(APIView):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
-        try:
-            google_login_completed.send(sender=None, request=request, user=user)
-        except Exception:
-            logger.exception("Erro ao executar handlers de login (merge de carrinho)")
+        _send_login_completed(request, user)
 
         tokens = get_tokens_for_user(user)
         user_data = UserSerializer(user).data
@@ -237,6 +234,14 @@ class GoogleLoginView(APIView):
         )
 
 
+def _send_login_completed(request, user):
+    """Avisa os handlers de login (ex.: juntar o carrinho do visitante) sem derrubar o login."""
+    try:
+        login_completed.send(sender=None, request=request, user=user)
+    except Exception:
+        logger.exception("Erro ao executar handlers de login (merge de carrinho)")
+
+
 class RegisterView(APIView):
     """Registo de novo utilizador."""
 
@@ -247,6 +252,7 @@ class RegisterView(APIView):
         serializer = RegisterSerializer(data=request.data)
         if serializer.is_valid():
             user = serializer.save()
+            _send_login_completed(request, user)
             tokens = get_tokens_for_user(user)
             user_data = UserSerializer(user).data
             return Response(
@@ -273,6 +279,7 @@ class PasswordLoginView(APIView):
         )
         if serializer.is_valid():
             user = serializer.validated_data["user"]
+            _send_login_completed(request, user)
             tokens = get_tokens_for_user(user)
             user_data = UserSerializer(user).data
             return Response(
