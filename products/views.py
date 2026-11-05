@@ -57,6 +57,7 @@ from .drop_waitlist import sweep_drop_openings
 from .models import (
     Category,
     DropCampaign,
+    DropWaitlist,
     Product,
     ProductImage,
     ProductVariation,
@@ -70,6 +71,9 @@ from .serializers import (
     CategorySerializer,
     DropCampaignDetailSerializer,
     DropCampaignSerializer,
+    DropWaitlistListSerializer,
+    DropWaitlistSerializer,
+    DropWaitlistUnseenSerializer,
     ProductDetailSerializer,
     ProductDuplicateSerializer,
     ProductImageSerializer,
@@ -1717,3 +1721,160 @@ class ProductDuplicateView(APIView):
             ProductDetailSerializer(product, context={"request": request}).data,
             status=201,
         )
+
+
+# ─── Drop Waitlist ────────────────────────────────────────────────────────────
+
+
+def _drop_waitlist_qs(user):
+    """Entradas da lista de espera do usuário com o drop relacionado."""
+    return DropWaitlist.objects.select_related("drop").filter(user=user)
+
+
+def _drop_accepts_waitlist(drop):
+    """Retorna True se o drop ainda não abriu e está visível."""
+    from django.utils import timezone
+
+    if not (drop.is_public and drop.is_active):
+        return False, "Este drop não está disponível para lista de espera."
+    now = timezone.now()
+    if drop.end_date and drop.end_date < now:
+        return False, "Este drop já foi encerrado."
+    if drop.launch_date and drop.launch_date <= now:
+        return False, "Este drop já abriu. Acesse a loja para comprar."
+    return True, None
+
+
+class DropWaitlistJoinView(APIView):
+    """POST /api/catalog/drops/<id>/waitlist/ — Entrar na lista de espera."""
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["Drop Waitlist"],
+        summary="Entrar na lista de espera de um drop",
+        responses={
+            201: DropWaitlistSerializer,
+            200: DropWaitlistSerializer,
+            400: OpenApiResponse(description="Drop não aceita lista de espera."),
+            404: OpenApiResponse(description="Drop não encontrado."),
+            401: OpenApiResponse(description="Não autenticado."),
+        },
+    )
+    def post(self, request, pk):
+        drop = get_object_or_404(DropCampaign, pk=pk)
+        ok, reason = _drop_accepts_waitlist(drop)
+        if not ok:
+            raise ValidationError({"detail": reason})
+
+        entry = DropWaitlist.objects.filter(user=request.user, drop=drop).first()
+        if entry is not None:
+            serializer = DropWaitlistSerializer(entry)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+
+        try:
+            with transaction.atomic():
+                entry = DropWaitlist.objects.create(user=request.user, drop=drop)
+        except IntegrityError:
+            entry = DropWaitlist.objects.get(user=request.user, drop=drop)
+            serializer = DropWaitlistSerializer(entry)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+
+        serializer = DropWaitlistSerializer(entry)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class DropWaitlistLeaveView(APIView):
+    """DELETE /api/catalog/drops/<id>/waitlist/ — Sair da lista de espera."""
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["Drop Waitlist"],
+        summary="Sair da lista de espera de um drop",
+        responses={
+            204: OpenApiResponse(description="Saiu da lista."),
+            404: OpenApiResponse(description="Entrada não encontrada."),
+            401: OpenApiResponse(description="Não autenticado."),
+        },
+    )
+    def delete(self, request, pk):
+        entry = get_object_or_404(DropWaitlist, user=request.user, drop_id=pk)
+        entry.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class DropWaitlistMyEntriesView(APIView):
+    """GET /api/catalog/drop-waitlist/ — Entradas do usuário logado."""
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["Drop Waitlist"],
+        summary="Listar entradas da lista de espera do usuário",
+        responses={
+            200: DropWaitlistListSerializer,
+            401: OpenApiResponse(description="Não autenticado."),
+        },
+    )
+    def get(self, request):
+        qs = _drop_waitlist_qs(request.user).order_by("-created_at")
+        serializer = DropWaitlistSerializer(qs, many=True)
+        return Response({"results": serializer.data})
+
+
+class DropWaitlistUnseenView(APIView):
+    """GET /api/catalog/drop-waitlist/unseen/ — Drops abertos não vistos no modal."""
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["Drop Waitlist"],
+        summary="Listar drops abertos não vistos no modal",
+        responses={
+            200: DropWaitlistUnseenSerializer,
+            401: OpenApiResponse(description="Não autenticado."),
+        },
+    )
+    def get(self, request):
+        from django.utils import timezone
+
+        now = timezone.now()
+        qs = (
+            _drop_waitlist_qs(request.user)
+            .filter(
+                seen_at__isnull=True,
+                drop__is_public=True,
+                drop__is_active=True,
+            )
+            .filter(Q(drop__launch_date__isnull=True) | Q(drop__launch_date__lte=now))
+            .filter(Q(drop__end_date__isnull=True) | Q(drop__end_date__gte=now))
+            .order_by("drop__launch_date")
+        )
+        serializer = DropWaitlistSerializer(qs, many=True)
+        return Response({"results": serializer.data})
+
+
+class DropWaitlistMarkSeenView(APIView):
+    """POST /api/catalog/drop-waitlist/<id>/seen/ — Marcar entrada como vista."""
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["Drop Waitlist"],
+        summary="Marcar aviso do drop como visto",
+        responses={
+            200: DropWaitlistSerializer,
+            404: OpenApiResponse(description="Entrada não encontrada."),
+            401: OpenApiResponse(description="Não autenticado."),
+        },
+    )
+    def post(self, request, pk):
+        from django.utils import timezone
+
+        entry = get_object_or_404(DropWaitlist, pk=pk, user=request.user)
+        if entry.seen_at is None:
+            entry.seen_at = timezone.now()
+            entry.save(update_fields=["seen_at"])
+        serializer = DropWaitlistSerializer(entry)
+        return Response(serializer.data, status=status.HTTP_200_OK)

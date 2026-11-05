@@ -297,6 +297,7 @@ class DropWaitlist(models.Model):
 
     Só usuário logado entra na lista. `notified_at` é do e-mail de abertura
     (ver products.drop_waitlist); o aviso no site deve ter campo próprio.
+    `seen_at` marca quando o usuário fechou o modal de aviso — independente do e-mail.
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -312,6 +313,11 @@ class DropWaitlist(models.Model):
     )
     created_at = models.DateTimeField(auto_now_add=True)
     notified_at = models.DateTimeField(null=True, blank=True)
+    seen_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Quando o usuário fechou o modal de aviso de abertura do drop.",
+    )
 
     class Meta:
         constraints = [
