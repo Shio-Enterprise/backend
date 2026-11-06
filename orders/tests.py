@@ -4259,3 +4259,116 @@ class CreateInfinitePayCheckoutPayloadTests(APITestCase):
             payload["redirect_url"],
             "http://testserver/api/orders/pagamento-sucesso/",
         )
+
+
+class GuestCartSurvivesLoginTests(APITestCase):
+    """Carrinho do visitante (sessão) passa para a conta em qualquer forma de entrar."""
+
+    password = "SenhaSegura123!"
+
+    def setUp(self):
+        self.category = Category.objects.create(name="Guest", slug="guest")
+        self.product = Product.objects.create(
+            category=self.category, name="Boné", base_price=79.90
+        )
+        self.variation = ProductVariation.objects.create(
+            product=self.product, size="U", sku="GUEST-U", stock_quantity=5
+        )
+        self.user = User.objects.create_user(
+            email="guest-merge@shio.com", name="Guest", password=self.password
+        )
+
+    def _add_as_guest(self, quantity=2):
+        response = self.client.post(
+            "/api/orders/cart/items/",
+            {"variation_id": str(self.variation.id), "quantity": quantity},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def _user_cart(self, user):
+        cart = Cart.objects.get(user=user, status="ACTIVE")
+        return {item.variation_id: item.quantity for item in cart.items.all()}
+
+    def test_login_com_senha_leva_o_carrinho_do_visitante(self):
+        self._add_as_guest(2)
+        response = self.client.post(
+            "/api/auth/login/",
+            {"email": self.user.email, "password": self.password},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self._user_cart(self.user), {self.variation.id: 2})
+        self.assertNotIn("cart", self.client.session)
+
+    def test_login_com_senha_soma_ao_carrinho_que_a_conta_ja_tinha(self):
+        cart = Cart.objects.create(user=self.user, status="ACTIVE")
+        CartItem.objects.create(
+            cart=cart, variation=self.variation, quantity=1, unit_price=79.90
+        )
+        self._add_as_guest(2)
+        self.client.post(
+            "/api/auth/login/",
+            {"email": self.user.email, "password": self.password},
+            format="json",
+        )
+        self.assertEqual(self._user_cart(self.user), {self.variation.id: 3})
+
+    def test_login_com_senha_errada_nao_mexe_no_carrinho(self):
+        self._add_as_guest(2)
+        response = self.client.post(
+            "/api/auth/login/",
+            {"email": self.user.email, "password": "errada"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(Cart.objects.filter(user=self.user).exists())
+        self.assertIn(str(self.variation.id), self.client.session["cart"])
+
+    def test_cadastro_leva_o_carrinho_do_visitante(self):
+        self._add_as_guest(1)
+        response = self.client.post(
+            "/api/auth/register/",
+            {"email": "novo@shio.com", "name": "Novo", "password": self.password},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        novo = User.objects.get(email="novo@shio.com")
+        self.assertEqual(self._user_cart(novo), {self.variation.id: 1})
+
+    def test_falha_ao_juntar_carrinho_nao_impede_o_login(self):
+        self._add_as_guest(1)
+        with patch(
+            "orders.signal_handlers.merge_session_cart_to_db",
+            side_effect=RuntimeError("falhou"),
+        ):
+            response = self.client.post(
+                "/api/auth/login/",
+                {"email": self.user.email, "password": self.password},
+                format="json",
+            )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("access", response.json())
+
+    @patch("authentication.services.id_token.verify_oauth2_token")
+    @patch(
+        "authentication.services.settings.GOOGLE_CLIENT_ID",
+        "test-client-id.apps.googleusercontent.com",
+    )
+    def test_login_google_continua_levando_o_carrinho(self, mock_verify):
+        mock_verify.return_value = {
+            "sub": "google-guest",
+            "email": self.user.email,
+            "email_verified": True,
+            "name": "Guest",
+            "aud": "test-client-id.apps.googleusercontent.com",
+            "iss": "accounts.google.com",
+        }
+        self._add_as_guest(2)
+        response = self.client.post(
+            "/api/auth/google/", {"id_token": "valid-token"}, format="json"
+        )
+        self.assertIn(
+            response.status_code, (status.HTTP_200_OK, status.HTTP_201_CREATED)
+        )
+        self.assertEqual(self._user_cart(self.user), {self.variation.id: 2})
