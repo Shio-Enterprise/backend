@@ -1,0 +1,18 @@
+{% extends "emails/base.html" %}
+
+{% block content %}
+<p>Olá, {{ nome|default:"usuário" }}!</p>
+
+<p>{{ convidado_por }} criou para você uma conta de administrador no painel do Shio.</p>
+
+<p>Para começar, crie a sua senha:</p>
+
+<p style="text-align: center; margin: 30px 0;">
+    <a href="{{ set_password_url }}" style="background-color: #000000; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 4px; display: inline-block; font-weight: bold;">Criar minha senha</a>
+</p>
+
+<p>Ou copie e cole o link a seguir no seu navegador:</p>
+<p style="word-break: break-all; color: #666;"><a href="{{ set_password_url }}">{{ set_password_url }}</a></p>
+
+<p>Depois é só entrar com este e-mail e a senha nova. O link expira em alguns dias; se expirar, use "Esqueci minha senha" na tela de login.</p>
+{% endblock %}
