@@ -688,9 +688,7 @@ class ProductDetailSerializer(ProductPricingSerializer):
     images = ProductImageSerializer(many=True, read_only=True)
     category = CategoryNestedSerializer(read_only=True)
     drop = DropNestedSerializer(read_only=True)
-    size_guide = SizeGuideSerializer(
-        source="category.size_guide", read_only=True, allow_null=True
-    )
+    size_guide = serializers.SerializerMethodField()
     is_sellable = serializers.SerializerMethodField()
 
     class Meta:
@@ -717,6 +715,22 @@ class ProductDetailSerializer(ProductPricingSerializer):
 
     def get_is_sellable(self, obj) -> bool:
         return is_product_sellable(obj)
+
+    def get_size_guide(self, obj):
+        
+        if obj.size_guide is not None:
+            guide = obj.size_guide
+        
+        elif obj.category is not None:
+            guide = obj.category.size_guide
+
+        else:
+            guide = None
+        
+        if guide is None:
+            return None
+        return SizeGuideSerializer(guide,many=False).data
+
 
 
 class ProductWriteSerializer(StrictSerializer):
