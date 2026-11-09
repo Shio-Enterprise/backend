@@ -1,5 +1,6 @@
 import uuid
 
+from django.conf import settings
 from django.contrib.auth.base_user import BaseUserManager
 from django.contrib.auth.models import AbstractUser
 from django.db import models
@@ -194,3 +195,30 @@ class NewsletterSubscriber(models.Model):
 
     def __str__(self):
         return self.email
+
+
+class NewsletterSend(models.Model):
+    """Histórico de envios de newsletter para inscritos (um registro por campanha)."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    subject = models.CharField(max_length=255, verbose_name="Assunto")
+    message = models.TextField(verbose_name="Mensagem")
+    sent_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="newsletter_sends",
+        verbose_name="Enviado por",
+    )
+    sent_at = models.DateTimeField(auto_now_add=True, verbose_name="Enviado em")
+    sent_count = models.PositiveIntegerField(default=0, verbose_name="Entregues")
+    failed_count = models.PositiveIntegerField(default=0, verbose_name="Falhas")
+
+    class Meta:
+        ordering = ["-sent_at"]
+        verbose_name = "Envio de Newsletter"
+        verbose_name_plural = "Envios de Newsletter"
+
+    def __str__(self):
+        return f"{self.subject} ({self.sent_at:%d/%m/%Y %H:%M})"

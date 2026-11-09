@@ -2,7 +2,7 @@ from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from django.contrib.auth.forms import UserChangeForm, UserCreationForm
 
-from .models import NewsletterSubscriber, User
+from .models import NewsletterSend, NewsletterSubscriber, User
 
 
 class CustomUserCreationForm(UserCreationForm):
@@ -97,3 +97,19 @@ class NewsletterSubscriberAdmin(admin.ModelAdmin):
     list_filter = ["consent_lgpd"]
     search_fields = ["email"]
     ordering = ["-subscribed_at"]
+
+
+@admin.register(NewsletterSend)
+class NewsletterSendAdmin(admin.ModelAdmin):
+    list_display = ["subject", "sent_by", "sent_at", "sent_count", "failed_count"]
+    readonly_fields = [
+        "id",
+        "subject",
+        "message",
+        "sent_by",
+        "sent_at",
+        "sent_count",
+        "failed_count",
+    ]
+    search_fields = ["subject", "sent_by__email", "sent_by__name"]
+    ordering = ["-sent_at"]

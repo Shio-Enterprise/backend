@@ -36,11 +36,17 @@ from authentication.signals import login_completed
 from core.exports import export_data_response
 from notifications.email import mask_email, send_email
 from notifications.marketing import is_receiving, opt_in, opt_out
+from notifications.newsletter import (
+    get_newsletter_audience,
+    render_newsletter_preview,
+    send_newsletter_campaign,
+    send_newsletter_test,
+)
 from notifications.unsubscribe import read_unsubscribe_token
 from orders.models import CustomerOrder, OrderStatus, PaymentStatus
 
 from .admin_permissions import serialized_permission_definitions
-from .models import NewsletterSubscriber, UserRole
+from .models import NewsletterSend, NewsletterSubscriber, UserRole
 from .permissions import CanManageAdminPermissions, CanManageCustomers
 from .serializers import (
     CPF_IN_USE_MESSAGE,
@@ -50,6 +56,9 @@ from .serializers import (
     CustomerCRMSerializer,
     GoogleAuthSerializer,
     LogoutInputSerializer,
+    NewsletterEmailMessageSerializer,
+    NewsletterEmailPreviewSerializer,
+    NewsletterSendHistorySerializer,
     NewsletterSubscribeSerializer,
     PasswordLoginSerializer,
     PasswordResetConfirmSerializer,
@@ -891,3 +900,99 @@ class PasswordResetConfirmView(APIView):
                 {"error": "O link de redefinição é inválido ou expirou."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+
+class NewsletterSummaryView(APIView):
+    """Resumo de público elegível e histórico de envios da newsletter."""
+
+    permission_classes = [CanManageCustomers]
+
+    @extend_schema(tags=["Newsletter"], responses=dict)
+    def get(self, request):
+        audience = get_newsletter_audience()
+        sends = NewsletterSend.objects.select_related("sent_by").all()
+        history = NewsletterSendHistorySerializer(sends, many=True).data
+        return Response(
+            {
+                "total_subscribers": len(audience),
+                "history": history,
+            }
+        )
+
+
+class NewsletterPreviewView(APIView):
+    """Pré-visualização do e-mail da newsletter em HTML."""
+
+    permission_classes = [CanManageCustomers]
+
+    @extend_schema(
+        tags=["Newsletter"],
+        request=NewsletterEmailPreviewSerializer,
+        responses=dict,
+    )
+    def post(self, request):
+        serializer = NewsletterEmailPreviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        subject = serializer.validated_data.get("subject", "")
+        message = serializer.validated_data.get("message", "")
+        html = render_newsletter_preview(subject=subject, message=message)
+        return Response({"html": html})
+
+
+class NewsletterTestView(APIView):
+    """Envia um e-mail de teste da newsletter para a conta do admin."""
+
+    permission_classes = [CanManageCustomers]
+
+    @extend_schema(
+        tags=["Newsletter"],
+        request=NewsletterEmailMessageSerializer,
+        responses=dict,
+    )
+    def post(self, request):
+        serializer = NewsletterEmailMessageSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        subject = serializer.validated_data["subject"]
+        message = serializer.validated_data["message"]
+        if send_newsletter_test(request.user, subject, message):
+            return Response({"sent": True})
+        return Response(
+            {"error": "Não foi possível enviar o teste."},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
+class NewsletterSendView(APIView):
+    """Envio em massa da newsletter para todos os inscritos elegíveis."""
+
+    permission_classes = [CanManageCustomers]
+
+    @extend_schema(
+        tags=["Newsletter"],
+        request=NewsletterEmailMessageSerializer,
+        responses=dict,
+    )
+    def post(self, request):
+        serializer = NewsletterEmailMessageSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        subject = serializer.validated_data["subject"]
+        message = serializer.validated_data["message"]
+
+        audience = get_newsletter_audience()
+        if len(audience) == 0:
+            return Response(
+                {"error": "Nenhum inscrito elegível para receber."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        record = send_newsletter_campaign(request.user, subject, message)
+        return Response(
+            {
+                "id": str(record.id),
+                "subject": record.subject,
+                "sent_count": record.sent_count,
+                "failed_count": record.failed_count,
+                "sent_at": record.sent_at,
+            },
+            status=status.HTTP_201_CREATED,
+        )

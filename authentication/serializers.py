@@ -8,7 +8,7 @@ from notifications.marketing import opt_in
 from orders.models import CustomerOrder
 
 from .admin_permissions import ADMIN_PERMISSION_CODES, ADMIN_PERMISSION_SET
-from .models import Address, User, UserProfile
+from .models import Address, NewsletterSend, User, UserProfile
 
 CPF_IN_USE_MESSAGE = "Este CPF já está cadastrado em outra conta."
 
@@ -390,3 +390,54 @@ class PasswordResetConfirmSerializer(serializers.Serializer):
     new_password = serializers.CharField(
         required=True, write_only=True, validators=[validate_password]
     )
+
+
+class NewsletterEmailMessageSerializer(serializers.Serializer):
+    subject = serializers.CharField(
+        max_length=255,
+        required=True,
+        allow_blank=False,
+        error_messages={"blank": "O assunto não pode estar em branco."},
+    )
+    message = serializers.CharField(
+        required=True,
+        allow_blank=False,
+        max_length=10000,
+        error_messages={"blank": "A mensagem não pode estar em branco."},
+    )
+
+
+class NewsletterEmailPreviewSerializer(serializers.Serializer):
+    subject = serializers.CharField(
+        max_length=255,
+        required=False,
+        allow_blank=True,
+        default="Newsletter — Shio",
+    )
+    message = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+        max_length=10000,
+    )
+
+
+class NewsletterSendHistorySerializer(serializers.ModelSerializer):
+    sent_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = NewsletterSend
+        fields = [
+            "id",
+            "subject",
+            "message",
+            "sent_at",
+            "sent_by_name",
+            "sent_count",
+            "failed_count",
+        ]
+
+    def get_sent_by_name(self, obj) -> str | None:
+        if not obj.sent_by:
+            return None
+        return obj.sent_by.name or obj.sent_by.email
