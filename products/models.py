@@ -340,6 +340,10 @@ class ProductVariation(models.Model):
     color = models.CharField(max_length=100, default="", blank=True)
     sku = models.CharField(max_length=100, unique=True)
     stock_quantity = models.PositiveIntegerField(default=0)
+    # Tamanho com histórico (pedido ou movimentação) não é apagado: é
+    # desativado. Inativo some da loja e não entra no carrinho nem no checkout,
+    # mas continua ligado aos pedidos antigos.
+    is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

@@ -1746,6 +1746,156 @@ class VariationCRUDTests(APITestCase):
         self.assertEqual(str(self.variation), f"{self.product.name} - P / Verde")
 
 
+class VariationDeactivationTests(APITestCase):
+    def setUp(self):
+        self.admin = make_user(
+            "admin@x.com", role=UserRole.ADMIN, name="Admin", is_staff=True
+        )
+        self.customer = make_user("c@x.com", role=UserRole.CUSTOMER, name="Cliente")
+        self.product = make_product()
+        self.small = ProductVariation.objects.create(
+            product=self.product, size="P", sku="DEACT-P", stock_quantity=0
+        )
+        self.large = ProductVariation.objects.create(
+            product=self.product, size="G", sku="DEACT-G", stock_quantity=3
+        )
+
+    def url(self, variation):
+        return f"/api/catalog/variations/{variation.id}/"
+
+    def deactivate(self, variation):
+        return self.client.put(
+            self.url(variation),
+            {"is_active": False},
+            format="json",
+            **auth_header(self.admin),
+        )
+
+    def make_order_item(self, variation):
+        order = CustomerOrder.objects.create(
+            user=self.customer,
+            subtotal=100,
+            total_amount=100,
+            status=OrderStatus.DELIVERED,
+            shipping_zip_code="71000000",
+            shipping_street="R",
+            shipping_number="1",
+            shipping_neighborhood="B",
+            shipping_city="C",
+            shipping_state="DF",
+        )
+        return OrderItem.objects.create(
+            order=order,
+            variation=variation,
+            quantity=1,
+            unit_price=100,
+            product_name=f"{self.product.name} - {variation.size}",
+        )
+
+    def test_remover_tamanho_com_pedido_so_desativa(self):
+        item = self.make_order_item(self.small)
+        response = self.client.delete(self.url(self.small), **auth_header(self.admin))
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertFalse(response.json()["is_active"])
+        self.small.refresh_from_db()
+        self.assertFalse(self.small.is_active)
+        item.refresh_from_db()
+        self.assertEqual(item.variation.size, "P")
+
+    def test_desativar_tamanho_com_estoque_400(self):
+        response = self.deactivate(self.large)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.large.refresh_from_db()
+        self.assertTrue(self.large.is_active)
+
+    def test_nao_desativa_o_ultimo_tamanho_ativo(self):
+        product = make_product(name="Boné")
+        only = ProductVariation.objects.create(
+            product=product, size="Único", sku="DEACT-U", stock_quantity=0
+        )
+        response = self.deactivate(only)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_tamanho_inativo_some_da_loja_e_continua_no_admin(self):
+        self.assertEqual(self.deactivate(self.small).status_code, 200)
+        detail_url = f"/api/catalog/products/{self.product.id}/"
+        public = self.client.get(detail_url).json()
+        self.assertEqual([v["size"] for v in public["variations"]], ["G"])
+        listed = self.client.get("/api/catalog/products/").json()["results"]
+        self.assertEqual([v["size"] for v in listed[0]["variations"]], ["G"])
+        admin = self.client.get(detail_url, **auth_header(self.admin)).json()
+        self.assertEqual(
+            {v["size"]: v["is_active"] for v in admin["variations"]},
+            {"P": False, "G": True},
+        )
+
+    def test_reativar_tamanho(self):
+        self.deactivate(self.small)
+        response = self.client.put(
+            self.url(self.small),
+            {"is_active": True},
+            format="json",
+            **auth_header(self.admin),
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.small.refresh_from_db()
+        self.assertTrue(self.small.is_active)
+
+    def test_entrada_manual_em_tamanho_inativo_400(self):
+        self.deactivate(self.small)
+        response = self.client.post(
+            f"/api/catalog/variations/{self.small.id}/stock-movements/",
+            {
+                "kind": "ENTRADA",
+                "reason": "COMPRA",
+                "quantity": 2,
+                "note": "Reposição",
+                "idempotency_key": str(uuid.uuid4()),
+            },
+            format="json",
+            **auth_header(self.admin),
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.small.refresh_from_db()
+        self.assertEqual(self.small.stock_quantity, 0)
+
+    def test_carrinho_recusa_tamanho_inativo(self):
+        # Estoque devolvido depois de desativar (ex.: pedido cancelado).
+        ProductVariation.objects.filter(pk=self.small.pk).update(
+            is_active=False, stock_quantity=2
+        )
+        response = self.client.post(
+            "/api/orders/cart/items/",
+            {"variation_id": str(self.small.id), "quantity": 1},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_avise_me_recusa_tamanho_inativo(self):
+        self.deactivate(self.small)
+        response = self.client.post(
+            "/api/catalog/stock-alerts/",
+            {"variation_id": str(self.small.id)},
+            format="json",
+            **auth_header(self.customer),
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class CheckoutInactiveVariationTests(APITestCase):
+    setUp = order_fixtures.CheckoutAPITests.setUp
+
+    def test_checkout_recusa_tamanho_inativo_no_carrinho(self):
+        ProductVariation.objects.filter(pk=self.variation.pk).update(is_active=False)
+        response = self.client.post(
+            "/api/orders/checkout/calculate/",
+            {"address_id": str(self.address.pk)},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(CustomerOrder.objects.exists())
+
+
 def make_product_image_file(name="img.jpg"):
     """JPEG válido 1x1 pra upload de ProductImage."""
     buf = BytesIO()

@@ -189,7 +189,7 @@ def exchange_options(order):
     product_ids = {item.variation.product_id for item in items}
     siblings = defaultdict(list)
     for variation in ProductVariation.objects.filter(
-        product_id__in=product_ids, product__is_active=True
+        product_id__in=product_ids, product__is_active=True, is_active=True
     ).order_by("size", "color"):
         siblings[variation.product_id].append(variation)
     return [
@@ -279,6 +279,7 @@ def _validate_items(order, items):
             replacement is None
             or replacement.product_id != item.variation.product_id
             or not replacement.product.is_active
+            or not replacement.is_active
         ):
             errors[key] = "Escolha outra variação do mesmo produto."
             continue

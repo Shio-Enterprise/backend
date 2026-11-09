@@ -26,6 +26,7 @@ def send_stock_alerts(variation_id) -> int:
     )
     if (
         variation is None
+        or not variation.is_active
         or variation.stock_quantity <= 0
         or not is_product_sellable(variation.product)
     ):
@@ -115,6 +116,7 @@ def schedule_product_alerts(product) -> None:
     variation_ids = (
         ProductVariation.objects.filter(
             product=product,
+            is_active=True,
             stock_quantity__gt=0,
             stock_alerts__notified_at__isnull=True,
         )
