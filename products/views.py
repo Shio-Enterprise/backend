@@ -76,6 +76,7 @@ from .serializers import (
     DropWaitlistUnseenSerializer,
     ProductDetailSerializer,
     ProductDuplicateSerializer,
+    ProductImageOrderSerializer,
     ProductImageSerializer,
     ProductListQuerySerializer,
     ProductListSerializer,
@@ -1523,6 +1524,67 @@ class ProductImageUpdateView(APIView):
         updated = serializer.save()
         return Response(
             ProductImageSerializer(updated, context={"request": request}).data
+        )
+
+
+class ProductImageOrderView(APIView):
+    """Define a ordem das imagens de um produto. A primeira é a principal."""
+
+    permission_classes = [CanManageCatalog]
+    serializer_class = ProductImageOrderSerializer
+
+    @extend_schema(
+        tags=["Products"],
+        summary="Reordenar imagens do produto",
+        description=(
+            "Recebe `image_ids` com **todos** os ids das imagens do produto, na "
+            "ordem desejada, e regrava `display_order` de 1 a N. A primeira é a "
+            "imagem principal (capa do card e do detalhe)."
+        ),
+        request=ProductImageOrderSerializer,
+        responses={
+            200: ProductImageSerializer(many=True),
+            400: OpenApiResponse(
+                description="Lista incompleta, repetida ou com imagem de outro produto."
+            ),
+            401: OpenApiResponse(description="Não autenticado."),
+            403: OpenApiResponse(description="Não autorizado — requer perfil ADMIN."),
+            404: OpenApiResponse(description="Produto não encontrado."),
+        },
+    )
+    def put(self, request, product_id):
+        serializer = ProductImageOrderSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                {"error": "Dados inválidos.", "details": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        image_ids = serializer.validated_data["image_ids"]
+        with transaction.atomic():
+            product = get_object_or_404(
+                Product.objects.select_for_update(), pk=product_id
+            )
+            images = {image.id: image for image in product.images.all()}
+            if set(image_ids) != set(images):
+                return Response(
+                    {
+                        "error": "Dados inválidos.",
+                        "details": {
+                            "image_ids": "Informe todas as imagens do produto."
+                        },
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            for order, image_id in enumerate(image_ids, start=1):
+                image = images[image_id]
+                if image.display_order != order:
+                    image.display_order = order
+                    image.save(update_fields=["display_order", "updated_at"])
+        ordered = [images[image_id] for image_id in image_ids]
+        return Response(
+            ProductImageSerializer(
+                ordered, many=True, context={"request": request}
+            ).data
         )
 
 

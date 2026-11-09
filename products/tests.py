@@ -1862,6 +1862,91 @@ class ImagePersistTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
 
+class ImageOrderTests(APITestCase):
+    def setUp(self):
+        self.admin = make_user(
+            "admin@x.com", role=UserRole.ADMIN, name="Admin", is_staff=True
+        )
+        self.customer = make_user("c@x.com", role=UserRole.CUSTOMER, name="Cliente")
+        self.product = make_product()
+        self.images = [
+            ProductImage.objects.create(
+                product=self.product,
+                image=make_product_image_file(f"{n}.jpg"),
+                display_order=n,
+            )
+            for n in (1, 2, 3)
+        ]
+        self.url = f"/api/catalog/products/{self.product.id}/images/order/"
+
+    def ids(self, *images):
+        return [str(image.id) for image in images]
+
+    def test_reordena_e_a_primeira_vira_principal(self):
+        first, second, third = self.images
+        response = self.client.put(
+            self.url,
+            {"image_ids": self.ids(third, first, second)},
+            format="json",
+            **auth_header(self.admin),
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(
+            [image["id"] for image in response.json()],
+            self.ids(third, first, second),
+        )
+        detail = self.client.get(
+            f"/api/catalog/products/{self.product.id}/", **auth_header(self.admin)
+        )
+        self.assertEqual(detail.json()["images"][0]["id"], str(third.id))
+        third.refresh_from_db()
+        self.assertEqual(third.display_order, 1)
+
+    def test_lista_incompleta_400(self):
+        first, second, _ = self.images
+        response = self.client.put(
+            self.url,
+            {"image_ids": self.ids(second, first)},
+            format="json",
+            **auth_header(self.admin),
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_imagem_repetida_400(self):
+        first, second, _ = self.images
+        response = self.client.put(
+            self.url,
+            {"image_ids": self.ids(first, second, first)},
+            format="json",
+            **auth_header(self.admin),
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_imagem_de_outro_produto_400(self):
+        first, second, _ = self.images
+        other = ProductImage.objects.create(
+            product=make_product(name="Outro"), image=make_product_image_file()
+        )
+        response = self.client.put(
+            self.url,
+            {"image_ids": self.ids(first, second, other)},
+            format="json",
+            **auth_header(self.admin),
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        first.refresh_from_db()
+        self.assertEqual(first.display_order, 1)
+
+    def test_customer_nao_pode_reordenar(self):
+        response = self.client.put(
+            self.url,
+            {"image_ids": self.ids(*reversed(self.images))},
+            format="json",
+            **auth_header(self.customer),
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
 class StockMovementTests(APITestCase):
     def setUp(self):
         self.admin = make_user(

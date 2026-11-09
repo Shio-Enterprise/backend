@@ -366,6 +366,17 @@ class ProductImageSerializer(serializers.ModelSerializer):
         return value
 
 
+class ProductImageOrderSerializer(serializers.Serializer):
+    """Nova ordem das imagens: todos os ids do produto, a primeira é a principal."""
+
+    image_ids = serializers.ListField(child=serializers.UUIDField(), allow_empty=False)
+
+    def validate_image_ids(self, value):
+        if len(set(value)) != len(value):
+            raise serializers.ValidationError("Imagem repetida.")
+        return value
+
+
 class CategoryNestedSerializer(serializers.ModelSerializer):
     """Resumo de Category usado em ProductDetailSerializer."""
 
