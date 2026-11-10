@@ -25,7 +25,7 @@ from drf_spectacular.utils import (
     OpenApiTypes,
     extend_schema,
 )
-from rest_framework import filters, mixins, status, viewsets
+from rest_framework import filters, mixins, serializers, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
@@ -39,12 +39,23 @@ from notifications.marketing import is_receiving, opt_in, opt_out
 from notifications.unsubscribe import read_unsubscribe_token
 from orders.models import CustomerOrder, OrderStatus, PaymentStatus
 
+from .admin_accounts import (
+    create_admin,
+    find_user_by_email,
+    normalize_email,
+    promote_to_admin,
+    revoke_admin_access,
+    send_admin_invite,
+)
 from .admin_permissions import serialized_permission_definitions
 from .models import NewsletterSubscriber, UserRole
 from .permissions import CanManageAdminPermissions, CanManageCustomers
 from .serializers import (
+    ALREADY_ADMIN_MESSAGE,
     CPF_IN_USE_MESSAGE,
+    SUPERUSER_LOCKED_MESSAGE,
     AddressSerializer,
+    AdminAccountCreateSerializer,
     AdminAccountSerializer,
     CustomerCRMDetailSerializer,
     CustomerCRMSerializer,
@@ -760,12 +771,12 @@ class AdminAccountViewSet(
     mixins.UpdateModelMixin,
     viewsets.GenericViewSet,
 ):
-    """Lista administradores e gerencia as permissões funcionais do painel."""
+    """Lista, cria/promove e remove administradores do painel."""
 
     permission_classes = [CanManageAdminPermissions]
     serializer_class = AdminAccountSerializer
     pagination_class = None
-    http_method_names = ["get", "patch", "head", "options"]
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ["name", "email"]
     ordering_fields = ["name", "email", "created_at"]
@@ -785,6 +796,90 @@ class AdminAccountViewSet(
     @action(detail=False, methods=["get"], url_path="permissions")
     def permissions(self, request):
         return Response({"results": serialized_permission_definitions()})
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter("email", OpenApiTypes.EMAIL, required=True),
+        ],
+        responses={200: OpenApiTypes.OBJECT},
+    )
+    @action(detail=False, methods=["get"], url_path="lookup")
+    def lookup(self, request):
+        """Diz se o e-mail já tem conta, para o painel escolher promover ou cadastrar."""
+        email = normalize_email(request.query_params.get("email"))
+        field = serializers.EmailField()
+        try:
+            field.run_validation(email)
+        except serializers.ValidationError:
+            return Response(
+                {"email": ["Informe um e-mail válido."]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user = find_user_by_email(email)
+        if user is None:
+            return Response({"email": email, "exists": False})
+        return Response(
+            {
+                "email": user.email,
+                "exists": True,
+                "id": user.pk,
+                "name": user.name,
+                "is_active": user.is_active,
+                "is_admin": user.is_admin,
+                "is_superuser": user.is_superuser,
+            }
+        )
+
+    @extend_schema(
+        request=AdminAccountCreateSerializer,
+        responses={200: AdminAccountSerializer, 201: AdminAccountSerializer},
+    )
+    def create(self, request, *args, **kwargs):
+        """Promove um cliente existente (200) ou cadastra conta nova (201)."""
+        serializer = AdminAccountCreateSerializer(
+            data=request.data, context=self.get_serializer_context()
+        )
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        user = data["existing_user"]
+        codes = data["admin_permissions"]
+
+        if user is not None:
+            promote_to_admin(user, codes)
+            body = AdminAccountSerializer(user).data
+            body["action"] = "promoted"
+            return Response(body, status=status.HTTP_200_OK)
+
+        try:
+            user = create_admin(data["email"], data["name"], codes)
+        except IntegrityError:
+            # Outro pedido criou o mesmo e-mail ao mesmo tempo.
+            return Response(
+                {"email": [ALREADY_ADMIN_MESSAGE]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        invite_sent = send_admin_invite(user, invited_by=request.user)
+        body = AdminAccountSerializer(user).data
+        body["action"] = "created"
+        body["invite_sent"] = invite_sent
+        return Response(body, status=status.HTTP_201_CREATED)
+
+    def destroy(self, request, *args, **kwargs):
+        """Remove o acesso de administrador; a conta vira cliente comum."""
+        user = self.get_object()
+        if user.pk == request.user.pk:
+            return Response(
+                {"detail": "Você não pode remover o seu próprio acesso."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if user.is_superuser:
+            return Response(
+                {"detail": SUPERUSER_LOCKED_MESSAGE},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        revoke_admin_access(user)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class NewsletterSubscribeView(APIView):
