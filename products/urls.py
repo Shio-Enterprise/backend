@@ -49,9 +49,21 @@ urlpatterns = [
     path("homepage/", PublicHomepageView.as_view(), name="homepage-public"),
     path("homepage/admin/", AdminHomepageView.as_view(), name="homepage-admin"),
     path("homepage/tagline/", HomepageTaglineView.as_view(), name="homepage-tagline"),
-    path("homepage/banners/", HomepageBannerListView.as_view(), name="homepage-banner-list"),
-    path("homepage/banners/order/", HomepageBannerOrderView.as_view(), name="homepage-banner-order"),
-    path("homepage/banners/<uuid:pk>/", HomepageBannerDetailView.as_view(), name="homepage-banner-detail"),
+    path(
+        "homepage/banners/",
+        HomepageBannerListView.as_view(),
+        name="homepage-banner-list",
+    ),
+    path(
+        "homepage/banners/order/",
+        HomepageBannerOrderView.as_view(),
+        name="homepage-banner-order",
+    ),
+    path(
+        "homepage/banners/<uuid:pk>/",
+        HomepageBannerDetailView.as_view(),
+        name="homepage-banner-detail",
+    ),
     path(
         "stock-alerts/",
         StockAlertListCreateView.as_view(),

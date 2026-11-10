@@ -33,13 +33,20 @@ class HomepageImageField(serializers.ImageField):
 class HomepageBannerSerializer(serializers.ModelSerializer):
     image_desktop = HomepageImageField()
     image_mobile = HomepageImageField(required=False, allow_null=True)
-    remove_image_mobile = serializers.BooleanField(write_only=True, required=False, default=False)
+    remove_image_mobile = serializers.BooleanField(
+        write_only=True, required=False, default=False
+    )
 
     class Meta:
         model = HomepageBanner
         fields = (
-            "id", "image_desktop", "image_mobile", "alt_text", "link",
-            "display_order", "remove_image_mobile",
+            "id",
+            "image_desktop",
+            "image_mobile",
+            "alt_text",
+            "link",
+            "display_order",
+            "remove_image_mobile",
         )
         read_only_fields = ("id", "display_order")
         extra_kwargs = {"image_mobile": {"required": False, "allow_null": True}}
@@ -58,13 +65,22 @@ class HomepageBannerSerializer(serializers.ModelSerializer):
 
     def validate_link(self, value):
         value = value.strip()
-        if value and (not value.startswith("/") or value.startswith("//") or "\\" in value or any(ord(char) < 32 for char in value)):
-            raise serializers.ValidationError("Use um caminho interno da loja começando por /.")
+        if value and (
+            not value.startswith("/")
+            or value.startswith("//")
+            or "\\" in value
+            or any(ord(char) < 32 for char in value)
+        ):
+            raise serializers.ValidationError(
+                "Use um caminho interno da loja começando por /."
+            )
         return value
 
     def validate(self, attrs):
         if attrs.get("remove_image_mobile") and attrs.get("image_mobile"):
-            raise serializers.ValidationError({"image_mobile": "Escolha uma nova imagem ou remova a atual."})
+            raise serializers.ValidationError(
+                {"image_mobile": "Escolha uma nova imagem ou remova a atual."}
+            )
         return attrs
 
     def create(self, validated_data):

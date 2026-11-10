@@ -10,16 +10,39 @@ class Migration(migrations.Migration):
         migrations.CreateModel(
             name="HomepageSettings",
             fields=[
-                ("id", models.PositiveSmallIntegerField(default=1, editable=False, primary_key=True, serialize=False)),
-                ("tagline", models.CharField(default="Deus primeiro. Negócios depois.", max_length=255)),
+                (
+                    "id",
+                    models.PositiveSmallIntegerField(
+                        default=1, editable=False, primary_key=True, serialize=False
+                    ),
+                ),
+                (
+                    "tagline",
+                    models.CharField(
+                        default="Deus primeiro. Negócios depois.", max_length=255
+                    ),
+                ),
             ],
         ),
         migrations.CreateModel(
             name="HomepageBanner",
             fields=[
-                ("id", models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True, serialize=False)),
+                (
+                    "id",
+                    models.UUIDField(
+                        default=uuid.uuid4,
+                        editable=False,
+                        primary_key=True,
+                        serialize=False,
+                    ),
+                ),
                 ("image_desktop", models.ImageField(upload_to="homepage/banners/")),
-                ("image_mobile", models.ImageField(blank=True, null=True, upload_to="homepage/banners/")),
+                (
+                    "image_mobile",
+                    models.ImageField(
+                        blank=True, null=True, upload_to="homepage/banners/"
+                    ),
+                ),
                 ("alt_text", models.CharField(max_length=255)),
                 ("link", models.CharField(blank=True, max_length=500)),
                 ("display_order", models.PositiveIntegerField(default=0)),

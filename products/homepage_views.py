@@ -36,7 +36,9 @@ def delete_files_on_commit(files):
     for file in files:
         if file and file.name:
             storage, name = file.storage, file.name
-            transaction.on_commit(lambda storage=storage, name=name: storage.delete(name))
+            transaction.on_commit(
+                lambda storage=storage, name=name: storage.delete(name)
+            )
 
 
 class PublicHomepageView(APIView):
@@ -70,12 +72,19 @@ class HomepageBannerListView(APIView):
     parser_classes = [MultiPartParser, FormParser]
 
     def post(self, request):
-        serializer = HomepageBannerSerializer(data=request.data, context={"request": request})
+        serializer = HomepageBannerSerializer(
+            data=request.data, context={"request": request}
+        )
         serializer.is_valid(raise_exception=True)
         with transaction.atomic():
             order = HomepageBanner.objects.aggregate(max=Max("display_order"))["max"]
-            banner = serializer.save(display_order=(order if order is not None else -1) + 1)
-        return Response(HomepageBannerSerializer(banner, context={"request": request}).data, status=status.HTTP_201_CREATED)
+            banner = serializer.save(
+                display_order=(order if order is not None else -1) + 1
+            )
+        return Response(
+            HomepageBannerSerializer(banner, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class HomepageBannerDetailView(APIView):
@@ -84,22 +93,32 @@ class HomepageBannerDetailView(APIView):
 
     def patch(self, request, pk):
         with transaction.atomic():
-            banner = get_object_or_404(HomepageBanner.objects.select_for_update(), pk=pk)
-            serializer = HomepageBannerSerializer(banner, data=request.data, partial=True, context={"request": request})
+            banner = get_object_or_404(
+                HomepageBanner.objects.select_for_update(), pk=pk
+            )
+            serializer = HomepageBannerSerializer(
+                banner, data=request.data, partial=True, context={"request": request}
+            )
             serializer.is_valid(raise_exception=True)
             old_desktop, old_mobile = banner.image_desktop, banner.image_mobile
             banner = serializer.save()
             replaced = []
             if old_desktop and old_desktop.name != banner.image_desktop.name:
                 replaced.append(old_desktop)
-            if old_mobile and (not banner.image_mobile or old_mobile.name != banner.image_mobile.name):
+            if old_mobile and (
+                not banner.image_mobile or old_mobile.name != banner.image_mobile.name
+            ):
                 replaced.append(old_mobile)
             delete_files_on_commit(replaced)
-        return Response(HomepageBannerSerializer(banner, context={"request": request}).data)
+        return Response(
+            HomepageBannerSerializer(banner, context={"request": request}).data
+        )
 
     def delete(self, request, pk):
         with transaction.atomic():
-            banner = get_object_or_404(HomepageBanner.objects.select_for_update(), pk=pk)
+            banner = get_object_or_404(
+                HomepageBanner.objects.select_for_update(), pk=pk
+            )
             files = (banner.image_desktop, banner.image_mobile)
             banner.delete()
             delete_files_on_commit(files)
@@ -116,8 +135,15 @@ class HomepageBannerOrderView(APIView):
         with transaction.atomic():
             banners = list(HomepageBanner.objects.select_for_update())
             existing = {banner.id for banner in banners}
-            if len(ids) != len(existing) or len(set(ids)) != len(ids) or set(ids) != existing:
-                return Response({"ids": ["Envie todos os banners existentes uma vez cada."]}, status=status.HTTP_400_BAD_REQUEST)
+            if (
+                len(ids) != len(existing)
+                or len(set(ids)) != len(ids)
+                or set(ids) != existing
+            ):
+                return Response(
+                    {"ids": ["Envie todos os banners existentes uma vez cada."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
             for order, banner_id in enumerate(ids):
                 HomepageBanner.objects.filter(pk=banner_id).update(display_order=order)
         return no_store(Response(homepage_payload(request)))

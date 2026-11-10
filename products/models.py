@@ -133,7 +133,9 @@ class HomepageSettings(models.Model):
 class HomepageBanner(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     image_desktop = models.ImageField(upload_to="homepage/banners/")
-    image_mobile = models.ImageField(upload_to="homepage/banners/", blank=True, null=True)
+    image_mobile = models.ImageField(
+        upload_to="homepage/banners/", blank=True, null=True
+    )
     alt_text = models.CharField(max_length=255)
     link = models.CharField(max_length=500, blank=True)
     display_order = models.PositiveIntegerField(default=0)
