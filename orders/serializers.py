@@ -823,8 +823,8 @@ class CheckoutInputSerializer(_CheckoutBaseInputSerializer):
 
 
 class CheckoutQuoteItemSerializer(CartItemRepresentationSerializer):
-    # Cotações gravadas antes da #85 não têm o campo.
-    in_stock = serializers.BooleanField(required=False)
+    # O snapshot da cotação não guarda estoque.
+    in_stock = None
 
 
 class CheckoutCouponSerializer(serializers.Serializer):
