@@ -1,10 +1,13 @@
 from django.urls import path
 
 from .homepage_views import (
-    AdminHomepageView, HomepageBannerDetailView, HomepageBannerListView,
-    HomepageBannerOrderView, HomepageTaglineView, PublicHomepageView,
+    AdminHomepageView,
+    HomepageBannerDetailView,
+    HomepageBannerListView,
+    HomepageBannerOrderView,
+    HomepageTaglineView,
+    PublicHomepageView,
 )
-
 from .views import (
     CatalogFilterOptionsView,
     CategoryDetailView,

@@ -1,7 +1,6 @@
 from django.db import migrations
 from django.db.models import Q
 
-
 OLD_CODES = (
     "access_admin_dashboard", "manage_catalog", "manage_drops",
     "manage_orders", "manage_customers", "manage_admin_permissions",

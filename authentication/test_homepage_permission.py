@@ -1,7 +1,8 @@
+from importlib import import_module
+
+from django.apps import apps
 from django.contrib.auth.models import Group, Permission
 from django.test import TestCase
-from django.apps import apps
-from importlib import import_module
 
 from authentication.admin_permissions import ADMIN_PERMISSION_CODES
 from authentication.permissions import user_has_admin_permission
