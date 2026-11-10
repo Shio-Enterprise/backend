@@ -420,4 +420,9 @@ DROP_WAITLIST_SWEEP_INTERVAL_SECONDS = config(
 )
 DROP_WAITLIST_RUN_INLINE = False
 
+# Newsletter: o envio roda numa thread, fora da requisição; nos testes, inline.
+# Um envio "enviando" sem avançar por esse tempo é marcado como interrompido.
+NEWSLETTER_RUN_INLINE = False
+NEWSLETTER_STALE_MINUTES = config("NEWSLETTER_STALE_MINUTES", default=10, cast=int)
+
 FRONTEND_URL = config("FRONTEND_URL", default="http://localhost:5173")

@@ -1,0 +1,13 @@
+{% extends "emails/base.txt" %}
+
+{% block content %}
+{% if nome %}Olá, {{ nome }}!{% else %}Olá!{% endif %}
+
+{{ mensagem }}
+
+Ir para a loja: {{ loja_url }}
+
+---
+Você recebeu este e-mail porque se inscreveu na nossa newsletter.
+Cancelar inscrição: {{ unsubscribe_url }}
+{% endblock %}
