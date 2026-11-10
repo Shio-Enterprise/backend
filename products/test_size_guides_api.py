@@ -177,3 +177,77 @@ class SizeGuideApiTests(APITestCase):
         )
         detail = self.client.get(f"/api/catalog/products/{product.pk}/").json()
         self.assertEqual(detail["size_guide"]["name"], "Calças")
+
+
+class ProductOwnSizeGuideTests(APITestCase):
+    """Guia escolhido no próprio produto, com o guia da categoria como reserva."""
+
+    def setUp(self):
+        self.admin = make_admin("catalogo@x.com", "manage_catalog")
+        self.normal = SizeGuide.objects.create(
+            name="Camiseta normal", columns=COLUMNS, rows=ROWS
+        )
+        self.oversized = SizeGuide.objects.create(
+            name="Camiseta oversized", columns=COLUMNS, rows=ROWS
+        )
+        self.camisetas = Category.objects.create(
+            name="Camisetas", slug="camisetas", size_guide=self.normal
+        )
+
+    def detail(self, product):
+        return self.client.get(f"/api/catalog/products/{product.pk}/").json()
+
+    def test_produto_com_guia_proprio_mostra_o_proprio(self):
+        product = make_product(category=self.camisetas, size_guide=self.oversized)
+        body = self.detail(product)
+        self.assertEqual(body["size_guide"]["name"], "Camiseta oversized")
+        self.assertEqual(body["own_size_guide"], str(self.oversized.pk))
+
+    def test_produto_sem_guia_proprio_mostra_o_da_categoria(self):
+        product = make_product(category=self.camisetas)
+        body = self.detail(product)
+        self.assertEqual(body["size_guide"]["name"], "Camiseta normal")
+        self.assertIsNone(body["own_size_guide"])
+
+    def test_dois_produtos_da_mesma_categoria_com_guias_diferentes(self):
+        normal = make_product(name="Básica", category=self.camisetas)
+        larga = make_product(
+            name="Larga", category=self.camisetas, size_guide=self.oversized
+        )
+        self.assertEqual(self.detail(normal)["size_guide"]["name"], "Camiseta normal")
+        self.assertEqual(self.detail(larga)["size_guide"]["name"], "Camiseta oversized")
+
+    def test_sem_guia_proprio_e_sem_categoria_fica_sem_guia(self):
+        product = make_product()
+        self.assertIsNone(self.detail(product)["size_guide"])
+
+    def test_excluir_guia_em_uso_volta_para_o_da_categoria(self):
+        product = make_product(category=self.camisetas, size_guide=self.oversized)
+        response = self.client.delete(
+            f"/api/catalog/size-guides/{self.oversized.pk}/",
+            **auth_header(self.admin),
+        )
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        product.refresh_from_db()
+        self.assertIsNone(product.size_guide)
+        self.assertEqual(self.detail(product)["size_guide"]["name"], "Camiseta normal")
+
+    def test_admin_escolhe_e_remove_o_guia_do_produto(self):
+        # O formulário do admin sempre manda o custo; sem ele o PATCH é recusado.
+        product = make_product(category=self.camisetas, cost_price=50)
+        url = f"/api/catalog/products/{product.pk}/"
+        response = self.client.patch(
+            url,
+            {"size_guide": str(self.oversized.pk)},
+            format="json",
+            **auth_header(self.admin),
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["size_guide"]["name"], "Camiseta oversized")
+
+        response = self.client.patch(
+            url, {"size_guide": None}, format="json", **auth_header(self.admin)
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        product.refresh_from_db()
+        self.assertIsNone(product.size_guide)

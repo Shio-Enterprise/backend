@@ -1223,7 +1223,7 @@ class ProductDetailView(APIView):
     def _get_object(self, pk, request, allow_inactive_for_admin=True):
         product = get_object_or_404(
             Product.objects.select_related(
-                "category__size_guide", "drop"
+                "size_guide", "category__size_guide", "drop"
             ).prefetch_related("variations", "images"),
             pk=pk,
         )
