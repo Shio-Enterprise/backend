@@ -272,7 +272,14 @@ class StrictSerializer(serializers.ModelSerializer):
         return super().to_internal_value(data)
 
 
+def can_see_stock_quantity(request) -> bool:
+    user = getattr(request, "user", None)
+    return bool(user and getattr(user, "is_admin", False))
+
+
 class ProductVariationSerializer(StrictSerializer):
+    in_stock = serializers.SerializerMethodField()
+
     class Meta:
         model = ProductVariation
         fields = [
@@ -282,6 +289,7 @@ class ProductVariationSerializer(StrictSerializer):
             "sku",
             "stock_quantity",
             "is_active",
+            "in_stock",
             "created_at",
             "updated_at",
         ]
@@ -291,6 +299,15 @@ class ProductVariationSerializer(StrictSerializer):
             "size": {"required": False, "allow_blank": True},
         }
         validators = []
+
+    def get_in_stock(self, obj) -> bool:
+        return obj.stock_quantity > 0
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if not can_see_stock_quantity(self.context.get("request")):
+            data.pop("stock_quantity", None)
+        return data
 
     def validate(self, attrs):
         if self.instance and "stock_quantity" in attrs:
@@ -355,6 +372,8 @@ class ProductVariationSerializer(StrictSerializer):
 
 
 class ProductVariationInputSerializer(ProductVariationSerializer):
+    in_stock = None
+
     class Meta(ProductVariationSerializer.Meta):
         fields = ["size", "color", "sku", "stock_quantity"]
         read_only_fields = []

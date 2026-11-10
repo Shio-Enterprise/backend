@@ -5,7 +5,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("products", "0014_dropwaitlist_seen_at"),
+        ("products", "0015_homepage"),
     ]
 
     operations = [

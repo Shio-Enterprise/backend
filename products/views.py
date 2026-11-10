@@ -1372,7 +1372,7 @@ class ProductVariationCreateView(APIView):
         variation = serializer.save(product=product)
         logger.info(f"Variação criada: {variation.sku} no produto {product.id}")
         return Response(
-            ProductVariationSerializer(variation).data,
+            ProductVariationSerializer(variation, context={"request": request}).data,
             status=status.HTTP_201_CREATED,
         )
 
@@ -1397,7 +1397,9 @@ class ProductVariationDetailView(APIView):
     )
     def put(self, request, pk):
         variation = get_object_or_404(ProductVariation, pk=pk)
-        serializer = ProductVariationSerializer(variation, data=request.data)
+        serializer = ProductVariationSerializer(
+            variation, data=request.data, context={"request": request}
+        )
         if not serializer.is_valid():
             return Response(
                 {"error": "Dados inválidos.", "details": serializer.errors},

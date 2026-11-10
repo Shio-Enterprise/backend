@@ -25,7 +25,7 @@ from drf_spectacular.utils import (
     OpenApiTypes,
     extend_schema,
 )
-from rest_framework import filters, mixins, status, viewsets
+from rest_framework import filters, mixins, serializers, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
@@ -36,20 +36,42 @@ from authentication.signals import login_completed
 from core.exports import export_data_response
 from notifications.email import mask_email, send_email
 from notifications.marketing import is_receiving, opt_in, opt_out
+from notifications.newsletter import (
+    NewsletterInProgress,
+    expire_stale_sends,
+    get_newsletter_audience,
+    render_newsletter_preview,
+    send_newsletter_test,
+    start_newsletter_campaign,
+)
 from notifications.unsubscribe import read_unsubscribe_token
 from orders.models import CustomerOrder, OrderStatus, PaymentStatus
 
+from .admin_accounts import (
+    create_admin,
+    find_user_by_email,
+    normalize_email,
+    promote_to_admin,
+    revoke_admin_access,
+    send_admin_invite,
+)
 from .admin_permissions import serialized_permission_definitions
-from .models import NewsletterSubscriber, UserRole
+from .models import NewsletterSend, NewsletterSubscriber, UserRole
 from .permissions import CanManageAdminPermissions, CanManageCustomers
 from .serializers import (
+    ALREADY_ADMIN_MESSAGE,
     CPF_IN_USE_MESSAGE,
+    SUPERUSER_LOCKED_MESSAGE,
     AddressSerializer,
+    AdminAccountCreateSerializer,
     AdminAccountSerializer,
     CustomerCRMDetailSerializer,
     CustomerCRMSerializer,
     GoogleAuthSerializer,
     LogoutInputSerializer,
+    NewsletterEmailMessageSerializer,
+    NewsletterEmailPreviewSerializer,
+    NewsletterSendHistorySerializer,
     NewsletterSubscribeSerializer,
     PasswordLoginSerializer,
     PasswordResetConfirmSerializer,
@@ -760,12 +782,12 @@ class AdminAccountViewSet(
     mixins.UpdateModelMixin,
     viewsets.GenericViewSet,
 ):
-    """Lista administradores e gerencia as permissões funcionais do painel."""
+    """Lista, cria/promove e remove administradores do painel."""
 
     permission_classes = [CanManageAdminPermissions]
     serializer_class = AdminAccountSerializer
     pagination_class = None
-    http_method_names = ["get", "patch", "head", "options"]
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ["name", "email"]
     ordering_fields = ["name", "email", "created_at"]
@@ -785,6 +807,90 @@ class AdminAccountViewSet(
     @action(detail=False, methods=["get"], url_path="permissions")
     def permissions(self, request):
         return Response({"results": serialized_permission_definitions()})
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter("email", OpenApiTypes.EMAIL, required=True),
+        ],
+        responses={200: OpenApiTypes.OBJECT},
+    )
+    @action(detail=False, methods=["get"], url_path="lookup")
+    def lookup(self, request):
+        """Diz se o e-mail já tem conta, para o painel escolher promover ou cadastrar."""
+        email = normalize_email(request.query_params.get("email"))
+        field = serializers.EmailField()
+        try:
+            field.run_validation(email)
+        except serializers.ValidationError:
+            return Response(
+                {"email": ["Informe um e-mail válido."]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user = find_user_by_email(email)
+        if user is None:
+            return Response({"email": email, "exists": False})
+        return Response(
+            {
+                "email": user.email,
+                "exists": True,
+                "id": user.pk,
+                "name": user.name,
+                "is_active": user.is_active,
+                "is_admin": user.is_admin,
+                "is_superuser": user.is_superuser,
+            }
+        )
+
+    @extend_schema(
+        request=AdminAccountCreateSerializer,
+        responses={200: AdminAccountSerializer, 201: AdminAccountSerializer},
+    )
+    def create(self, request, *args, **kwargs):
+        """Promove um cliente existente (200) ou cadastra conta nova (201)."""
+        serializer = AdminAccountCreateSerializer(
+            data=request.data, context=self.get_serializer_context()
+        )
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        user = data["existing_user"]
+        codes = data["admin_permissions"]
+
+        if user is not None:
+            promote_to_admin(user, codes)
+            body = AdminAccountSerializer(user).data
+            body["action"] = "promoted"
+            return Response(body, status=status.HTTP_200_OK)
+
+        try:
+            user = create_admin(data["email"], data["name"], codes)
+        except IntegrityError:
+            # Outro pedido criou o mesmo e-mail ao mesmo tempo.
+            return Response(
+                {"email": [ALREADY_ADMIN_MESSAGE]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        invite_sent = send_admin_invite(user, invited_by=request.user)
+        body = AdminAccountSerializer(user).data
+        body["action"] = "created"
+        body["invite_sent"] = invite_sent
+        return Response(body, status=status.HTTP_201_CREATED)
+
+    def destroy(self, request, *args, **kwargs):
+        """Remove o acesso de administrador; a conta vira cliente comum."""
+        user = self.get_object()
+        if user.pk == request.user.pk:
+            return Response(
+                {"detail": "Você não pode remover o seu próprio acesso."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if user.is_superuser:
+            return Response(
+                {"detail": SUPERUSER_LOCKED_MESSAGE},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        revoke_admin_access(user)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class NewsletterSubscribeView(APIView):
@@ -891,3 +997,107 @@ class PasswordResetConfirmView(APIView):
                 {"error": "O link de redefinição é inválido ou expirou."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+
+class NewsletterSummaryView(APIView):
+    """Resumo de público elegível e histórico de envios da newsletter."""
+
+    permission_classes = [CanManageCustomers]
+
+    @extend_schema(tags=["Newsletter"], responses=dict)
+    def get(self, request):
+        expire_stale_sends()
+        audience = get_newsletter_audience()
+        sends = NewsletterSend.objects.select_related("sent_by").all()
+        history = NewsletterSendHistorySerializer(sends, many=True).data
+        return Response(
+            {
+                "total_subscribers": len(audience),
+                "history": history,
+            }
+        )
+
+
+class NewsletterPreviewView(APIView):
+    """Pré-visualização do e-mail da newsletter em HTML."""
+
+    permission_classes = [CanManageCustomers]
+
+    @extend_schema(
+        tags=["Newsletter"],
+        request=NewsletterEmailPreviewSerializer,
+        responses=dict,
+    )
+    def post(self, request):
+        serializer = NewsletterEmailPreviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        subject = serializer.validated_data.get("subject", "")
+        message = serializer.validated_data.get("message", "")
+        html = render_newsletter_preview(subject=subject, message=message)
+        return Response({"html": html})
+
+
+class NewsletterTestView(APIView):
+    """Envia um e-mail de teste da newsletter para a conta do admin."""
+
+    permission_classes = [CanManageCustomers]
+
+    @extend_schema(
+        tags=["Newsletter"],
+        request=NewsletterEmailMessageSerializer,
+        responses=dict,
+    )
+    def post(self, request):
+        serializer = NewsletterEmailMessageSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        subject = serializer.validated_data["subject"]
+        message = serializer.validated_data["message"]
+        if send_newsletter_test(request.user, subject, message):
+            return Response({"sent": True})
+        return Response(
+            {"error": "Não foi possível enviar o teste."},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
+class NewsletterSendView(APIView):
+    """Inicia o envio em massa da newsletter para todos os inscritos elegíveis.
+
+    Responde 202 com o registro do envio; os e-mails saem em segundo plano.
+    """
+
+    permission_classes = [CanManageCustomers]
+
+    @extend_schema(
+        tags=["Newsletter"],
+        request=NewsletterEmailMessageSerializer,
+        responses=dict,
+    )
+    def post(self, request):
+        serializer = NewsletterEmailMessageSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        subject = serializer.validated_data["subject"]
+        message = serializer.validated_data["message"]
+
+        audience = get_newsletter_audience()
+        if len(audience) == 0:
+            return Response(
+                {"error": "Nenhum inscrito elegível para receber."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            record = start_newsletter_campaign(request.user, subject, message)
+        except NewsletterInProgress:
+            return Response(
+                {"error": "Já existe um envio de newsletter em andamento."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        # Com o envio em segundo plano o registro volta como "enviando";
+        # o histórico do resumo mostra o avanço.
+        record.refresh_from_db()
+        return Response(
+            NewsletterSendHistorySerializer(record).data,
+            status=status.HTTP_202_ACCEPTED,
+        )

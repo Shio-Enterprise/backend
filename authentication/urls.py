@@ -11,7 +11,11 @@ from .views import (
     MarketingUnsubscribeView,
     MeMarketingView,
     MeView,
+    NewsletterPreviewView,
+    NewsletterSendView,
     NewsletterSubscribeView,
+    NewsletterSummaryView,
+    NewsletterTestView,
     PasswordLoginView,
     PasswordResetConfirmView,
     PasswordResetRequestView,
@@ -55,6 +59,27 @@ urlpatterns = [
         "newsletter/subscribe/",
         NewsletterSubscribeView.as_view(),
         name="newsletter-subscribe",
+    ),
+    # Rotas administrativas da newsletter
+    path(
+        "admin/newsletter/",
+        NewsletterSummaryView.as_view(),
+        name="admin-newsletter-summary",
+    ),
+    path(
+        "admin/newsletter/preview/",
+        NewsletterPreviewView.as_view(),
+        name="admin-newsletter-preview",
+    ),
+    path(
+        "admin/newsletter/test/",
+        NewsletterTestView.as_view(),
+        name="admin-newsletter-test",
+    ),
+    path(
+        "admin/newsletter/send/",
+        NewsletterSendView.as_view(),
+        name="admin-newsletter-send",
     ),
     # POST - Solicitação de redefinição de senha
     path("password-reset/", PasswordResetRequestView.as_view(), name="password-reset"),

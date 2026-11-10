@@ -1,0 +1,14 @@
+{% extends "emails/base.txt" %}
+
+{% block content %}
+Olá, {{ nome|default:"usuário" }}!
+
+{{ convidado_por }} criou para você uma conta de administrador no painel do Shio.
+
+Para começar, crie a sua senha no link abaixo:
+{{ set_password_url }}
+
+Depois é só entrar com este e-mail e a senha nova.
+
+O link expira em alguns dias. Se expirar, use "Esqueci minha senha" na tela de login.
+{% endblock %}
