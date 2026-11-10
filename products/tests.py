@@ -1797,6 +1797,8 @@ class VariationDeactivationTests(APITestCase):
         response = self.client.delete(self.url(self.small), **auth_header(self.admin))
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertFalse(response.json()["is_active"])
+        # O admin recebe o estoque na resposta (a tela de edição usa).
+        self.assertEqual(response.json()["stock_quantity"], 0)
         self.small.refresh_from_db()
         self.assertFalse(self.small.is_active)
         item.refresh_from_db()

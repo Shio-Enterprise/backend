@@ -1441,7 +1441,11 @@ class ProductVariationDetailView(APIView):
                     variation.is_active = False
                     variation.save(update_fields=["is_active", "updated_at"])
                 logger.info(f"Variação desativada: {variation.sku} ({variation.id})")
-                return Response(ProductVariationSerializer(variation).data)
+                return Response(
+                    ProductVariationSerializer(
+                        variation, context={"request": request}
+                    ).data
+                )
             if (
                 not variation.product.variations.filter(is_active=True)
                 .exclude(pk=variation.pk)
