@@ -1,0 +1,18 @@
+{% extends "emails/base.html" %}
+
+{% block content %}
+<p style="margin-bottom: 20px; font-size: 16px;">{% if nome %}Olá, {{ nome }}!{% else %}Olá!{% endif %}</p>
+
+<div style="margin: 24px 0; font-size: 16px; line-height: 1.6; color: #2d2d2d;">
+{{ mensagem|linebreaksbr }}
+</div>
+
+<p style="text-align: center; margin: 36px 0 24px 0;">
+    <a href="{{ loja_url }}" style="background-color: #000000; color: #ffffff; padding: 14px 28px; text-decoration: none; border-radius: 4px; display: inline-block; font-weight: bold; font-size: 14px; letter-spacing: 1px; text-transform: uppercase;">Ir para a loja</a>
+</p>
+
+<p style="font-size: 12px; color: #666666; text-align: center; margin-top: 36px; border-top: 1px solid #eeeeee; padding-top: 16px;">
+    Você recebeu este e-mail porque se inscreveu na nossa newsletter.<br>
+    <a href="{{ unsubscribe_url }}" style="color: #666666; text-decoration: underline;">Cancelar inscrição</a>
+</p>
+{% endblock %}
