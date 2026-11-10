@@ -5,6 +5,7 @@ from django.core.files.base import ContentFile
 from django.db import IntegrityError, transaction
 from django.db.models import (
     Case,
+    Count,
     Exists,
     IntegerField,
     Max,
@@ -627,7 +628,11 @@ class SizeGuideListCreateView(APIView):
         responses={200: SizeGuideAdminSerializer(many=True)},
     )
     def get(self, request):
-        guides = SizeGuide.objects.prefetch_related("categories").order_by("name")
+        guides = (
+            SizeGuide.objects.prefetch_related("categories")
+            .annotate(product_count=Count("products"))
+            .order_by("name")
+        )
         return Response(SizeGuideAdminSerializer(guides, many=True).data)
 
     @extend_schema(

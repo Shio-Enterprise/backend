@@ -251,3 +251,21 @@ class ProductOwnSizeGuideTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         product.refresh_from_db()
         self.assertIsNone(product.size_guide)
+
+    def test_painel_mostra_quantos_produtos_usam_cada_guia(self):
+        make_product(name="Larga 1", size_guide=self.oversized)
+        make_product(name="Larga 2", size_guide=self.oversized)
+        # Produto que só usa o guia pela categoria não conta.
+        make_product(name="Básica", category=self.camisetas)
+        headers = auth_header(self.admin)
+
+        body = self.client.get("/api/catalog/size-guides/", **headers).json()
+        # O banco já vem com os guias padrão da migration; olha só os deste teste.
+        counts = {guide["name"]: guide["product_count"] for guide in body}
+        self.assertEqual(counts["Camiseta normal"], 0)
+        self.assertEqual(counts["Camiseta oversized"], 2)
+
+        detail = self.client.get(
+            f"/api/catalog/size-guides/{self.oversized.pk}/", **headers
+        ).json()
+        self.assertEqual(detail["product_count"], 2)
