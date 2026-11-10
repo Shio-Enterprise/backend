@@ -31,6 +31,7 @@ O solicitante escolheu a abordagem 1.
 - O solicitante restringiu links a caminhos internos da loja. A validação aceita caminhos iniciados por `/`, sem `//`, para evitar redirecionamentos externos ou esquemas perigosos.
 - A frase pode ser alterada independentemente dos banners; texto vazio é recusado. A configuração ausente usa a frase atual.
 - A imagem de celular é opcional; na ausência dela, a loja reutiliza a imagem de computador em todas as larguras.
+- Ao editar um banner, o admin pode retirar a imagem de celular e limpar o link opcional.
 - Se a API pública estiver temporariamente indisponível, a loja mostra os banners e a frase padrão, mantendo a página utilizável.
 
 ## Verificação
