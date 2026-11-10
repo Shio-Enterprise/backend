@@ -83,11 +83,11 @@ class HomepageBannerDetailView(APIView):
     parser_classes = [MultiPartParser, FormParser]
 
     def patch(self, request, pk):
-        banner = get_object_or_404(HomepageBanner, pk=pk)
-        serializer = HomepageBannerSerializer(banner, data=request.data, partial=True, context={"request": request})
-        serializer.is_valid(raise_exception=True)
-        old_desktop, old_mobile = banner.image_desktop, banner.image_mobile
         with transaction.atomic():
+            banner = get_object_or_404(HomepageBanner.objects.select_for_update(), pk=pk)
+            serializer = HomepageBannerSerializer(banner, data=request.data, partial=True, context={"request": request})
+            serializer.is_valid(raise_exception=True)
+            old_desktop, old_mobile = banner.image_desktop, banner.image_mobile
             banner = serializer.save()
             replaced = []
             if old_desktop and old_desktop.name != banner.image_desktop.name:
@@ -98,9 +98,9 @@ class HomepageBannerDetailView(APIView):
         return Response(HomepageBannerSerializer(banner, context={"request": request}).data)
 
     def delete(self, request, pk):
-        banner = get_object_or_404(HomepageBanner, pk=pk)
-        files = (banner.image_desktop, banner.image_mobile)
         with transaction.atomic():
+            banner = get_object_or_404(HomepageBanner.objects.select_for_update(), pk=pk)
+            files = (banner.image_desktop, banner.image_mobile)
             banner.delete()
             delete_files_on_commit(files)
         return Response(status=status.HTTP_204_NO_CONTENT)

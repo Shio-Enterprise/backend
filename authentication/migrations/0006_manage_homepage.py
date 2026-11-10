@@ -22,6 +22,7 @@ def grant_existing_full_admins(apps, schema_editor):
     profile_ids = UserProfile.objects.filter(role="ADMIN").values_list("user_id", flat=True)
     for user in User.objects.filter(Q(is_staff=True) | Q(pk__in=profile_ids), is_superuser=False).distinct():
         held = set(user.user_permissions.filter(id__in=old_ids).values_list("id", flat=True))
+        held.update(user.groups.values_list("permissions__id", flat=True))
         if held == old_ids and len(old_ids) == len(OLD_CODES):
             user.user_permissions.add(permission)
 

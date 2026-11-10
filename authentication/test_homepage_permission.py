@@ -1,4 +1,4 @@
-from django.contrib.auth.models import Permission
+from django.contrib.auth.models import Group, Permission
 from django.test import TestCase
 from django.apps import apps
 from importlib import import_module
@@ -33,3 +33,16 @@ class HomepagePermissionTests(TestCase):
         limited.refresh_from_db()
         self.assertTrue(user_has_admin_permission(full, "manage_homepage"))
         self.assertFalse(user_has_admin_permission(limited, "manage_homepage"))
+
+    def test_migration_preserves_full_access_granted_through_group(self):
+        old_codes = (
+            "access_admin_dashboard", "manage_catalog", "manage_drops",
+            "manage_orders", "manage_customers", "manage_admin_permissions",
+        )
+        group = Group.objects.create(name="Administradores completos")
+        group.permissions.set(Permission.objects.filter(content_type__app_label="authentication", codename__in=old_codes))
+        admin = make_user("group-homepage@example.com", is_staff=True)
+        admin.user_permissions.clear()
+        admin.groups.add(group)
+        import_module("authentication.migrations.0006_manage_homepage").grant_existing_full_admins(apps, None)
+        self.assertTrue(user_has_admin_permission(admin, "manage_homepage"))
