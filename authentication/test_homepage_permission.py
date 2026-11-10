@@ -36,7 +36,7 @@ class HomepagePermissionTests(TestCase):
         limited = make_user("limited-homepage@example.com", is_staff=True)
         full.user_permissions.set(old_permissions)
         limited.user_permissions.set(old_permissions.filter(codename="manage_orders"))
-        migration = import_module("authentication.migrations.0006_manage_homepage")
+        migration = import_module("authentication.migrations.0008_manage_homepage")
         migration.grant_existing_full_admins(apps, None)
         full.refresh_from_db()
         limited.refresh_from_db()
@@ -62,7 +62,7 @@ class HomepagePermissionTests(TestCase):
         admin.user_permissions.clear()
         admin.groups.add(group)
         import_module(
-            "authentication.migrations.0006_manage_homepage"
+            "authentication.migrations.0008_manage_homepage"
         ).grant_existing_full_admins(apps, None)
         self.assertTrue(user_has_admin_permission(admin, "manage_homepage"))
 
@@ -83,6 +83,6 @@ class HomepagePermissionTests(TestCase):
         )
         admin.groups.add(Group.objects.create(name="Grupo vazio"))
         import_module(
-            "authentication.migrations.0006_manage_homepage"
+            "authentication.migrations.0008_manage_homepage"
         ).grant_existing_full_admins(apps, None)
         self.assertTrue(user_has_admin_permission(admin, "manage_homepage"))

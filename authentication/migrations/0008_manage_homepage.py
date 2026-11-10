@@ -46,7 +46,7 @@ def grant_existing_full_admins(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-    dependencies = [("authentication", "0005_newsletter_email_lowercase")]
+    dependencies = [("authentication", "0007_newslettersend_status")]
 
     operations = [
         migrations.AlterModelOptions(
