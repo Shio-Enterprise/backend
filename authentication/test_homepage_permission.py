@@ -46,3 +46,14 @@ class HomepagePermissionTests(TestCase):
         admin.groups.add(group)
         import_module("authentication.migrations.0006_manage_homepage").grant_existing_full_admins(apps, None)
         self.assertTrue(user_has_admin_permission(admin, "manage_homepage"))
+
+    def test_migration_ignores_unrelated_group_permissions(self):
+        old_codes = (
+            "access_admin_dashboard", "manage_catalog", "manage_drops",
+            "manage_orders", "manage_customers", "manage_admin_permissions",
+        )
+        admin = make_user("mixed-homepage@example.com", is_staff=True)
+        admin.user_permissions.set(Permission.objects.filter(content_type__app_label="authentication", codename__in=old_codes))
+        admin.groups.add(Group.objects.create(name="Grupo vazio"))
+        import_module("authentication.migrations.0006_manage_homepage").grant_existing_full_admins(apps, None)
+        self.assertTrue(user_has_admin_permission(admin, "manage_homepage"))
