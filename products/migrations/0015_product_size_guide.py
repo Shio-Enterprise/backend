@@ -5,15 +5,20 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('products', '0014_dropwaitlist_seen_at'),
+        ("products", "0014_dropwaitlist_seen_at"),
     ]
 
     operations = [
         migrations.AddField(
-            model_name='product',
-            name='size_guide',
-            field=models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='products', to='products.sizeguide'),
+            model_name="product",
+            name="size_guide",
+            field=models.ForeignKey(
+                blank=True,
+                null=True,
+                on_delete=django.db.models.deletion.SET_NULL,
+                related_name="products",
+                to="products.sizeguide",
+            ),
         ),
     ]

@@ -736,7 +736,6 @@ class ProductDetailSerializer(ProductPricingSerializer):
         return SizeGuideSerializer(guide).data
 
 
-
 class ProductWriteSerializer(StrictSerializer):
     """Create/update de Product com variations opcionais aninhadas no create."""
 
