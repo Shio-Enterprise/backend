@@ -18,6 +18,12 @@ ADMIN_PERMISSION_DEFINITIONS = (
         "Criar, editar e remover drops e administrar os produtos vinculados a eles.",
     ),
     (
+        "manage_homepage",
+        "Gerenciar página inicial",
+        "Página inicial",
+        "Editar banners e frase da página inicial da loja.",
+    ),
+    (
         "manage_orders",
         "Gerenciar pedidos",
         "Pedidos",
