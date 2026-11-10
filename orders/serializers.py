@@ -771,7 +771,7 @@ class CartItemRepresentationSerializer(serializers.Serializer):
     quantity = serializers.IntegerField()
     unit_price = serializers.DecimalField(max_digits=10, decimal_places=2)
     total_price = serializers.DecimalField(max_digits=10, decimal_places=2)
-    stock_quantity = serializers.IntegerField()
+    in_stock = serializers.BooleanField()
     is_sellable = serializers.BooleanField()
 
 
@@ -823,7 +823,8 @@ class CheckoutInputSerializer(_CheckoutBaseInputSerializer):
 
 
 class CheckoutQuoteItemSerializer(CartItemRepresentationSerializer):
-    stock_quantity = serializers.IntegerField(required=False)
+    # Cotações gravadas antes da #85 não têm o campo.
+    in_stock = serializers.BooleanField(required=False)
 
 
 class CheckoutCouponSerializer(serializers.Serializer):

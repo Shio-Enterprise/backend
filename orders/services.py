@@ -154,7 +154,7 @@ def _get_checkout_contents(
                 "product_name": variation.product.name,
                 "size": variation.size,
                 "sku": variation.sku,
-                "stock_quantity": variation.stock_quantity,
+                "in_stock": variation.stock_quantity > 0,
                 "quantity": item.quantity,
                 "unit_price": unit_price,
                 "base_price": variation.product.base_price,
@@ -910,7 +910,7 @@ def get_cart_data(request):
                         price_at
                     ),
                     "total_price": total_price,
-                    "stock_quantity": item.variation.stock_quantity,
+                    "in_stock": item.variation.stock_quantity > 0,
                     "is_sellable": is_product_sellable(item.variation.product),
                 }
             )
@@ -960,7 +960,7 @@ def get_cart_data(request):
                         price_at
                     ),
                     "total_price": total_price,
-                    "stock_quantity": variation.stock_quantity,
+                    "in_stock": variation.stock_quantity > 0,
                     "is_sellable": is_product_sellable(variation.product),
                 }
             )
@@ -1007,9 +1007,7 @@ def add_item_to_cart(request, variation_id, quantity):
 
             new_quantity = cart_item.quantity + quantity
             if new_quantity > variation.stock_quantity:
-                raise ValueError(
-                    f"Estoque insuficiente para {variation.product.name}. Disponível: {variation.stock_quantity}"
-                )
+                raise ValueError(f"Estoque insuficiente para {variation.product.name}.")
 
             cart_item.quantity = new_quantity
             cart_item.unit_price = variation.product.effective_price
@@ -1033,9 +1031,7 @@ def add_item_to_cart(request, variation_id, quantity):
         new_quantity = current_quantity + quantity
 
         if new_quantity > variation.stock_quantity:
-            raise ValueError(
-                f"Estoque insuficiente para {variation.product.name}. Disponível: {variation.stock_quantity}"
-            )
+            raise ValueError(f"Estoque insuficiente para {variation.product.name}.")
 
         session_cart[var_id_str] = {
             "quantity": new_quantity,
@@ -1061,9 +1057,7 @@ def update_item_quantity(request, variation_id, quantity):
         )
 
     if quantity > variation.stock_quantity:
-        raise ValueError(
-            f"Estoque insuficiente para {variation.product.name}. Disponível: {variation.stock_quantity}"
-        )
+        raise ValueError(f"Estoque insuficiente para {variation.product.name}.")
 
     if request.user.is_authenticated:
         cart_item = get_object_or_404(CartItem, cart=cart, variation=variation)
