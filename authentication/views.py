@@ -37,10 +37,12 @@ from core.exports import export_data_response
 from notifications.email import mask_email, send_email
 from notifications.marketing import is_receiving, opt_in, opt_out
 from notifications.newsletter import (
+    NewsletterInProgress,
+    expire_stale_sends,
     get_newsletter_audience,
     render_newsletter_preview,
-    send_newsletter_campaign,
     send_newsletter_test,
+    start_newsletter_campaign,
 )
 from notifications.unsubscribe import read_unsubscribe_token
 from orders.models import CustomerOrder, OrderStatus, PaymentStatus
@@ -909,6 +911,7 @@ class NewsletterSummaryView(APIView):
 
     @extend_schema(tags=["Newsletter"], responses=dict)
     def get(self, request):
+        expire_stale_sends()
         audience = get_newsletter_audience()
         sends = NewsletterSend.objects.select_related("sent_by").all()
         history = NewsletterSendHistorySerializer(sends, many=True).data
@@ -963,7 +966,10 @@ class NewsletterTestView(APIView):
 
 
 class NewsletterSendView(APIView):
-    """Envio em massa da newsletter para todos os inscritos elegíveis."""
+    """Inicia o envio em massa da newsletter para todos os inscritos elegíveis.
+
+    Responde 202 com o registro do envio; os e-mails saem em segundo plano.
+    """
 
     permission_classes = [CanManageCustomers]
 
@@ -985,14 +991,18 @@ class NewsletterSendView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        record = send_newsletter_campaign(request.user, subject, message)
+        try:
+            record = start_newsletter_campaign(request.user, subject, message)
+        except NewsletterInProgress:
+            return Response(
+                {"error": "Já existe um envio de newsletter em andamento."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        # Com o envio em segundo plano o registro volta como "enviando";
+        # o histórico do resumo mostra o avanço.
+        record.refresh_from_db()
         return Response(
-            {
-                "id": str(record.id),
-                "subject": record.subject,
-                "sent_count": record.sent_count,
-                "failed_count": record.failed_count,
-                "sent_at": record.sent_at,
-            },
-            status=status.HTTP_201_CREATED,
+            NewsletterSendHistorySerializer(record).data,
+            status=status.HTTP_202_ACCEPTED,
         )

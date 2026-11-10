@@ -435,6 +435,9 @@ class NewsletterSendHistorySerializer(serializers.ModelSerializer):
             "sent_by_name",
             "sent_count",
             "failed_count",
+            "total_count",
+            "status",
+            "finished_at",
         ]
 
     def get_sent_by_name(self, obj) -> str | None:

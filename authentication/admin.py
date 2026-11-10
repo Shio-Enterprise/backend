@@ -101,7 +101,15 @@ class NewsletterSubscriberAdmin(admin.ModelAdmin):
 
 @admin.register(NewsletterSend)
 class NewsletterSendAdmin(admin.ModelAdmin):
-    list_display = ["subject", "sent_by", "sent_at", "sent_count", "failed_count"]
+    list_display = [
+        "subject",
+        "status",
+        "sent_by",
+        "sent_at",
+        "sent_count",
+        "failed_count",
+    ]
+    list_filter = ["status"]
     readonly_fields = [
         "id",
         "subject",
@@ -110,6 +118,10 @@ class NewsletterSendAdmin(admin.ModelAdmin):
         "sent_at",
         "sent_count",
         "failed_count",
+        "total_count",
+        "status",
+        "updated_at",
+        "finished_at",
     ]
     search_fields = ["subject", "sent_by__email", "sent_by__name"]
     ordering = ["-sent_at"]

@@ -197,8 +197,19 @@ class NewsletterSubscriber(models.Model):
         return self.email
 
 
+class NewsletterSendStatus(models.TextChoices):
+    SENDING = "sending", "Enviando"
+    SENT = "sent", "Enviado"
+    INTERRUPTED = "interrupted", "Interrompido"
+
+
 class NewsletterSend(models.Model):
-    """Histórico de envios de newsletter para inscritos (um registro por campanha)."""
+    """Histórico de envios de newsletter para inscritos (um registro por campanha).
+
+    O registro nasce com status "enviando" antes do primeiro e-mail e os
+    contadores sobem a cada envio, então um envio interrompido continua no
+    histórico com o que já saiu.
+    """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     subject = models.CharField(max_length=255, verbose_name="Assunto")
@@ -214,11 +225,30 @@ class NewsletterSend(models.Model):
     sent_at = models.DateTimeField(auto_now_add=True, verbose_name="Enviado em")
     sent_count = models.PositiveIntegerField(default=0, verbose_name="Entregues")
     failed_count = models.PositiveIntegerField(default=0, verbose_name="Falhas")
+    total_count = models.PositiveIntegerField(default=0, verbose_name="Destinatários")
+    status = models.CharField(
+        max_length=20,
+        choices=NewsletterSendStatus.choices,
+        default=NewsletterSendStatus.SENDING,
+        verbose_name="Status",
+    )
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Atualizado em")
+    finished_at = models.DateTimeField(
+        null=True, blank=True, verbose_name="Concluído em"
+    )
 
     class Meta:
         ordering = ["-sent_at"]
         verbose_name = "Envio de Newsletter"
         verbose_name_plural = "Envios de Newsletter"
+        constraints = [
+            # No máximo um envio em andamento por vez (o banco garante o 409).
+            models.UniqueConstraint(
+                fields=["status"],
+                condition=models.Q(status="sending"),
+                name="newsletter_send_one_in_progress",
+            )
+        ]
 
     def __str__(self):
         return f"{self.subject} ({self.sent_at:%d/%m/%Y %H:%M})"

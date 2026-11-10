@@ -9,6 +9,7 @@ from rest_framework.test import APITestCase
 
 from authentication.models import (
     NewsletterSend,
+    NewsletterSendStatus,
     NewsletterSubscriber,
     UserProfile,
     UserRole,
@@ -114,7 +115,7 @@ class NewsletterApiTests(APITestCase):
         self.assertEqual(resp.data, {"sent": True})
         self.assertEqual(len(mail.outbox), 1)
         self.assertEqual(mail.outbox[0].to, ["admin@shio.com"])
-        self.assertEqual(mail.outbox[0].subject, "Teste Drop")
+        self.assertEqual(mail.outbox[0].subject, "[Teste] Teste Drop")
         self.assertEqual(NewsletterSend.objects.count(), 0)
 
     def test_teste_falha_retorna_502(self):
@@ -136,11 +137,15 @@ class NewsletterApiTests(APITestCase):
             {"subject": "Drop Exclusivo", "message": "Disponível a partir de hoje!"},
             format="json",
         )
-        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(resp.status_code, status.HTTP_202_ACCEPTED)
+        # Nos testes o envio roda inline, então já volta concluído.
+        self.assertEqual(resp.data["status"], NewsletterSendStatus.SENT)
         self.assertEqual(resp.data["sent_count"], 2)
         self.assertEqual(resp.data["failed_count"], 0)
+        self.assertEqual(resp.data["total_count"], 2)
         self.assertEqual(resp.data["subject"], "Drop Exclusivo")
         self.assertIn("sent_at", resp.data)
+        self.assertIn("id", resp.data)
 
         self.assertEqual(len(mail.outbox), 2)
         record = NewsletterSend.objects.get()
@@ -148,6 +153,41 @@ class NewsletterApiTests(APITestCase):
         self.assertEqual(record.sent_by, self.admin)
         self.assertEqual(record.sent_count, 2)
         self.assertEqual(record.failed_count, 0)
+
+    def test_envio_com_outro_em_andamento_retorna_409(self):
+        self.subscribe("ana@x.com")
+        NewsletterSend.objects.create(
+            subject="Em andamento",
+            message="x",
+            sent_by=self.admin,
+            status=NewsletterSendStatus.SENDING,
+        )
+        url = reverse("authentication:admin-newsletter-send")
+        resp = self.client.post(
+            url, {"subject": "Outro", "message": "Mensagem"}, format="json"
+        )
+        self.assertEqual(resp.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(
+            resp.data, {"error": "Já existe um envio de newsletter em andamento."}
+        )
+        self.assertEqual(len(mail.outbox), 0)
+        self.assertEqual(NewsletterSend.objects.count(), 1)
+
+    def test_resumo_mostra_status_do_envio(self):
+        NewsletterSend.objects.create(
+            subject="Em andamento",
+            message="x",
+            sent_by=self.admin,
+            status=NewsletterSendStatus.SENDING,
+            total_count=10,
+            sent_count=3,
+        )
+        resp = self.client.get(reverse("authentication:admin-newsletter-summary"))
+        item = resp.data["history"][0]
+        self.assertEqual(item["status"], NewsletterSendStatus.SENDING)
+        self.assertEqual(item["total_count"], 10)
+        self.assertEqual(item["sent_count"], 3)
+        self.assertIsNone(item["finished_at"])
 
     def test_envio_sem_publico_retorna_400(self):
         url = reverse("authentication:admin-newsletter-send")
