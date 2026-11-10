@@ -642,6 +642,8 @@ class SizeGuideAdminSerializer(serializers.ModelSerializer):
         many=True, queryset=Category.objects.all(), required=False
     )
     category_details = serializers.SerializerMethodField()
+    # Quantos produtos escolheram este guia como guia próprio.
+    product_count = serializers.SerializerMethodField()
 
     class Meta:
         model = SizeGuide
@@ -652,6 +654,7 @@ class SizeGuideAdminSerializer(serializers.ModelSerializer):
             "rows",
             "categories",
             "category_details",
+            "product_count",
             "created_at",
             "updated_at",
         ]
@@ -665,6 +668,12 @@ class SizeGuideAdminSerializer(serializers.ModelSerializer):
     @extend_schema_field(CategoryNestedSerializer(many=True))
     def get_category_details(self, obj):
         return CategoryNestedSerializer(obj.categories.order_by("name"), many=True).data
+
+    def get_product_count(self, obj) -> int:
+        # A listagem já manda a contagem anotada (uma consulta só); nas outras
+        # rotas, conta na hora.
+        annotated = getattr(obj, "product_count", None)
+        return annotated if annotated is not None else obj.products.count()
 
     def validate(self, attrs):
         columns = attrs.get("columns", getattr(self.instance, "columns", None))
@@ -707,8 +716,11 @@ class ProductDetailSerializer(ProductPricingSerializer):
     images = ProductImageSerializer(many=True, read_only=True)
     category = CategoryNestedSerializer(read_only=True)
     drop = DropNestedSerializer(read_only=True)
-    size_guide = SizeGuideSerializer(
-        source="category.size_guide", read_only=True, allow_null=True
+    # Guia mostrado na loja: o do produto ou, se não houver, o da categoria.
+    size_guide = serializers.SerializerMethodField()
+    # Só o guia escolhido no próprio produto (sem o fallback), para o formulário do admin.
+    own_size_guide = serializers.PrimaryKeyRelatedField(
+        source="size_guide", read_only=True
     )
     is_sellable = serializers.SerializerMethodField()
 
@@ -727,6 +739,7 @@ class ProductDetailSerializer(ProductPricingSerializer):
             "category",
             "drop",
             "size_guide",
+            "own_size_guide",
             "variations",
             "images",
             "created_at",
@@ -736,6 +749,19 @@ class ProductDetailSerializer(ProductPricingSerializer):
 
     def get_is_sellable(self, obj) -> bool:
         return is_product_sellable(obj)
+
+    @extend_schema_field(SizeGuideSerializer(allow_null=True))
+    def get_size_guide(self, obj):
+        if obj.size_guide is not None:
+            guide = obj.size_guide
+        elif obj.category is not None:
+            guide = obj.category.size_guide
+        else:
+            guide = None
+
+        if guide is None:
+            return None
+        return SizeGuideSerializer(guide).data
 
 
 class ProductWriteSerializer(StrictSerializer):
@@ -763,6 +789,7 @@ class ProductWriteSerializer(StrictSerializer):
             "variations",
             "created_at",
             "updated_at",
+            "size_guide",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
         extra_kwargs = {"description": {"allow_blank": True, "required": False}}

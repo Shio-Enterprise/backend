@@ -178,6 +178,13 @@ class DropCampaign(models.Model):
 
 class Product(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    size_guide = models.ForeignKey(
+        SizeGuide,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="products",
+    )
     drop = models.ForeignKey(
         DropCampaign,
         on_delete=models.SET_NULL,
