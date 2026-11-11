@@ -280,18 +280,18 @@ class MeViewTests(APITestCase):
             self.url,
             {
                 "phone_number": "61999999999",
-                "cpf": "12345678910",
+                "cpf": "52998224725",
             },
             format="json",
         )
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.json()["phone_number"], "61999999999")
-        self.assertEqual(response.json()["cpf"], "12345678910")
+        self.assertEqual(response.json()["cpf"], "529.982.247-25")
 
         self.user.refresh_from_db()
         self.assertEqual(self.user.profile.phone_number, "61999999999")
-        self.assertEqual(self.user.profile.cpf, "12345678910")
+        self.assertEqual(self.user.profile.cpf, "52998224725")
 
     def _other_user_with_cpf(self, cpf):
         other = User.objects.create_user(
@@ -301,11 +301,11 @@ class MeViewTests(APITestCase):
         return other
 
     def test_patch_cpf_de_outra_conta_retorna_400_sem_salvar_nada(self):
-        self._other_user_with_cpf("12345678910")
+        self._other_user_with_cpf("52998224725")
         self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.access_token}")
 
         response = self.client.patch(
-            self.url, {"name": "Nome Novo", "cpf": "12345678910"}, format="json"
+            self.url, {"name": "Nome Novo", "cpf": "52998224725"}, format="json"
         )
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
@@ -319,12 +319,12 @@ class MeViewTests(APITestCase):
 
     def test_patch_mantendo_o_proprio_cpf_funciona(self):
         UserProfile.objects.update_or_create(
-            user=self.user, defaults={"cpf": "12345678910"}
+            user=self.user, defaults={"cpf": "52998224725"}
         )
         self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.access_token}")
 
         response = self.client.patch(
-            self.url, {"name": "Nome Novo", "cpf": "12345678910"}, format="json"
+            self.url, {"name": "Nome Novo", "cpf": "52998224725"}, format="json"
         )
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
@@ -362,6 +362,76 @@ class MeViewTests(APITestCase):
         self.assertNotIn("duplicate", str(response.json()).lower())
         self.user.refresh_from_db()
         self.assertEqual(self.user.name, "Me User")
+
+    def test_patch_normalizes_valid_cpf_and_returns_formatted_value(self):
+        self.client.force_authenticate(self.user)
+        for value in ("09675623330", "096.756.233-30"):
+            with self.subTest(value=value):
+                response = self.client.patch(self.url, {"cpf": value}, format="json")
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                self.assertEqual(response.json()["cpf"], "096.756.233-30")
+                self.user.refresh_from_db()
+                self.assertEqual(self.user.profile.cpf, "09675623330")
+        self.assertEqual(self.client.get(self.url).json()["cpf"], "096.756.233-30")
+
+    def test_patch_invalid_cpf_does_not_save_any_field(self):
+        UserProfile.objects.create(user=self.user, cpf="52998224725")
+        self.client.force_authenticate(self.user)
+        for value in ("111.111.111-11", "123.456.789-00", "09675623331"):
+            with self.subTest(value=value):
+                response = self.client.patch(
+                    self.url, {"name": "Não salvar", "cpf": value}, format="json"
+                )
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assertEqual(response.json()["details"]["cpf"], ["CPF inválido."])
+                self.user.refresh_from_db()
+                self.assertEqual(self.user.name, "Me User")
+                self.assertEqual(self.user.profile.cpf, "52998224725")
+
+    def test_patch_duplicate_cpf_is_rejected_including_legacy_formats(self):
+        other = self._other_user_with_cpf("09675623330")
+        self.client.force_authenticate(self.user)
+        for stored in ("09675623330", "096.756.233-30", "096 756233-30"):
+            UserProfile.objects.filter(user=other).update(cpf=stored)
+            for submitted in ("09675623330", "096.756.233-30"):
+                with self.subTest(stored=stored, submitted=submitted):
+                    response = self.client.patch(
+                        self.url, {"cpf": submitted}, format="json"
+                    )
+                    self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                    self.assertEqual(
+                        response.json()["details"]["cpf"],
+                        ["Este CPF já está cadastrado em outra conta."],
+                    )
+
+    def test_patch_can_normalize_own_legacy_cpf(self):
+        UserProfile.objects.create(user=self.user, cpf="096.756.233-30")
+        self.client.force_authenticate(self.user)
+        response = self.client.patch(self.url, {"cpf": "09675623330"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.profile.cpf, "09675623330")
+
+    def test_patch_can_clear_cpf(self):
+        self.client.force_authenticate(self.user)
+        for value in ("", None, "   "):
+            UserProfile.objects.update_or_create(
+                user=self.user, defaults={"cpf": "09675623330"}
+            )
+            with self.subTest(value=value):
+                response = self.client.patch(self.url, {"cpf": value}, format="json")
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                self.assertIsNone(response.json()["cpf"])
+                self.user.refresh_from_db()
+                self.assertIsNone(self.user.profile.cpf)
+
+    def test_patch_without_cpf_keeps_legacy_value(self):
+        UserProfile.objects.create(user=self.user, cpf="123.456.789-00")
+        self.client.force_authenticate(self.user)
+        response = self.client.patch(self.url, {"name": "Novo nome"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.profile.cpf, "123.456.789-00")
 
 
 class TokenRefreshViewTests(APITestCase):

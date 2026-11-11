@@ -635,7 +635,7 @@ def test_checkout_and_payment_redirect(driver, base_url, test_token):
             driver, "//input[@name='cpf' or @placeholder='000.000.000-00']"
         )
         if not cpf_input.get_attribute("value"):
-            type_text_slowly(driver, cpf_input, "00000000000", delay=0.01)
+            type_text_slowly(driver, cpf_input, "52998224725", delay=0.01)
 
         click_visible_element(
             driver, "//button[contains(., 'Salvar Alterações') or @type='submit']"

@@ -1,3 +1,5 @@
+import re
+
 from django.contrib.auth import authenticate
 from django.contrib.auth.password_validation import validate_password
 from django.db import transaction
@@ -8,6 +10,7 @@ from orders.models import CustomerOrder
 
 from .admin_accounts import find_user_by_email, normalize_email, set_admin_permissions
 from .admin_permissions import ADMIN_PERMISSION_CODES, ADMIN_PERMISSION_SET
+from .cpf import normalize_cpf
 from .models import Address, NewsletterSend, User, UserProfile
 
 CPF_IN_USE_MESSAGE = "Este CPF já está cadastrado em outra conta."
@@ -71,17 +74,24 @@ class UserSerializer(serializers.ModelSerializer):
         )
 
     def validate_cpf(self, value):
-        # A coluna é única: CPF vazio vira NULL, senão a segunda conta sem CPF
-        # colide com a primeira no "".
-        value = (value or "").strip() or None
+        value = normalize_cpf(value)
         if value is None:
             return None
-        in_use = UserProfile.objects.filter(cpf=value)
+        # Duplicados legados mantêm a pontuação até a equipe resolver o conflito.
+        pattern = r"^[^0-9]*" + r"[^0-9]*".join(value) + r"[^0-9]*$"
+        in_use = UserProfile.objects.filter(cpf__regex=pattern)
         if self.instance is not None:
             in_use = in_use.exclude(user=self.instance)
         if in_use.exists():
             raise serializers.ValidationError(CPF_IN_USE_MESSAGE)
         return value
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        cpf = data.get("cpf")
+        if cpf and re.fullmatch(r"[0-9]{11}", cpf):
+            data["cpf"] = f"{cpf[:3]}.{cpf[3:6]}.{cpf[6:9]}-{cpf[9:]}"
+        return data
 
     def update(self, instance, validated_data):
         profile_data = validated_data.pop("profile", {})
@@ -96,6 +106,7 @@ class UserSerializer(serializers.ModelSerializer):
                 if "cpf" in profile_data:
                     profile.cpf = profile_data.get("cpf")
                 profile.save()
+                instance.profile = profile
 
         return instance
 
