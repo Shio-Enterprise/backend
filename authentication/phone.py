@@ -49,8 +49,9 @@ def _invalid_message(value: str) -> str:
 
 
 def format_phone(value: str | None) -> str | None:
-    """(61) 99999-9999 ou (61) 3333-4444. Valor fora do padrão volta como está."""
-    if value and re.fullmatch(r"[0-9]{10,11}", value):
+    """(61) 99999-9999 ou (61) 3333-4444. Valor fora do padrão volta como está,
+    para não parecer um número válido."""
+    if value and phone_digits(value) == value:
         return f"({value[:2]}) {value[2:-4]}-{value[-4:]}"
     return value
 

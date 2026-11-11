@@ -65,6 +65,9 @@ class NormalizePhoneTests(SimpleTestCase):
         self.assertEqual(format_phone("61999999999"), "(61) 99999-9999")
         self.assertEqual(format_phone("1133334444"), "(11) 3333-4444")
         self.assertEqual(format_phone("telefone antigo"), "telefone antigo")
+        # Antigo com 10 ou 11 dígitos mas inválido não ganha máscara.
+        self.assertEqual(format_phone("6199999999"), "6199999999")
+        self.assertEqual(format_phone("01999999999"), "01999999999")
         self.assertIsNone(format_phone(None))
 
     def test_formato_internacional_para_o_gateway(self):
