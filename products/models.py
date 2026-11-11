@@ -122,6 +122,29 @@ class Category(models.Model):
         return self.name
 
 
+DEFAULT_HOMEPAGE_TAGLINE = "Deus primeiro. Negócios depois."
+
+
+class HomepageSettings(models.Model):
+    id = models.PositiveSmallIntegerField(primary_key=True, default=1, editable=False)
+    tagline = models.CharField(max_length=255, default=DEFAULT_HOMEPAGE_TAGLINE)
+
+
+class HomepageBanner(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    image_desktop = models.ImageField(upload_to="homepage/banners/")
+    image_mobile = models.ImageField(
+        upload_to="homepage/banners/", blank=True, null=True
+    )
+    alt_text = models.CharField(max_length=255)
+    link = models.CharField(max_length=500, blank=True)
+    display_order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["display_order", "created_at", "id"]
+
+
 class DropCampaign(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255)
@@ -155,6 +178,13 @@ class DropCampaign(models.Model):
 
 class Product(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    size_guide = models.ForeignKey(
+        SizeGuide,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="products",
+    )
     drop = models.ForeignKey(
         DropCampaign,
         on_delete=models.SET_NULL,

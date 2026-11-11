@@ -36,6 +36,14 @@ from authentication.signals import login_completed
 from core.exports import export_data_response
 from notifications.email import mask_email, send_email
 from notifications.marketing import is_receiving, opt_in, opt_out
+from notifications.newsletter import (
+    NewsletterInProgress,
+    expire_stale_sends,
+    get_newsletter_audience,
+    render_newsletter_preview,
+    send_newsletter_test,
+    start_newsletter_campaign,
+)
 from notifications.unsubscribe import read_unsubscribe_token
 from orders.models import CustomerOrder, OrderStatus, PaymentStatus
 
@@ -48,7 +56,7 @@ from .admin_accounts import (
     send_admin_invite,
 )
 from .admin_permissions import serialized_permission_definitions
-from .models import NewsletterSubscriber, UserRole
+from .models import NewsletterSend, NewsletterSubscriber, UserRole
 from .permissions import CanManageAdminPermissions, CanManageCustomers
 from .serializers import (
     ALREADY_ADMIN_MESSAGE,
@@ -61,6 +69,9 @@ from .serializers import (
     CustomerCRMSerializer,
     GoogleAuthSerializer,
     LogoutInputSerializer,
+    NewsletterEmailMessageSerializer,
+    NewsletterEmailPreviewSerializer,
+    NewsletterSendHistorySerializer,
     NewsletterSubscribeSerializer,
     PasswordLoginSerializer,
     PasswordResetConfirmSerializer,
@@ -986,3 +997,107 @@ class PasswordResetConfirmView(APIView):
                 {"error": "O link de redefinição é inválido ou expirou."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+
+class NewsletterSummaryView(APIView):
+    """Resumo de público elegível e histórico de envios da newsletter."""
+
+    permission_classes = [CanManageCustomers]
+
+    @extend_schema(tags=["Newsletter"], responses=dict)
+    def get(self, request):
+        expire_stale_sends()
+        audience = get_newsletter_audience()
+        sends = NewsletterSend.objects.select_related("sent_by").all()
+        history = NewsletterSendHistorySerializer(sends, many=True).data
+        return Response(
+            {
+                "total_subscribers": len(audience),
+                "history": history,
+            }
+        )
+
+
+class NewsletterPreviewView(APIView):
+    """Pré-visualização do e-mail da newsletter em HTML."""
+
+    permission_classes = [CanManageCustomers]
+
+    @extend_schema(
+        tags=["Newsletter"],
+        request=NewsletterEmailPreviewSerializer,
+        responses=dict,
+    )
+    def post(self, request):
+        serializer = NewsletterEmailPreviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        subject = serializer.validated_data.get("subject", "")
+        message = serializer.validated_data.get("message", "")
+        html = render_newsletter_preview(subject=subject, message=message)
+        return Response({"html": html})
+
+
+class NewsletterTestView(APIView):
+    """Envia um e-mail de teste da newsletter para a conta do admin."""
+
+    permission_classes = [CanManageCustomers]
+
+    @extend_schema(
+        tags=["Newsletter"],
+        request=NewsletterEmailMessageSerializer,
+        responses=dict,
+    )
+    def post(self, request):
+        serializer = NewsletterEmailMessageSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        subject = serializer.validated_data["subject"]
+        message = serializer.validated_data["message"]
+        if send_newsletter_test(request.user, subject, message):
+            return Response({"sent": True})
+        return Response(
+            {"error": "Não foi possível enviar o teste."},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
+class NewsletterSendView(APIView):
+    """Inicia o envio em massa da newsletter para todos os inscritos elegíveis.
+
+    Responde 202 com o registro do envio; os e-mails saem em segundo plano.
+    """
+
+    permission_classes = [CanManageCustomers]
+
+    @extend_schema(
+        tags=["Newsletter"],
+        request=NewsletterEmailMessageSerializer,
+        responses=dict,
+    )
+    def post(self, request):
+        serializer = NewsletterEmailMessageSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        subject = serializer.validated_data["subject"]
+        message = serializer.validated_data["message"]
+
+        audience = get_newsletter_audience()
+        if len(audience) == 0:
+            return Response(
+                {"error": "Nenhum inscrito elegível para receber."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            record = start_newsletter_campaign(request.user, subject, message)
+        except NewsletterInProgress:
+            return Response(
+                {"error": "Já existe um envio de newsletter em andamento."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        # Com o envio em segundo plano o registro volta como "enviando";
+        # o histórico do resumo mostra o avanço.
+        record.refresh_from_db()
+        return Response(
+            NewsletterSendHistorySerializer(record).data,
+            status=status.HTTP_202_ACCEPTED,
+        )
