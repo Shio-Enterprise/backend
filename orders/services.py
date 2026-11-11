@@ -13,6 +13,7 @@ from django.urls import reverse
 from django.utils import timezone
 from rest_framework.exceptions import APIException, ValidationError
 
+from authentication.phone import international_phone
 from orders.correios import (
     fetch_shipping_deadline_by_service_and_ceps,
     fetch_shipping_price_by_service_and_ceps,
@@ -136,7 +137,7 @@ def _get_checkout_contents(
             if lock
             else is_product_sellable(variation.product)
         )
-        if not product_available:
+        if not product_available or not variation.is_active:
             raise ValidationError({"message": "Produto indisponível."})
         try:
             unit_price = normalize_money(variation.product.price_at(priced_at))
@@ -154,7 +155,7 @@ def _get_checkout_contents(
                 "product_name": variation.product.name,
                 "size": variation.size,
                 "sku": variation.sku,
-                "stock_quantity": variation.stock_quantity,
+                "in_stock": variation.stock_quantity > 0,
                 "quantity": item.quantity,
                 "unit_price": unit_price,
                 "base_price": variation.product.base_price,
@@ -485,7 +486,7 @@ def create_infinitepay_checkout(order, request):
     phone_number = ""
     try:
         profile = order.user.profile
-        phone_number = profile.phone_number or ""
+        phone_number = international_phone(profile.phone_number)
     except ObjectDoesNotExist:
         phone_number = ""
 
@@ -910,7 +911,7 @@ def get_cart_data(request):
                         price_at
                     ),
                     "total_price": total_price,
-                    "stock_quantity": item.variation.stock_quantity,
+                    "in_stock": item.variation.stock_quantity > 0,
                     "is_sellable": is_product_sellable(item.variation.product),
                 }
             )
@@ -960,7 +961,7 @@ def get_cart_data(request):
                         price_at
                     ),
                     "total_price": total_price,
-                    "stock_quantity": variation.stock_quantity,
+                    "in_stock": variation.stock_quantity > 0,
                     "is_sellable": is_product_sellable(variation.product),
                 }
             )
@@ -991,7 +992,7 @@ def add_item_to_cart(request, variation_id, quantity):
                 id=variation_id,
             )
 
-            if not is_product_sellable(variation.product):
+            if not is_product_sellable(variation.product) or not variation.is_active:
                 raise ValueError(
                     f"{variation.product.name} não está disponível para compra no momento."
                 )
@@ -1007,9 +1008,7 @@ def add_item_to_cart(request, variation_id, quantity):
 
             new_quantity = cart_item.quantity + quantity
             if new_quantity > variation.stock_quantity:
-                raise ValueError(
-                    f"Estoque insuficiente para {variation.product.name}. Disponível: {variation.stock_quantity}"
-                )
+                raise ValueError(f"Estoque insuficiente para {variation.product.name}.")
 
             cart_item.quantity = new_quantity
             cart_item.unit_price = variation.product.effective_price
@@ -1020,7 +1019,7 @@ def add_item_to_cart(request, variation_id, quantity):
             id=variation_id,
         )
 
-        if not is_product_sellable(variation.product):
+        if not is_product_sellable(variation.product) or not variation.is_active:
             raise ValueError(
                 f"{variation.product.name} não está disponível para compra no momento."
             )
@@ -1033,9 +1032,7 @@ def add_item_to_cart(request, variation_id, quantity):
         new_quantity = current_quantity + quantity
 
         if new_quantity > variation.stock_quantity:
-            raise ValueError(
-                f"Estoque insuficiente para {variation.product.name}. Disponível: {variation.stock_quantity}"
-            )
+            raise ValueError(f"Estoque insuficiente para {variation.product.name}.")
 
         session_cart[var_id_str] = {
             "quantity": new_quantity,
@@ -1055,15 +1052,13 @@ def update_item_quantity(request, variation_id, quantity):
         id=variation_id,
     )
 
-    if not is_product_sellable(variation.product):
+    if not is_product_sellable(variation.product) or not variation.is_active:
         raise ValueError(
             f"{variation.product.name} não está disponível para compra no momento."
         )
 
     if quantity > variation.stock_quantity:
-        raise ValueError(
-            f"Estoque insuficiente para {variation.product.name}. Disponível: {variation.stock_quantity}"
-        )
+        raise ValueError(f"Estoque insuficiente para {variation.product.name}.")
 
     if request.user.is_authenticated:
         cart_item = get_object_or_404(CartItem, cart=cart, variation=variation)

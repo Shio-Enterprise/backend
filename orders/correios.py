@@ -1,5 +1,6 @@
 import base64
 import logging
+import re
 from datetime import datetime
 
 import requests
@@ -212,7 +213,7 @@ def build_destinatario_data_from_order(order) -> dict:
     try:
         profile = user.profile
         if profile and profile.cpf:
-            cpf_cnpj = profile.cpf
+            cpf_cnpj = re.sub(r"[^0-9]", "", profile.cpf)
     except ObjectDoesNotExist:
         cpf_cnpj = ""
 

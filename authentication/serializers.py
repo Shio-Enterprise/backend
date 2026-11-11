@@ -1,13 +1,26 @@
+import re
+
 from django.contrib.auth import authenticate
-from django.contrib.auth.models import Permission
 from django.contrib.auth.password_validation import validate_password
+from django.db import transaction
 from rest_framework import serializers
 
 from notifications.marketing import opt_in
 from orders.models import CustomerOrder
 
+from .admin_accounts import find_user_by_email, normalize_email, set_admin_permissions
 from .admin_permissions import ADMIN_PERMISSION_CODES, ADMIN_PERMISSION_SET
-from .models import Address, User, UserProfile
+from .cpf import normalize_cpf
+from .models import Address, NewsletterSend, User, UserProfile
+from .phone import format_phone, normalize_phone
+
+CPF_IN_USE_MESSAGE = "Este CPF já está cadastrado em outra conta."
+EMPTY_ADMIN_PERMISSIONS_MESSAGE = (
+    "Selecione ao menos uma permissão para a conta administrativa."
+)
+ALREADY_ADMIN_MESSAGE = "Este e-mail já pertence a um administrador."
+SUPERUSER_LOCKED_MESSAGE = "Superusuários não podem ser alterados pelo painel."
+INACTIVE_ACCOUNT_MESSAGE = "Esta conta está desativada e não pode virar administradora."
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -61,17 +74,44 @@ class UserSerializer(serializers.ModelSerializer):
             ).values_list("codename", flat=True)
         )
 
+    def validate_phone_number(self, value):
+        return normalize_phone(value)
+
+    def validate_cpf(self, value):
+        value = normalize_cpf(value)
+        if value is None:
+            return None
+        # Duplicados legados mantêm a pontuação até a equipe resolver o conflito.
+        pattern = r"^[^0-9]*" + r"[^0-9]*".join(value) + r"[^0-9]*$"
+        in_use = UserProfile.objects.filter(cpf__regex=pattern)
+        if self.instance is not None:
+            in_use = in_use.exclude(user=self.instance)
+        if in_use.exists():
+            raise serializers.ValidationError(CPF_IN_USE_MESSAGE)
+        return value
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        cpf = data.get("cpf")
+        if cpf and re.fullmatch(r"[0-9]{11}", cpf):
+            data["cpf"] = f"{cpf[:3]}.{cpf[3:6]}.{cpf[6:9]}-{cpf[9:]}"
+        data["phone_number"] = format_phone(data.get("phone_number"))
+        return data
+
     def update(self, instance, validated_data):
         profile_data = validated_data.pop("profile", {})
-        instance = super().update(instance, validated_data)
+        # Usuário e perfil juntos: se o perfil falhar, o nome não fica salvo.
+        with transaction.atomic():
+            instance = super().update(instance, validated_data)
 
-        if profile_data:
-            profile, _ = UserProfile.objects.get_or_create(user=instance)
-            if "phone_number" in profile_data:
-                profile.phone_number = profile_data.get("phone_number")
-            if "cpf" in profile_data:
-                profile.cpf = profile_data.get("cpf")
-            profile.save()
+            if profile_data:
+                profile, _ = UserProfile.objects.get_or_create(user=instance)
+                if "phone_number" in profile_data:
+                    profile.phone_number = profile_data.get("phone_number")
+                if "cpf" in profile_data:
+                    profile.cpf = profile_data.get("cpf")
+                profile.save()
+                instance.profile = profile
 
         return instance
 
@@ -119,9 +159,7 @@ class AdminAccountSerializer(serializers.ModelSerializer):
 
     def validate_admin_permissions(self, value):
         if not value:
-            raise serializers.ValidationError(
-                "Selecione ao menos uma permissão para a conta administrativa."
-            )
+            raise serializers.ValidationError(EMPTY_ADMIN_PERMISSIONS_MESSAGE)
 
         unknown = set(value) - ADMIN_PERMISSION_SET
         if unknown:
@@ -150,14 +188,45 @@ class AdminAccountSerializer(serializers.ModelSerializer):
         if selected_codes is None:
             return instance
 
-        managed_permissions = Permission.objects.filter(
-            content_type__app_label="authentication",
-            codename__in=ADMIN_PERMISSION_CODES,
-        )
-        instance.user_permissions.remove(*managed_permissions)
-        selected_permissions = managed_permissions.filter(codename__in=selected_codes)
-        instance.user_permissions.add(*selected_permissions)
+        set_admin_permissions(instance, selected_codes)
         return instance
+
+
+class AdminAccountCreateSerializer(serializers.Serializer):
+    """Promove um cliente (e-mail já cadastrado) ou cadastra uma conta nova."""
+
+    email = serializers.EmailField()
+    name = serializers.CharField(
+        required=False, allow_blank=True, max_length=255, trim_whitespace=True
+    )
+    admin_permissions = serializers.ListField(
+        child=serializers.ChoiceField(choices=ADMIN_PERMISSION_CODES),
+        allow_empty=True,
+    )
+
+    def validate_email(self, value):
+        return normalize_email(value)
+
+    def validate_admin_permissions(self, value):
+        if not value:
+            raise serializers.ValidationError(EMPTY_ADMIN_PERMISSIONS_MESSAGE)
+        return sorted(set(value))
+
+    def validate(self, attrs):
+        user = find_user_by_email(attrs["email"])
+        if user is not None:
+            if user.is_superuser:
+                raise serializers.ValidationError({"email": SUPERUSER_LOCKED_MESSAGE})
+            if user.is_admin:
+                raise serializers.ValidationError({"email": ALREADY_ADMIN_MESSAGE})
+            if not user.is_active:
+                raise serializers.ValidationError({"email": INACTIVE_ACCOUNT_MESSAGE})
+        elif not attrs.get("name"):
+            raise serializers.ValidationError(
+                {"name": "Informe o nome para cadastrar uma conta nova."}
+            )
+        attrs["existing_user"] = user
+        return attrs
 
 
 class GoogleAuthSerializer(serializers.Serializer):
@@ -372,3 +441,57 @@ class PasswordResetConfirmSerializer(serializers.Serializer):
     new_password = serializers.CharField(
         required=True, write_only=True, validators=[validate_password]
     )
+
+
+class NewsletterEmailMessageSerializer(serializers.Serializer):
+    subject = serializers.CharField(
+        max_length=255,
+        required=True,
+        allow_blank=False,
+        error_messages={"blank": "O assunto não pode estar em branco."},
+    )
+    message = serializers.CharField(
+        required=True,
+        allow_blank=False,
+        max_length=10000,
+        error_messages={"blank": "A mensagem não pode estar em branco."},
+    )
+
+
+class NewsletterEmailPreviewSerializer(serializers.Serializer):
+    subject = serializers.CharField(
+        max_length=255,
+        required=False,
+        allow_blank=True,
+        default="Newsletter — Shio",
+    )
+    message = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+        max_length=10000,
+    )
+
+
+class NewsletterSendHistorySerializer(serializers.ModelSerializer):
+    sent_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = NewsletterSend
+        fields = [
+            "id",
+            "subject",
+            "message",
+            "sent_at",
+            "sent_by_name",
+            "sent_count",
+            "failed_count",
+            "total_count",
+            "status",
+            "finished_at",
+        ]
+
+    def get_sent_by_name(self, obj) -> str | None:
+        if not obj.sent_by:
+            return None
+        return obj.sent_by.name or obj.sent_by.email

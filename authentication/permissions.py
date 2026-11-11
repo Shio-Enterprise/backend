@@ -57,6 +57,10 @@ class CanManageDrops(AdminPermissionRequired):
     codename = "manage_drops"
 
 
+class CanManageHomepage(AdminPermissionRequired):
+    codename = "manage_homepage"
+
+
 class CanManageOrders(AdminPermissionRequired):
     codename = "manage_orders"
 

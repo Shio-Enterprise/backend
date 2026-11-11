@@ -1,5 +1,13 @@
 from django.urls import path
 
+from .homepage_views import (
+    AdminHomepageView,
+    HomepageBannerDetailView,
+    HomepageBannerListView,
+    HomepageBannerOrderView,
+    HomepageTaglineView,
+    PublicHomepageView,
+)
 from .views import (
     CatalogFilterOptionsView,
     CategoryDetailView,
@@ -7,11 +15,17 @@ from .views import (
     DropCampaignDetailView,
     DropCampaignListCreateView,
     DropProductManageView,
+    DropWaitlistJoinView,
+    DropWaitlistLeaveView,
+    DropWaitlistMarkSeenView,
+    DropWaitlistMyEntriesView,
+    DropWaitlistUnseenView,
     InventoryExportView,
     ProductDetailView,
     ProductDuplicateView,
     ProductImageCreateView,
     ProductImageDeleteView,
+    ProductImageOrderView,
     ProductImageUpdateView,
     ProductListCreateView,
     ProductRecommendationsView,
@@ -33,6 +47,24 @@ from .views import (
 app_name = "products"
 
 urlpatterns = [
+    path("homepage/", PublicHomepageView.as_view(), name="homepage-public"),
+    path("homepage/admin/", AdminHomepageView.as_view(), name="homepage-admin"),
+    path("homepage/tagline/", HomepageTaglineView.as_view(), name="homepage-tagline"),
+    path(
+        "homepage/banners/",
+        HomepageBannerListView.as_view(),
+        name="homepage-banner-list",
+    ),
+    path(
+        "homepage/banners/order/",
+        HomepageBannerOrderView.as_view(),
+        name="homepage-banner-order",
+    ),
+    path(
+        "homepage/banners/<uuid:pk>/",
+        HomepageBannerDetailView.as_view(),
+        name="homepage-banner-detail",
+    ),
     path(
         "stock-alerts/",
         StockAlertListCreateView.as_view(),
@@ -148,6 +180,12 @@ urlpatterns = [
         ProductImageCreateView.as_view(),
         name="product-image-create",
     ),
+    # PUT (admin) - Reordena as imagens (a primeira é a principal)
+    path(
+        "products/<uuid:product_id>/images/order/",
+        ProductImageOrderView.as_view(),
+        name="product-image-order",
+    ),
     # PUT (admin, multipart) - Substitui binário da imagem
     path(
         "products/<uuid:product_id>/images/<uuid:image_id>/",
@@ -170,4 +208,34 @@ urlpatterns = [
     path("inventory/export/", InventoryExportView.as_view(), name="inventory_export"),
     # GET (admin) - Resumo de stock (legado)
     path("inventory/", inventory_summary, name="inventory_summary"),
+    # GET (autenticado) - Lista entradas do usuário na lista de espera
+    path(
+        "drop-waitlist/",
+        DropWaitlistMyEntriesView.as_view(),
+        name="drop-waitlist-list",
+    ),
+    # GET (autenticado) - Drops abertos não vistos no modal
+    path(
+        "drop-waitlist/unseen/",
+        DropWaitlistUnseenView.as_view(),
+        name="drop-waitlist-unseen",
+    ),
+    # POST (autenticado) - Marcar aviso do drop como visto
+    path(
+        "drop-waitlist/<uuid:pk>/seen/",
+        DropWaitlistMarkSeenView.as_view(),
+        name="drop-waitlist-mark-seen",
+    ),
+    # POST (autenticado) - Entrar na lista de espera
+    path(
+        "drops/<uuid:pk>/waitlist/",
+        DropWaitlistJoinView.as_view(),
+        name="drop-waitlist-join",
+    ),
+    # DELETE (autenticado) - Sair da lista de espera
+    path(
+        "drops/<uuid:pk>/waitlist/delete/",
+        DropWaitlistLeaveView.as_view(),
+        name="drop-waitlist-leave",
+    ),
 ]

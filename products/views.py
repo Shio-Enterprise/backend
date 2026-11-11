@@ -5,6 +5,7 @@ from django.core.files.base import ContentFile
 from django.db import IntegrityError, transaction
 from django.db.models import (
     Case,
+    Count,
     Exists,
     IntegerField,
     Max,
@@ -57,6 +58,7 @@ from .drop_waitlist import sweep_drop_openings
 from .models import (
     Category,
     DropCampaign,
+    DropWaitlist,
     Product,
     ProductImage,
     ProductVariation,
@@ -70,8 +72,12 @@ from .serializers import (
     CategorySerializer,
     DropCampaignDetailSerializer,
     DropCampaignSerializer,
+    DropWaitlistListSerializer,
+    DropWaitlistSerializer,
+    DropWaitlistUnseenSerializer,
     ProductDetailSerializer,
     ProductDuplicateSerializer,
+    ProductImageOrderSerializer,
     ProductImageSerializer,
     ProductListQuerySerializer,
     ProductListSerializer,
@@ -90,7 +96,11 @@ from .serializers import (
     WishlistPageSerializer,
     WishlistSerializer,
 )
-from .services import get_inventory_summary
+from .services import (
+    ensure_can_deactivate,
+    get_inventory_summary,
+    variation_has_history,
+)
 from .stock_alerts import watch_sellable
 
 logger = logging.getLogger(__name__)
@@ -269,7 +279,7 @@ class StockAlertListCreateView(APIView):
         )
         if not is_product_visible(variation.product):
             raise Http404
-        if not is_product_sellable(variation.product):
+        if not is_product_sellable(variation.product) or not variation.is_active:
             raise ValidationError(
                 {"variation_id": ["Este produto não está à venda no momento."]}
             )
@@ -623,7 +633,11 @@ class SizeGuideListCreateView(APIView):
         responses={200: SizeGuideAdminSerializer(many=True)},
     )
     def get(self, request):
-        guides = SizeGuide.objects.prefetch_related("categories").order_by("name")
+        guides = (
+            SizeGuide.objects.prefetch_related("categories")
+            .annotate(product_count=Count("products"))
+            .order_by("name")
+        )
         return Response(SizeGuideAdminSerializer(guides, many=True).data)
 
     @extend_schema(
@@ -1116,7 +1130,7 @@ class ProductListCreateView(APIView):
                 qs = visible_products_queryset(qs)
         else:
             available = ProductVariation.objects.filter(
-                product_id=OuterRef("pk"), stock_quantity__gt=0
+                product_id=OuterRef("pk"), is_active=True, stock_quantity__gt=0
             )
             qs = visible_products_queryset(qs).filter(Exists(available))
 
@@ -1219,7 +1233,7 @@ class ProductDetailView(APIView):
     def _get_object(self, pk, request, allow_inactive_for_admin=True):
         product = get_object_or_404(
             Product.objects.select_related(
-                "category__size_guide", "drop"
+                "size_guide", "category__size_guide", "drop"
             ).prefetch_related("variations", "images"),
             pk=pk,
         )
@@ -1363,7 +1377,7 @@ class ProductVariationCreateView(APIView):
         variation = serializer.save(product=product)
         logger.info(f"Variação criada: {variation.sku} no produto {product.id}")
         return Response(
-            ProductVariationSerializer(variation).data,
+            ProductVariationSerializer(variation, context={"request": request}).data,
             status=status.HTTP_201_CREATED,
         )
 
@@ -1388,7 +1402,9 @@ class ProductVariationDetailView(APIView):
     )
     def put(self, request, pk):
         variation = get_object_or_404(ProductVariation, pk=pk)
-        serializer = ProductVariationSerializer(variation, data=request.data)
+        serializer = ProductVariationSerializer(
+            variation, data=request.data, context={"request": request}
+        )
         if not serializer.is_valid():
             return Response(
                 {"error": "Dados inválidos.", "details": serializer.errors},
@@ -1401,11 +1417,19 @@ class ProductVariationDetailView(APIView):
         tags=["Products"],
         summary="Remover variação",
         description=(
-            "Remove a variação. ⚠️ Itens em carrinhos ativos referenciando esta variação "
-            "serão removidos em CASCADE."
+            "Remove a variação. Se ela tem histórico (pedido, movimentação ou saldo "
+            "de abertura), não é apagada: é **desativada** (`is_active=false`) e a "
+            "resposta é 200 com a variação, para os pedidos antigos continuarem "
+            "mostrando o tamanho. Desativar exige estoque zerado.\n\n"
+            "⚠️ Itens em carrinhos ativos referenciando uma variação apagada "
+            "são removidos em CASCADE."
         ),
         responses={
+            200: ProductVariationSerializer,
             204: OpenApiResponse(description="Variação removida."),
+            400: OpenApiResponse(
+                description="Último tamanho ativo ou estoque não zerado."
+            ),
             401: OpenApiResponse(description="Não autenticado."),
             403: OpenApiResponse(description="Não autorizado — requer perfil ADMIN."),
             404: OpenApiResponse(description="Variação não encontrada."),
@@ -1413,21 +1437,33 @@ class ProductVariationDetailView(APIView):
     )
     def delete(self, request, pk):
         variation = get_object_or_404(ProductVariation, pk=pk)
-        logger.info(f"Variação removida: {variation.sku} ({variation.id})")
         with transaction.atomic():
             Product.objects.select_for_update().get(pk=variation.product_id)
+            variation = ProductVariation.objects.select_for_update().get(pk=pk)
+            if variation_has_history(variation):
+                if variation.is_active:
+                    ensure_can_deactivate(variation)
+                    variation.is_active = False
+                    variation.save(update_fields=["is_active", "updated_at"])
+                logger.info(f"Variação desativada: {variation.sku} ({variation.id})")
+                return Response(
+                    ProductVariationSerializer(
+                        variation, context={"request": request}
+                    ).data
+                )
             if (
-                variation.product.variations.count() <= 1
-                or variation.stock_movements.exists()
-                or variation.orderitem_set.exists()
+                not variation.product.variations.filter(is_active=True)
+                .exclude(pk=variation.pk)
+                .exists()
             ):
                 raise ValidationError(
-                    "Não é possível excluir a última variação ou uma variação com histórico."
+                    "O produto precisa de pelo menos um tamanho ativo."
                 )
             try:
                 variation.delete()
             except ProtectedError:
                 raise ValidationError("Variação possui histórico de estoque.") from None
+        logger.info(f"Variação removida: {variation.sku} ({variation.id})")
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -1519,6 +1555,67 @@ class ProductImageUpdateView(APIView):
         updated = serializer.save()
         return Response(
             ProductImageSerializer(updated, context={"request": request}).data
+        )
+
+
+class ProductImageOrderView(APIView):
+    """Define a ordem das imagens de um produto. A primeira é a principal."""
+
+    permission_classes = [CanManageCatalog]
+    serializer_class = ProductImageOrderSerializer
+
+    @extend_schema(
+        tags=["Products"],
+        summary="Reordenar imagens do produto",
+        description=(
+            "Recebe `image_ids` com **todos** os ids das imagens do produto, na "
+            "ordem desejada, e regrava `display_order` de 1 a N. A primeira é a "
+            "imagem principal (capa do card e do detalhe)."
+        ),
+        request=ProductImageOrderSerializer,
+        responses={
+            200: ProductImageSerializer(many=True),
+            400: OpenApiResponse(
+                description="Lista incompleta, repetida ou com imagem de outro produto."
+            ),
+            401: OpenApiResponse(description="Não autenticado."),
+            403: OpenApiResponse(description="Não autorizado — requer perfil ADMIN."),
+            404: OpenApiResponse(description="Produto não encontrado."),
+        },
+    )
+    def put(self, request, product_id):
+        serializer = ProductImageOrderSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                {"error": "Dados inválidos.", "details": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        image_ids = serializer.validated_data["image_ids"]
+        with transaction.atomic():
+            product = get_object_or_404(
+                Product.objects.select_for_update(), pk=product_id
+            )
+            images = {image.id: image for image in product.images.all()}
+            if set(image_ids) != set(images):
+                return Response(
+                    {
+                        "error": "Dados inválidos.",
+                        "details": {
+                            "image_ids": "Informe todas as imagens do produto."
+                        },
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            for order, image_id in enumerate(image_ids, start=1):
+                image = images[image_id]
+                if image.display_order != order:
+                    image.display_order = order
+                    image.save(update_fields=["display_order", "updated_at"])
+        ordered = [images[image_id] for image_id in image_ids]
+        return Response(
+            ProductImageSerializer(
+                ordered, many=True, context={"request": request}
+            ).data
         )
 
 
@@ -1717,3 +1814,160 @@ class ProductDuplicateView(APIView):
             ProductDetailSerializer(product, context={"request": request}).data,
             status=201,
         )
+
+
+# ─── Drop Waitlist ────────────────────────────────────────────────────────────
+
+
+def _drop_waitlist_qs(user):
+    """Entradas da lista de espera do usuário com o drop relacionado."""
+    return DropWaitlist.objects.select_related("drop").filter(user=user)
+
+
+def _drop_accepts_waitlist(drop):
+    """Retorna True se o drop ainda não abriu e está visível."""
+    from django.utils import timezone
+
+    if not (drop.is_public and drop.is_active):
+        return False, "Este drop não está disponível para lista de espera."
+    now = timezone.now()
+    if drop.end_date and drop.end_date < now:
+        return False, "Este drop já foi encerrado."
+    if drop.launch_date and drop.launch_date <= now:
+        return False, "Este drop já abriu. Acesse a loja para comprar."
+    return True, None
+
+
+class DropWaitlistJoinView(APIView):
+    """POST /api/catalog/drops/<id>/waitlist/ — Entrar na lista de espera."""
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["Drop Waitlist"],
+        summary="Entrar na lista de espera de um drop",
+        responses={
+            201: DropWaitlistSerializer,
+            200: DropWaitlistSerializer,
+            400: OpenApiResponse(description="Drop não aceita lista de espera."),
+            404: OpenApiResponse(description="Drop não encontrado."),
+            401: OpenApiResponse(description="Não autenticado."),
+        },
+    )
+    def post(self, request, pk):
+        drop = get_object_or_404(DropCampaign, pk=pk)
+        ok, reason = _drop_accepts_waitlist(drop)
+        if not ok:
+            raise ValidationError({"detail": reason})
+
+        entry = DropWaitlist.objects.filter(user=request.user, drop=drop).first()
+        if entry is not None:
+            serializer = DropWaitlistSerializer(entry)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+
+        try:
+            with transaction.atomic():
+                entry = DropWaitlist.objects.create(user=request.user, drop=drop)
+        except IntegrityError:
+            entry = DropWaitlist.objects.get(user=request.user, drop=drop)
+            serializer = DropWaitlistSerializer(entry)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+
+        serializer = DropWaitlistSerializer(entry)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class DropWaitlistLeaveView(APIView):
+    """DELETE /api/catalog/drops/<id>/waitlist/ — Sair da lista de espera."""
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["Drop Waitlist"],
+        summary="Sair da lista de espera de um drop",
+        responses={
+            204: OpenApiResponse(description="Saiu da lista."),
+            404: OpenApiResponse(description="Entrada não encontrada."),
+            401: OpenApiResponse(description="Não autenticado."),
+        },
+    )
+    def delete(self, request, pk):
+        entry = get_object_or_404(DropWaitlist, user=request.user, drop_id=pk)
+        entry.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class DropWaitlistMyEntriesView(APIView):
+    """GET /api/catalog/drop-waitlist/ — Entradas do usuário logado."""
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["Drop Waitlist"],
+        summary="Listar entradas da lista de espera do usuário",
+        responses={
+            200: DropWaitlistListSerializer,
+            401: OpenApiResponse(description="Não autenticado."),
+        },
+    )
+    def get(self, request):
+        qs = _drop_waitlist_qs(request.user).order_by("-created_at")
+        serializer = DropWaitlistSerializer(qs, many=True)
+        return Response({"results": serializer.data})
+
+
+class DropWaitlistUnseenView(APIView):
+    """GET /api/catalog/drop-waitlist/unseen/ — Drops abertos não vistos no modal."""
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["Drop Waitlist"],
+        summary="Listar drops abertos não vistos no modal",
+        responses={
+            200: DropWaitlistUnseenSerializer,
+            401: OpenApiResponse(description="Não autenticado."),
+        },
+    )
+    def get(self, request):
+        from django.utils import timezone
+
+        now = timezone.now()
+        qs = (
+            _drop_waitlist_qs(request.user)
+            .filter(
+                seen_at__isnull=True,
+                drop__is_public=True,
+                drop__is_active=True,
+            )
+            .filter(Q(drop__launch_date__isnull=True) | Q(drop__launch_date__lte=now))
+            .filter(Q(drop__end_date__isnull=True) | Q(drop__end_date__gte=now))
+            .order_by("drop__launch_date")
+        )
+        serializer = DropWaitlistSerializer(qs, many=True)
+        return Response({"results": serializer.data})
+
+
+class DropWaitlistMarkSeenView(APIView):
+    """POST /api/catalog/drop-waitlist/<id>/seen/ — Marcar entrada como vista."""
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["Drop Waitlist"],
+        summary="Marcar aviso do drop como visto",
+        responses={
+            200: DropWaitlistSerializer,
+            404: OpenApiResponse(description="Entrada não encontrada."),
+            401: OpenApiResponse(description="Não autenticado."),
+        },
+    )
+    def post(self, request, pk):
+        from django.utils import timezone
+
+        entry = get_object_or_404(DropWaitlist, pk=pk, user=request.user)
+        if entry.seen_at is None:
+            entry.seen_at = timezone.now()
+            entry.save(update_fields=["seen_at"])
+        serializer = DropWaitlistSerializer(entry)
+        return Response(serializer.data, status=status.HTTP_200_OK)

@@ -122,6 +122,29 @@ class Category(models.Model):
         return self.name
 
 
+DEFAULT_HOMEPAGE_TAGLINE = "Deus primeiro. Negócios depois."
+
+
+class HomepageSettings(models.Model):
+    id = models.PositiveSmallIntegerField(primary_key=True, default=1, editable=False)
+    tagline = models.CharField(max_length=255, default=DEFAULT_HOMEPAGE_TAGLINE)
+
+
+class HomepageBanner(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    image_desktop = models.ImageField(upload_to="homepage/banners/")
+    image_mobile = models.ImageField(
+        upload_to="homepage/banners/", blank=True, null=True
+    )
+    alt_text = models.CharField(max_length=255)
+    link = models.CharField(max_length=500, blank=True)
+    display_order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["display_order", "created_at", "id"]
+
+
 class DropCampaign(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255)
@@ -155,6 +178,13 @@ class DropCampaign(models.Model):
 
 class Product(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    size_guide = models.ForeignKey(
+        SizeGuide,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="products",
+    )
     drop = models.ForeignKey(
         DropCampaign,
         on_delete=models.SET_NULL,
@@ -297,6 +327,7 @@ class DropWaitlist(models.Model):
 
     Só usuário logado entra na lista. `notified_at` é do e-mail de abertura
     (ver products.drop_waitlist); o aviso no site deve ter campo próprio.
+    `seen_at` marca quando o usuário fechou o modal de aviso — independente do e-mail.
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -312,6 +343,11 @@ class DropWaitlist(models.Model):
     )
     created_at = models.DateTimeField(auto_now_add=True)
     notified_at = models.DateTimeField(null=True, blank=True)
+    seen_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Quando o usuário fechou o modal de aviso de abertura do drop.",
+    )
 
     class Meta:
         constraints = [
@@ -334,6 +370,10 @@ class ProductVariation(models.Model):
     color = models.CharField(max_length=100, default="", blank=True)
     sku = models.CharField(max_length=100, unique=True)
     stock_quantity = models.PositiveIntegerField(default=0)
+    # Tamanho com histórico (pedido ou movimentação) não é apagado: é
+    # desativado. Inativo some da loja e não entra no carrinho nem no checkout,
+    # mas continua ligado aos pedidos antigos.
+    is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
