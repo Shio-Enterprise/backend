@@ -4260,6 +4260,23 @@ class CreateInfinitePayCheckoutPayloadTests(APITestCase):
             "http://testserver/api/orders/pagamento-sucesso/",
         )
 
+    def test_payload_envia_telefone_com_codigo_do_pais(self):
+        UserProfile.objects.update_or_create(
+            user=self.user, defaults={"phone_number": "61999999999"}
+        )
+        order = self.make_order(Decimal("0.00"))
+
+        payload = self.call_service(order)
+
+        self.assertEqual(payload["customer"]["phone_number"], "+5561999999999")
+
+    def test_payload_sem_telefone_manda_vazio(self):
+        order = self.make_order(Decimal("0.00"))
+
+        payload = self.call_service(order)
+
+        self.assertEqual(payload["customer"]["phone_number"], "")
+
 
 class GuestCartSurvivesLoginTests(APITestCase):
     """Carrinho do visitante (sessão) passa para a conta em qualquer forma de entrar."""

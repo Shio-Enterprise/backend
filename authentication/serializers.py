@@ -12,6 +12,7 @@ from .admin_accounts import find_user_by_email, normalize_email, set_admin_permi
 from .admin_permissions import ADMIN_PERMISSION_CODES, ADMIN_PERMISSION_SET
 from .cpf import normalize_cpf
 from .models import Address, NewsletterSend, User, UserProfile
+from .phone import format_phone, normalize_phone
 
 CPF_IN_USE_MESSAGE = "Este CPF já está cadastrado em outra conta."
 EMPTY_ADMIN_PERMISSIONS_MESSAGE = (
@@ -73,6 +74,9 @@ class UserSerializer(serializers.ModelSerializer):
             ).values_list("codename", flat=True)
         )
 
+    def validate_phone_number(self, value):
+        return normalize_phone(value)
+
     def validate_cpf(self, value):
         value = normalize_cpf(value)
         if value is None:
@@ -91,6 +95,7 @@ class UserSerializer(serializers.ModelSerializer):
         cpf = data.get("cpf")
         if cpf and re.fullmatch(r"[0-9]{11}", cpf):
             data["cpf"] = f"{cpf[:3]}.{cpf[3:6]}.{cpf[6:9]}-{cpf[9:]}"
+        data["phone_number"] = format_phone(data.get("phone_number"))
         return data
 
     def update(self, instance, validated_data):

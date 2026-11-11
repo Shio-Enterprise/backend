@@ -286,7 +286,7 @@ class MeViewTests(APITestCase):
         )
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.json()["phone_number"], "61999999999")
+        self.assertEqual(response.json()["phone_number"], "(61) 99999-9999")
         self.assertEqual(response.json()["cpf"], "529.982.247-25")
 
         self.user.refresh_from_db()
