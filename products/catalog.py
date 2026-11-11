@@ -23,7 +23,9 @@ from .models import Product, ProductVariation
 def catalog_filter_options():
     """Opções do catálogo completo, sem carregar produtos na interface."""
     products = Product.objects.filter(is_active=True)
-    variations = ProductVariation.objects.filter(product__is_active=True)
+    variations = ProductVariation.objects.filter(
+        product__is_active=True, is_active=True
+    )
     return {
         **products.aggregate(min_price=Min("base_price"), max_price=Max("base_price")),
         "sizes": list(
@@ -74,7 +76,7 @@ def with_sales_count(queryset):
 def recommend_products(product):
     """Prioriza contexto e vendas, completa a lista com o catálogo disponível."""
     available = ProductVariation.objects.filter(
-        product_id=OuterRef("pk"), stock_quantity__gt=0
+        product_id=OuterRef("pk"), is_active=True, stock_quantity__gt=0
     )
     queryset = (
         Product.objects.filter(is_active=True)
@@ -131,6 +133,7 @@ def filter_catalog(queryset, params, *, require_stock=False):
         variations["variations__color__in"] = params["color"]
     if variations:
         if require_stock:
+            variations["variations__is_active"] = True
             variations["variations__stock_quantity__gt"] = 0
         queryset = queryset.filter(**variations).distinct()
 

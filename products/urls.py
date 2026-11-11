@@ -25,6 +25,7 @@ from .views import (
     ProductDuplicateView,
     ProductImageCreateView,
     ProductImageDeleteView,
+    ProductImageOrderView,
     ProductImageUpdateView,
     ProductListCreateView,
     ProductRecommendationsView,
@@ -178,6 +179,12 @@ urlpatterns = [
         "products/<uuid:product_id>/images/",
         ProductImageCreateView.as_view(),
         name="product-image-create",
+    ),
+    # PUT (admin) - Reordena as imagens (a primeira é a principal)
+    path(
+        "products/<uuid:product_id>/images/order/",
+        ProductImageOrderView.as_view(),
+        name="product-image-order",
     ),
     # PUT (admin, multipart) - Substitui binário da imagem
     path(
