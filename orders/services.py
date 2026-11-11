@@ -13,6 +13,7 @@ from django.urls import reverse
 from django.utils import timezone
 from rest_framework.exceptions import APIException, ValidationError
 
+from authentication.phone import international_phone
 from orders.correios import (
     fetch_shipping_deadline_by_service_and_ceps,
     fetch_shipping_price_by_service_and_ceps,
@@ -485,7 +486,7 @@ def create_infinitepay_checkout(order, request):
     phone_number = ""
     try:
         profile = order.user.profile
-        phone_number = profile.phone_number or ""
+        phone_number = international_phone(profile.phone_number)
     except ObjectDoesNotExist:
         phone_number = ""
 
