@@ -6,6 +6,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from .models import User, UserProfile
 from .phone import (
+    MOBILE_NINE_DIGITS_MESSAGE,
     PHONE_INVALID_MESSAGE,
     format_phone,
     international_phone,
@@ -34,8 +35,8 @@ class NormalizePhoneTests(SimpleTestCase):
             "619999999999",  # dígito a mais
             "01999999999",  # DDD com zero
             "60999999999",  # DDD com zero
-            "61899999999",  # celular sem o 9
-            "6199999999",  # fixo começando com 9
+            "61899999999",  # 11 dígitos sem o 9
+            "6119999999",  # fixo começando com 1
             "11111111111",
             "abc",
             "()-",
@@ -44,6 +45,14 @@ class NormalizePhoneTests(SimpleTestCase):
             with (
                 self.subTest(value=value),
                 self.assertRaisesMessage(ValidationError, PHONE_INVALID_MESSAGE),
+            ):
+                normalize_phone(value)
+
+    def test_celular_antigo_de_8_digitos_pede_o_9(self):
+        for value in ("(61) 9999-9999", "6188887777", "+55 61 7777-6666"):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesMessage(ValidationError, MOBILE_NINE_DIGITS_MESSAGE),
             ):
                 normalize_phone(value)
 

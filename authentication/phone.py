@@ -3,6 +3,9 @@ import re
 from rest_framework.exceptions import ValidationError
 
 PHONE_INVALID_MESSAGE = "Telefone inválido. Informe DDD e número."
+MOBILE_NINE_DIGITS_MESSAGE = (
+    "Celular precisa ter 9 dígitos depois do DDD. Confira se falta o 9 no começo."
+)
 
 
 def phone_digits(value: str | None) -> str | None:
@@ -31,8 +34,18 @@ def normalize_phone(value: str | None) -> str | None:
         return None
     digits = phone_digits(value)
     if digits is None:
-        raise ValidationError(PHONE_INVALID_MESSAGE)
+        raise ValidationError(_invalid_message(value))
     return digits
+
+
+def _invalid_message(value: str) -> str:
+    # Celular antigo de 8 dígitos (antes do 9 extra): (61) 9999-9999.
+    digits = re.sub(r"[^0-9]", "", value)
+    if len(digits) == 12 and digits.startswith("55"):
+        digits = digits[2:]
+    if len(digits) == 10 and "0" not in digits[:2] and digits[2] in "6789":
+        return MOBILE_NINE_DIGITS_MESSAGE
+    return PHONE_INVALID_MESSAGE
 
 
 def format_phone(value: str | None) -> str | None:
