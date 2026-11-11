@@ -77,6 +77,7 @@ from .serializers import (
     DropWaitlistUnseenSerializer,
     ProductDetailSerializer,
     ProductDuplicateSerializer,
+    ProductImageOrderSerializer,
     ProductImageSerializer,
     ProductListQuerySerializer,
     ProductListSerializer,
@@ -95,7 +96,11 @@ from .serializers import (
     WishlistPageSerializer,
     WishlistSerializer,
 )
-from .services import get_inventory_summary
+from .services import (
+    ensure_can_deactivate,
+    get_inventory_summary,
+    variation_has_history,
+)
 from .stock_alerts import watch_sellable
 
 logger = logging.getLogger(__name__)
@@ -274,7 +279,7 @@ class StockAlertListCreateView(APIView):
         )
         if not is_product_visible(variation.product):
             raise Http404
-        if not is_product_sellable(variation.product):
+        if not is_product_sellable(variation.product) or not variation.is_active:
             raise ValidationError(
                 {"variation_id": ["Este produto não está à venda no momento."]}
             )
@@ -1125,7 +1130,7 @@ class ProductListCreateView(APIView):
                 qs = visible_products_queryset(qs)
         else:
             available = ProductVariation.objects.filter(
-                product_id=OuterRef("pk"), stock_quantity__gt=0
+                product_id=OuterRef("pk"), is_active=True, stock_quantity__gt=0
             )
             qs = visible_products_queryset(qs).filter(Exists(available))
 
@@ -1412,11 +1417,19 @@ class ProductVariationDetailView(APIView):
         tags=["Products"],
         summary="Remover variação",
         description=(
-            "Remove a variação. ⚠️ Itens em carrinhos ativos referenciando esta variação "
-            "serão removidos em CASCADE."
+            "Remove a variação. Se ela tem histórico (pedido, movimentação ou saldo "
+            "de abertura), não é apagada: é **desativada** (`is_active=false`) e a "
+            "resposta é 200 com a variação, para os pedidos antigos continuarem "
+            "mostrando o tamanho. Desativar exige estoque zerado.\n\n"
+            "⚠️ Itens em carrinhos ativos referenciando uma variação apagada "
+            "são removidos em CASCADE."
         ),
         responses={
+            200: ProductVariationSerializer,
             204: OpenApiResponse(description="Variação removida."),
+            400: OpenApiResponse(
+                description="Último tamanho ativo ou estoque não zerado."
+            ),
             401: OpenApiResponse(description="Não autenticado."),
             403: OpenApiResponse(description="Não autorizado — requer perfil ADMIN."),
             404: OpenApiResponse(description="Variação não encontrada."),
@@ -1424,21 +1437,33 @@ class ProductVariationDetailView(APIView):
     )
     def delete(self, request, pk):
         variation = get_object_or_404(ProductVariation, pk=pk)
-        logger.info(f"Variação removida: {variation.sku} ({variation.id})")
         with transaction.atomic():
             Product.objects.select_for_update().get(pk=variation.product_id)
+            variation = ProductVariation.objects.select_for_update().get(pk=pk)
+            if variation_has_history(variation):
+                if variation.is_active:
+                    ensure_can_deactivate(variation)
+                    variation.is_active = False
+                    variation.save(update_fields=["is_active", "updated_at"])
+                logger.info(f"Variação desativada: {variation.sku} ({variation.id})")
+                return Response(
+                    ProductVariationSerializer(
+                        variation, context={"request": request}
+                    ).data
+                )
             if (
-                variation.product.variations.count() <= 1
-                or variation.stock_movements.exists()
-                or variation.orderitem_set.exists()
+                not variation.product.variations.filter(is_active=True)
+                .exclude(pk=variation.pk)
+                .exists()
             ):
                 raise ValidationError(
-                    "Não é possível excluir a última variação ou uma variação com histórico."
+                    "O produto precisa de pelo menos um tamanho ativo."
                 )
             try:
                 variation.delete()
             except ProtectedError:
                 raise ValidationError("Variação possui histórico de estoque.") from None
+        logger.info(f"Variação removida: {variation.sku} ({variation.id})")
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -1530,6 +1555,67 @@ class ProductImageUpdateView(APIView):
         updated = serializer.save()
         return Response(
             ProductImageSerializer(updated, context={"request": request}).data
+        )
+
+
+class ProductImageOrderView(APIView):
+    """Define a ordem das imagens de um produto. A primeira é a principal."""
+
+    permission_classes = [CanManageCatalog]
+    serializer_class = ProductImageOrderSerializer
+
+    @extend_schema(
+        tags=["Products"],
+        summary="Reordenar imagens do produto",
+        description=(
+            "Recebe `image_ids` com **todos** os ids das imagens do produto, na "
+            "ordem desejada, e regrava `display_order` de 1 a N. A primeira é a "
+            "imagem principal (capa do card e do detalhe)."
+        ),
+        request=ProductImageOrderSerializer,
+        responses={
+            200: ProductImageSerializer(many=True),
+            400: OpenApiResponse(
+                description="Lista incompleta, repetida ou com imagem de outro produto."
+            ),
+            401: OpenApiResponse(description="Não autenticado."),
+            403: OpenApiResponse(description="Não autorizado — requer perfil ADMIN."),
+            404: OpenApiResponse(description="Produto não encontrado."),
+        },
+    )
+    def put(self, request, product_id):
+        serializer = ProductImageOrderSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                {"error": "Dados inválidos.", "details": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        image_ids = serializer.validated_data["image_ids"]
+        with transaction.atomic():
+            product = get_object_or_404(
+                Product.objects.select_for_update(), pk=product_id
+            )
+            images = {image.id: image for image in product.images.all()}
+            if set(image_ids) != set(images):
+                return Response(
+                    {
+                        "error": "Dados inválidos.",
+                        "details": {
+                            "image_ids": "Informe todas as imagens do produto."
+                        },
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            for order, image_id in enumerate(image_ids, start=1):
+                image = images[image_id]
+                if image.display_order != order:
+                    image.display_order = order
+                    image.save(update_fields=["display_order", "updated_at"])
+        ordered = [images[image_id] for image_id in image_ids]
+        return Response(
+            ProductImageSerializer(
+                ordered, many=True, context={"request": request}
+            ).data
         )
 
 

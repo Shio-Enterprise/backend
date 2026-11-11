@@ -156,6 +156,30 @@ def move_stock(
     return movement
 
 
+def ensure_can_deactivate(variation):
+    """Regras para desativar um tamanho. Chamar com o produto travado."""
+    if variation.stock_quantity > 0:
+        raise ValidationError(
+            {"is_active": "Zere o estoque deste tamanho antes de desativá-lo."}
+        )
+    if (
+        not variation.product.variations.filter(is_active=True)
+        .exclude(pk=variation.pk)
+        .exists()
+    ):
+        raise ValidationError(
+            {"is_active": "O produto precisa de pelo menos um tamanho ativo."}
+        )
+
+
+def variation_has_history(variation):
+    return (
+        variation.stock_movements.exists()
+        or variation.orderitem_set.exists()
+        or StockOpeningBalance.objects.filter(variation=variation).exists()
+    )
+
+
 @transaction.atomic
 def create_variation(product, data, actor=None):
     Product.objects.select_for_update().get(pk=product.pk)

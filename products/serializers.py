@@ -28,7 +28,13 @@ from .models import (
     Wishlist,
     validate_size_guide_content,
 )
-from .services import create_variation, move_stock, normalize_color, normalize_variation
+from .services import (
+    create_variation,
+    ensure_can_deactivate,
+    move_stock,
+    normalize_color,
+    normalize_variation,
+)
 
 
 class CatalogPageQuerySerializer(serializers.Serializer):
@@ -282,6 +288,7 @@ class ProductVariationSerializer(StrictSerializer):
             "color",
             "sku",
             "stock_quantity",
+            "is_active",
             "in_stock",
             "created_at",
             "updated_at",
@@ -343,6 +350,8 @@ class ProductVariationSerializer(StrictSerializer):
     def update(self, instance, validated_data):
         Product.objects.select_for_update().get(pk=instance.product_id)
         instance = ProductVariation.objects.select_for_update().get(pk=instance.pk)
+        if instance.is_active and validated_data.get("is_active") is False:
+            ensure_can_deactivate(instance)
         siblings = instance.product.variations.exclude(pk=instance.pk)
         size, color = validated_data["size"], validated_data["color"]
         if (
@@ -382,6 +391,17 @@ class ProductImageSerializer(serializers.ModelSerializer):
         max_mb = 5
         if value and value.size > max_mb * 1024 * 1024:
             raise serializers.ValidationError(f"Imagem não pode passar de {max_mb}MB.")
+        return value
+
+
+class ProductImageOrderSerializer(serializers.Serializer):
+    """Nova ordem das imagens: todos os ids do produto, a primeira é a principal."""
+
+    image_ids = serializers.ListField(child=serializers.UUIDField(), allow_empty=False)
+
+    def validate_image_ids(self, value):
+        if len(set(value)) != len(value):
+            raise serializers.ValidationError("Imagem repetida.")
         return value
 
 
@@ -437,6 +457,9 @@ class ProductPricingSerializer(serializers.ModelSerializer):
         if not request or not getattr(request.user, "is_admin", False):
             for key in ("cost_price", "margin_amount", "margin_percent"):
                 data.pop(key, None)
+            # Tamanho desativado só aparece para o admin.
+            if "variations" in data:
+                data["variations"] = [v for v in data["variations"] if v["is_active"]]
         else:
             margin = (
                 None if instance.cost_price is None else price - instance.cost_price
@@ -908,6 +931,11 @@ class StockMovementSerializer(StrictSerializer):
         if attrs.get("reason") in ("VENDA", "ESTOQUE_INICIAL", "TROCA"):
             raise serializers.ValidationError(
                 {"reason": "Motivo reservado para operações automáticas."}
+            )
+        variation = self.context.get("variation")
+        if variation and not variation.is_active and attrs.get("kind") == "ENTRADA":
+            raise serializers.ValidationError(
+                {"kind": "Reative o tamanho antes de dar entrada no estoque."}
             )
         return attrs
 
