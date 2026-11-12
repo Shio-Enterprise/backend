@@ -2,6 +2,7 @@ import re
 
 from django.contrib.auth import authenticate
 from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
 from rest_framework import serializers
 
@@ -22,6 +23,39 @@ EMPTY_ADMIN_PERMISSIONS_MESSAGE = (
 ALREADY_ADMIN_MESSAGE = "Este e-mail já pertence a um administrador."
 SUPERUSER_LOCKED_MESSAGE = "Superusuários não podem ser alterados pelo painel."
 INACTIVE_ACCOUNT_MESSAGE = "Esta conta está desativada e não pode virar administradora."
+
+EMAIL_ERROR_MESSAGES = {
+    "required": "Informe o e-mail.",
+    "blank": "Informe o e-mail.",
+    "invalid": "Informe um e-mail válido, como nome@exemplo.com.",
+    "max_length": "O e-mail pode ter no máximo {max_length} caracteres.",
+}
+PASSWORD_REQUIRED_MESSAGES = {
+    "required": "Informe a senha.",
+    "blank": "Informe a senha.",
+}
+# Mensagens dos validadores de senha do Django, pelo código do erro (#96).
+PASSWORD_VALIDATOR_MESSAGES = {
+    "password_too_short": "A senha precisa ter pelo menos {min_length} caracteres.",
+    "password_too_common": "Essa senha é muito comum.",
+    "password_entirely_numeric": "A senha não pode ter só números.",
+    "password_too_similar": "A senha está muito parecida com seus dados.",
+}
+
+
+def validate_password_pt(value):
+    """`validate_password` com as mensagens em português, uma por motivo."""
+    try:
+        validate_password(value)
+    except DjangoValidationError as exc:
+        messages = []
+        for error in exc.error_list:
+            template = PASSWORD_VALIDATOR_MESSAGES.get(error.code)
+            if template is None:
+                messages.extend(error.messages)
+            else:
+                messages.append(template.format(**(error.params or {})))
+        raise serializers.ValidationError(messages) from None
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -276,11 +310,22 @@ class PasswordLoginSerializer(serializers.Serializer):
 class RegisterSerializer(serializers.ModelSerializer):
     # Declarado à mão para trocar o UniqueValidator do modelo, que compara o
     # e-mail exatamente igual, por uma busca que ignora maiúsculas (#97).
-    email = serializers.EmailField(max_length=254)
+    email = serializers.EmailField(max_length=254, error_messages=EMAIL_ERROR_MESSAGES)
     password = serializers.CharField(
-        write_only=True, required=True, validators=[validate_password]
+        write_only=True,
+        required=True,
+        validators=[validate_password_pt],
+        error_messages=PASSWORD_REQUIRED_MESSAGES,
     )
-    name = serializers.CharField(required=True)
+    name = serializers.CharField(
+        required=True,
+        max_length=255,
+        error_messages={
+            "required": "Informe o nome.",
+            "blank": "Informe o nome.",
+            "max_length": "O nome pode ter no máximo {max_length} caracteres.",
+        },
+    )
     marketing_opt_in = serializers.BooleanField(
         required=False, default=False, write_only=True
     )
@@ -459,7 +504,10 @@ class PasswordResetConfirmSerializer(serializers.Serializer):
     uidb64 = serializers.CharField(required=True)
     token = serializers.CharField(required=True)
     new_password = serializers.CharField(
-        required=True, write_only=True, validators=[validate_password]
+        required=True,
+        write_only=True,
+        validators=[validate_password_pt],
+        error_messages=PASSWORD_REQUIRED_MESSAGES,
     )
 
 
