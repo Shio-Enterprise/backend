@@ -4,6 +4,7 @@ from django.conf import settings
 from django.contrib.auth.base_user import BaseUserManager
 from django.contrib.auth.models import AbstractUser
 from django.db import models
+from django.db.models.functions import Lower
 from django.utils.translation import gettext_lazy as _
 
 from .admin_permissions import (
@@ -14,6 +15,15 @@ from .admin_permissions import (
 
 class UserManager(BaseUserManager):
     use_in_migrations = True
+
+    @classmethod
+    def normalize_email(cls, email):
+        # O Django só põe o domínio em minúsculas; aqui vale o e-mail todo (#97).
+        return (email or "").strip().lower()
+
+    def get_by_natural_key(self, username):
+        # Usado pelo login: `Maria@gmail.com` encontra a conta `maria@gmail.com`.
+        return self.get(**{self.model.USERNAME_FIELD: self.normalize_email(username)})
 
     def create_user(self, email, password=None, **extra_fields):
         if not email:
@@ -100,8 +110,16 @@ class User(AbstractUser):
             (codename, name)
             for codename, name, _label, _description in ADMIN_PERMISSION_DEFINITIONS
         ]
+        constraints = [
+            models.UniqueConstraint(
+                Lower("email"),
+                name="unique_user_email_ci",
+                violation_error_message="Este e-mail já está em uso.",
+            ),
+        ]
 
     def save(self, *args, **kwargs):
+        self.email = type(self).objects.normalize_email(self.email)
         was_staff = False
         if self.pk:
             was_staff = (
