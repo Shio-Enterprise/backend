@@ -759,7 +759,8 @@ class DropCampaignListCreateView(APIView):
             "(`max_quantity` atingido) continua aparecendo aqui — esses estados "
             "só afetam `is_sellable` (se dá para comprar), não a visibilidade. "
             "Só `is_public=False` (Privado) é ocultado.\n\n"
-            "**Admin**: por padrão vê todos os drops (incluindo privados). Use "
+            "**Admin** (Drops, Catálogo ou Pedidos): por padrão vê todos os "
+            "drops (incluindo privados). Use "
             "`?visible=true` para pré-visualizar exatamente o que o público vê."
         ),
         parameters=[
@@ -776,9 +777,11 @@ class DropCampaignListCreateView(APIView):
         responses={200: DropCampaignSerializer(many=True)},
     )
     def get(self, request):
-        is_admin = user_has_admin_permission(
-            request.user, "manage_drops"
-        ) or user_has_admin_permission(request.user, "manage_catalog")
+        # manage_orders: o formulário de cupom precisa dos drops privados (#105).
+        is_admin = any(
+            user_has_admin_permission(request.user, codename)
+            for codename in ("manage_drops", "manage_catalog", "manage_orders")
+        )
         queryset = DropCampaign.objects.all().order_by("-created_at")
 
         if is_admin:
