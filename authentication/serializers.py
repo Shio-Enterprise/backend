@@ -2,7 +2,7 @@ import re
 
 from django.contrib.auth import authenticate
 from django.contrib.auth.password_validation import validate_password
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from rest_framework import serializers
 
 from notifications.marketing import opt_in
@@ -15,6 +15,7 @@ from .models import Address, NewsletterSend, User, UserProfile
 from .phone import format_phone, normalize_phone
 
 CPF_IN_USE_MESSAGE = "Este CPF já está cadastrado em outra conta."
+EMAIL_IN_USE_MESSAGE = "Este e-mail já está em uso."
 EMPTY_ADMIN_PERMISSIONS_MESSAGE = (
     "Selecione ao menos uma permissão para a conta administrativa."
 )
@@ -273,6 +274,9 @@ class PasswordLoginSerializer(serializers.Serializer):
 
 
 class RegisterSerializer(serializers.ModelSerializer):
+    # Declarado à mão para trocar o UniqueValidator do modelo, que compara o
+    # e-mail exatamente igual, por uma busca que ignora maiúsculas (#97).
+    email = serializers.EmailField(max_length=254)
     password = serializers.CharField(
         write_only=True, required=True, validators=[validate_password]
     )
@@ -285,14 +289,27 @@ class RegisterSerializer(serializers.ModelSerializer):
         model = User
         fields = ["email", "name", "password", "marketing_opt_in"]
 
+    def validate_email(self, value):
+        email = normalize_email(value)
+        if User.objects.filter(email__iexact=email).exists():
+            raise serializers.ValidationError(EMAIL_IN_USE_MESSAGE, code="unique")
+        return email
+
     def create(self, validated_data):
         marketing_opt_in = validated_data.pop("marketing_opt_in", False)
-        user = User.objects.create_user(
-            email=validated_data["email"],
-            name=validated_data["name"],
-            password=validated_data["password"],
-            is_new_user=True,
-        )
+        try:
+            with transaction.atomic():
+                user = User.objects.create_user(
+                    email=validated_data["email"],
+                    name=validated_data["name"],
+                    password=validated_data["password"],
+                    is_new_user=True,
+                )
+        except IntegrityError:
+            # Outra requisição criou a mesma conta depois da validação.
+            raise serializers.ValidationError(
+                {"email": [EMAIL_IN_USE_MESSAGE]}, code="unique"
+            ) from None
         if marketing_opt_in:
             opt_in(user.email)
         return user
@@ -433,6 +450,9 @@ class NewsletterSubscribeSerializer(serializers.Serializer):
 
 class PasswordResetRequestSerializer(serializers.Serializer):
     email = serializers.EmailField(required=True)
+
+    def validate_email(self, value):
+        return normalize_email(value)
 
 
 class PasswordResetConfirmSerializer(serializers.Serializer):
