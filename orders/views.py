@@ -27,7 +27,6 @@ from rest_framework.views import APIView
 from authentication.permissions import (
     CanAccessAdminDashboard,
     CanManageOrders,
-    IsStaffOrSuperUser,
     user_has_admin_permission,
 )
 from core.exports import export_data_response
@@ -1768,7 +1767,7 @@ class CartItemDetailAPIView(APIView):
 
 
 class CouponListCreateView(APIView):
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageOrders]
 
     @extend_schema(responses=CouponAdminSerializer(many=True))
     def get(self, request):
@@ -1820,7 +1819,7 @@ class CouponListCreateView(APIView):
 
 
 class CouponDetailView(APIView):
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageOrders]
 
     def get_object(self, pk):
         valid_orders = valid_order_q("orders__")
@@ -1878,7 +1877,7 @@ class CouponDetailView(APIView):
 
 
 class _CouponEmailBaseView(APIView):
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageOrders]
 
     def get_coupon(self, uuid):
         from django.shortcuts import get_object_or_404

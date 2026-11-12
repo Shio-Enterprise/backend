@@ -65,6 +65,7 @@ from .serializers import (
     AddressSerializer,
     AdminAccountCreateSerializer,
     AdminAccountSerializer,
+    CustomerAdminUpdateSerializer,
     CustomerCRMDetailSerializer,
     CustomerCRMSerializer,
     GoogleAuthSerializer,
@@ -625,10 +626,14 @@ class AddressDetailView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
-class CustomerCRMViewSet(viewsets.ReadOnlyModelViewSet):
-    """UC07 – Gerenciar Clientes (CRM)"""
+class CustomerCRMViewSet(mixins.UpdateModelMixin, viewsets.ReadOnlyModelViewSet):
+    """UC07 – Gerenciar Clientes (CRM)
+
+    PATCH edita nome, telefone e CPF do cliente (#100); e-mail e senha não.
+    """
 
     permission_classes = [CanManageCustomers]
+    http_method_names = ["get", "patch", "head", "options"]
     filter_backends = [
         filters.OrderingFilter,
         filters.SearchFilter,
@@ -679,7 +684,33 @@ class CustomerCRMViewSet(viewsets.ReadOnlyModelViewSet):
     def get_serializer_class(self):
         if self.action == "retrieve":
             return CustomerCRMDetailSerializer
+        if self.action == "partial_update":
+            return CustomerAdminUpdateSerializer
         return CustomerCRMSerializer
+
+    @extend_schema(
+        tags=["CRM Clientes"],
+        summary="Editar cliente",
+        description=(
+            "Altera nome, telefone e CPF do cliente, com as validações do "
+            "cadastro. E-mail e senha não são alterados por aqui."
+        ),
+        request=CustomerAdminUpdateSerializer,
+        responses={
+            200: CustomerAdminUpdateSerializer,
+            400: OpenApiResponse(description="Dados inválidos"),
+            403: OpenApiResponse(description="Sem permissão de clientes"),
+            404: OpenApiResponse(description="Cliente não encontrado"),
+        },
+    )
+    def partial_update(self, request, *args, **kwargs):
+        try:
+            return super().partial_update(request, *args, **kwargs)
+        except IntegrityError:
+            # Corrida: outra conta salvou o mesmo CPF depois da validação.
+            return Response(
+                {"cpf": [CPF_IN_USE_MESSAGE]}, status=status.HTTP_400_BAD_REQUEST
+            )
 
     @extend_schema(
         tags=["CRM Clientes"],
