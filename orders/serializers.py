@@ -1,6 +1,7 @@
 import re
 
 from django.contrib.auth import get_user_model
+from django.db import IntegrityError, transaction
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
@@ -872,7 +873,34 @@ class CouponAdminSerializer(serializers.ModelSerializer):
         extra_kwargs = {
             "max_uses_total": {"min_value": 1},
             "max_uses_per_user": {"min_value": 1},
+            # Unicidade checada em validate(), sem diferenciar maiúsculas e em português.
+            # O validador automático respondia "coupon with this code already exists.".
+            "code": {"validators": []},
         }
+
+    # validate() já checa o código, mas dois admins salvando o mesmo código ao mesmo
+    # tempo passam os dois pela checagem: o banco recusa o segundo, e isso vira a mesma
+    # mensagem em vez de um erro 500.
+    def _save_unique_code(self, save):
+        try:
+            with transaction.atomic():
+                return save()
+        except IntegrityError as exc:
+            if "code" not in str(exc).lower():
+                raise
+            raise serializers.ValidationError(
+                {"code": ["Este código já existe."]}
+            ) from exc
+
+    def create(self, validated_data):
+        return self._save_unique_code(
+            lambda: super(CouponAdminSerializer, self).create(validated_data)
+        )
+
+    def update(self, instance, validated_data):
+        return self._save_unique_code(
+            lambda: super(CouponAdminSerializer, self).update(instance, validated_data)
+        )
 
     def to_representation(self, instance):
         rep = super().to_representation(instance)
