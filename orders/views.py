@@ -1934,7 +1934,7 @@ class CouponEmailTestView(_CouponEmailBaseView):
         coupon = self.get_coupon(uuid)
         message = self.get_message(request)
         if send_coupon_test(coupon, request.user, message):
-            return Response({"sent": True})
+            return Response({"sent": True, "to": request.user.email})
         return Response(
             {"error": "Não foi possível enviar o teste."},
             status=status.HTTP_502_BAD_GATEWAY,

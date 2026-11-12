@@ -93,7 +93,7 @@ class CouponEmailApiTests(APITestCase):
             self.url("admin-coupon-email-test"), {"message": "oi"}, format="json"
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data, {"sent": True})
+        self.assertEqual(response.data, {"sent": True, "to": "admin@shio.com"})
         self.assertEqual(len(mail.outbox), 1)
         self.assertEqual(mail.outbox[0].to, ["admin@shio.com"])
         self.assertEqual(CouponEmailSend.objects.count(), 0)
