@@ -1,8 +1,6 @@
 {% extends "emails/base.txt" %}
 
 {% block content %}
-{% if nome %}Olá, {{ nome }}!{% else %}Olá!{% endif %}
-
 {{ mensagem }}
 
 Ir para a loja: {{ loja_url }}

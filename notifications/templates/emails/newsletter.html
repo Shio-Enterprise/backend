@@ -1,9 +1,7 @@
 {% extends "emails/base.html" %}
 
 {% block content %}
-<p style="margin-bottom: 20px; font-size: 16px;">{% if nome %}Olá, {{ nome }}!{% else %}Olá!{% endif %}</p>
-
-<div style="margin: 24px 0; font-size: 16px; line-height: 1.6; color: #2d2d2d;">
+<div style="margin: 0 0 24px 0; font-size: 16px; line-height: 1.6; color: #2d2d2d;">
 {{ mensagem|linebreaksbr }}
 </div>
 
