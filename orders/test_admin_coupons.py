@@ -1,4 +1,5 @@
 from decimal import Decimal
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.urls import reverse
@@ -6,6 +7,7 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 
 from .models import Coupon, CouponDiscountType
+from .serializers import CouponAdminSerializer
 
 User = get_user_model()
 
@@ -177,3 +179,36 @@ class CouponDuplicateCodeMessageTests(APITestCase):
         url = reverse("orders:admin-coupons-detail", args=[self.existing.id])
         response = self.client.patch(url, {"code": "TESTE10"}, format="json")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def racing_validate(self):
+        """Outro admin salva o mesmo código entre a validação e o INSERT/UPDATE."""
+        original = CouponAdminSerializer.validate
+
+        def validate(serializer, data):
+            data = original(serializer, data)
+            Coupon.objects.create(
+                code=data["code"],
+                discount_type=CouponDiscountType.PERCENTAGE,
+                discount_value=Decimal("1.00"),
+            )
+            return data
+
+        return patch.object(CouponAdminSerializer, "validate", validate)
+
+    def test_corrida_ao_criar_responde_400_em_portugues(self):
+        with self.racing_validate():
+            response = self.client.post(
+                self.url, self.payload("CORRIDA1"), format="json"
+            )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["code"], ["Este código já existe."])
+        self.assertEqual(Coupon.objects.filter(code="CORRIDA1").count(), 1)
+
+    def test_corrida_ao_editar_responde_400_em_portugues(self):
+        url = reverse("orders:admin-coupons-detail", args=[self.other.id])
+        with self.racing_validate():
+            response = self.client.patch(url, {"code": "CORRIDA2"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["code"], ["Este código já existe."])
+        self.other.refresh_from_db()
+        self.assertEqual(self.other.code, "OUTRO5")
