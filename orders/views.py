@@ -589,10 +589,24 @@ class UserOrderDetailView(APIView):
         )
 
 
+def filter_by_customer(qs, raw):
+    """Filtra pedidos pelo ID do cliente; valor inválido vira 400 (#88)."""
+    if raw in (None, ""):
+        return qs
+    try:
+        customer_id = int(raw)
+    except (TypeError, ValueError):
+        customer_id = 0
+    if customer_id < 1:
+        raise ValidationError({"customer": "customer deve ser um ID inteiro válido."})
+    return qs.filter(user_id=customer_id)
+
+
 class AdminOrderListView(APIView):
     """
     GET /api/orders/admin/
-    Lista pedidos para o painel admin com filtro por `status`.
+    Lista pedidos para o painel admin com filtros por `status`, `refund_status`,
+    `exchange_status` e `customer`.
     """
 
     permission_classes = [CanManageOrders]
@@ -619,6 +633,13 @@ class AdminOrderListView(APIView):
                 description="Filtra pelo status da troca mais recente do pedido",
                 location=OpenApiParameter.QUERY,
             ),
+            OpenApiParameter(
+                name="customer",
+                type=OpenApiTypes.INT,
+                description="Filtra pelos pedidos de um cliente (ID do usuário)",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
         ],
         responses={200: DashboardRecentOrderSerializer(many=True)},
     )
@@ -633,6 +654,7 @@ class AdminOrderListView(APIView):
                 )
             )
         )
+        qs = filter_by_customer(qs, request.query_params.get("customer"))
         if status_q:
             qs = qs.filter(status=status_q)
         if refund_status_q:
@@ -684,6 +706,13 @@ class AdminOrderExportView(APIView):
                 location=OpenApiParameter.QUERY,
                 required=False,
             ),
+            OpenApiParameter(
+                name="customer",
+                type=OpenApiTypes.INT,
+                description="Filtra pelos pedidos de um cliente (ID do usuário)",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
         ],
         responses={
             200: OpenApiResponse(description="Arquivo exportado (CSV ou XLSX)"),
@@ -701,6 +730,7 @@ class AdminOrderExportView(APIView):
             .prefetch_related("items__variation__product")
             .order_by("-created_at")
         )
+        qs = filter_by_customer(qs, request.query_params.get("customer"))
         if status_q:
             qs = qs.filter(status=status_q)
         if search_q:
