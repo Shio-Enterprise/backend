@@ -206,3 +206,37 @@ class AdminOrderCustomerFilterTests(APITestCase):
         self.assertEqual(
             self.list_ids({"customer": self.joao.id}), {str(self.joao_paid.id)}
         )
+
+    def test_exportacao_respeita_reembolso_e_troca(self):
+        Refund.objects.create(
+            order=self.maria_delivered,
+            status=RefundStatus.REQUESTED,
+            amount=50,
+            reason=RefundReason.CUSTOMER_REQUEST,
+        )
+        ExchangeRequest.objects.create(
+            order=self.joao_paid,
+            status=ExchangeStatus.REQUESTED,
+            reason=ExchangeReason.SIZE_OR_COLOR,
+        )
+        cases = [
+            ({"refund_status": RefundStatus.REQUESTED}, {str(self.maria_delivered.id)}),
+            ({"exchange_status": ExchangeStatus.REQUESTED}, {str(self.joao_paid.id)}),
+            (
+                {
+                    "customer": self.maria.id,
+                    "exchange_status": ExchangeStatus.REQUESTED,
+                },
+                set(),
+            ),
+        ]
+        for query, expected in cases:
+            with self.subTest(query=query):
+                rows = self.export_rows({**query, "file_format": "csv"})
+                self.assertEqual({r[0] for r in rows}, expected)
+
+    def test_exportacao_status_invalido_devolve_400(self):
+        for query in ({"refund_status": "XYZ"}, {"exchange_status": "XYZ"}):
+            with self.subTest(query=query):
+                response = self.client.get(EXPORT_URL, query)
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)

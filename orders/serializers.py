@@ -872,6 +872,9 @@ class CouponAdminSerializer(serializers.ModelSerializer):
         extra_kwargs = {
             "max_uses_total": {"min_value": 1},
             "max_uses_per_user": {"min_value": 1},
+            # Unicidade checada em validate(), sem diferenciar maiúsculas e em português.
+            # O validador automático respondia "coupon with this code already exists.".
+            "code": {"validators": []},
         }
 
     def to_representation(self, instance):

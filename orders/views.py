@@ -602,6 +602,25 @@ def filter_by_customer(qs, raw):
     return qs.filter(user_id=customer_id)
 
 
+def filter_by_after_sales(qs, params):
+    """Filtra pelo reembolso/troca mais recentes; status inválido vira 400.
+
+    Usado pela lista e pela exportação, para o arquivo bater com a tela.
+    """
+    qs = with_exchange_status(with_refund_status(qs))
+    refund_status_q = params.get("refund_status")
+    exchange_status_q = params.get("exchange_status")
+    if refund_status_q:
+        if refund_status_q not in RefundStatus.values:
+            raise ValidationError({"refund_status": "Status de reembolso inválido."})
+        qs = qs.filter(refund_status=refund_status_q)
+    if exchange_status_q:
+        if exchange_status_q not in ExchangeStatus.values:
+            raise ValidationError({"exchange_status": "Status de troca inválido."})
+        qs = qs.filter(exchange_status=exchange_status_q)
+    return qs
+
+
 class AdminOrderListView(APIView):
     """
     GET /api/orders/admin/
@@ -645,28 +664,13 @@ class AdminOrderListView(APIView):
     )
     def get(self, request):
         status_q = request.query_params.get("status")
-        refund_status_q = request.query_params.get("refund_status")
-        exchange_status_q = request.query_params.get("exchange_status")
-        qs = with_exchange_status(
-            with_refund_status(
-                CustomerOrder.objects.select_related("user", "payment").order_by(
-                    "-created_at"
-                )
-            )
+        qs = CustomerOrder.objects.select_related("user", "payment").order_by(
+            "-created_at"
         )
         qs = filter_by_customer(qs, request.query_params.get("customer"))
+        qs = filter_by_after_sales(qs, request.query_params)
         if status_q:
             qs = qs.filter(status=status_q)
-        if refund_status_q:
-            if refund_status_q not in RefundStatus.values:
-                raise ValidationError(
-                    {"refund_status": "Status de reembolso inválido."}
-                )
-            qs = qs.filter(refund_status=refund_status_q)
-        if exchange_status_q:
-            if exchange_status_q not in ExchangeStatus.values:
-                raise ValidationError({"exchange_status": "Status de troca inválido."})
-            qs = qs.filter(exchange_status=exchange_status_q)
 
         data = DashboardRecentOrderSerializer(qs, many=True).data
         return Response(data, status=status.HTTP_200_OK)
@@ -675,7 +679,8 @@ class AdminOrderListView(APIView):
 class AdminOrderExportView(APIView):
     """
     GET /api/orders/admin/export/
-    Exporta pedidos para CSV ou Excel (.xlsx) respeitando filtros de busca e status.
+    Exporta pedidos para CSV ou Excel (.xlsx) respeitando os mesmos filtros da tela
+    (busca, status, cliente, reembolso e troca).
     Requer a permissão CanManageOrders.
     """
 
@@ -713,6 +718,22 @@ class AdminOrderExportView(APIView):
                 location=OpenApiParameter.QUERY,
                 required=False,
             ),
+            OpenApiParameter(
+                name="refund_status",
+                type=OpenApiTypes.STR,
+                enum=RefundStatus.values,
+                description="Filtra pelo status do reembolso mais recente do pedido",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
+            OpenApiParameter(
+                name="exchange_status",
+                type=OpenApiTypes.STR,
+                enum=ExchangeStatus.values,
+                description="Filtra pelo status da troca mais recente do pedido",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
         ],
         responses={
             200: OpenApiResponse(description="Arquivo exportado (CSV ou XLSX)"),
@@ -731,6 +752,7 @@ class AdminOrderExportView(APIView):
             .order_by("-created_at")
         )
         qs = filter_by_customer(qs, request.query_params.get("customer"))
+        qs = filter_by_after_sales(qs, request.query_params)
         if status_q:
             qs = qs.filter(status=status_q)
         if search_q:
