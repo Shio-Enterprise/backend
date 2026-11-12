@@ -5,10 +5,13 @@ import io
 
 import openpyxl
 from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Permission
 from rest_framework import status
 from rest_framework.test import APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
+from authentication.admin_permissions import ADMIN_PERMISSION_CODES
+from authentication.models import UserProfile, UserRole
 from orders.models import (
     CustomerOrder,
     ExchangeReason,
@@ -177,3 +180,29 @@ class AdminOrderCustomerFilterTests(APITestCase):
             with self.subTest(url=url):
                 response = self.client.get(url, {"customer": self.maria.id})
                 self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def admin_with(self, email, codenames):
+        admin = User.objects.create_user(email=email, name="Admin", is_staff=True)
+        UserProfile.objects.create(user=admin, role=UserRole.ADMIN)
+        admin.user_permissions.set(
+            Permission.objects.filter(
+                content_type__app_label="authentication",
+                codename__in=codenames,
+            )
+        )
+        self.assertTrue(set(codenames) <= set(ADMIN_PERMISSION_CODES))
+        token = RefreshToken.for_user(admin).access_token
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+
+    def test_admin_so_de_clientes_nao_ve_pedidos_do_cliente(self):
+        self.admin_with("crm88@x.com", ["manage_customers"])
+        for url in (LIST_URL, EXPORT_URL):
+            with self.subTest(url=url):
+                response = self.client.get(url, {"customer": self.maria.id})
+                self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_admin_so_de_pedidos_usa_o_filtro(self):
+        self.admin_with("pedidos88@x.com", ["manage_orders"])
+        self.assertEqual(
+            self.list_ids({"customer": self.joao.id}), {str(self.joao_paid.id)}
+        )
