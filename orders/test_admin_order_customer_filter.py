@@ -3,6 +3,7 @@
 import csv
 import io
 
+import openpyxl
 from django.contrib.auth import get_user_model
 from rest_framework import status
 from rest_framework.test import APITestCase
@@ -10,6 +11,9 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from orders.models import (
     CustomerOrder,
+    ExchangeReason,
+    ExchangeRequest,
+    ExchangeStatus,
     OrderStatus,
     Refund,
     RefundReason,
@@ -109,7 +113,67 @@ class AdminOrderCustomerFilterTests(APITestCase):
         rows = list(csv.reader(io.StringIO(content.decode("utf-8-sig")), delimiter=";"))
         emails = {row[3] for row in rows[1:]}
         self.assertEqual(emails, {"maria@x.com"})
+        self.assertEqual(len(rows) - 1, 2)
 
     def test_exportacao_valor_invalido_devolve_400(self):
         response = self.client.get(EXPORT_URL, {"customer": "abc"})
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def export_rows(self, query):
+        response = self.client.get(EXPORT_URL, query)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        if query.get("file_format") == "xlsx":
+            sheet = openpyxl.load_workbook(io.BytesIO(response.content)).active
+            return [list(r) for r in sheet.iter_rows(min_row=2, values_only=True)]
+        content = (
+            b"".join(response.streaming_content)
+            if response.streaming
+            else response.content
+        )
+        return list(
+            csv.reader(io.StringIO(content.decode("utf-8-sig")), delimiter=";")
+        )[1:]
+
+    def test_combina_com_troca(self):
+        for order in (self.maria_delivered, self.joao_paid):
+            ExchangeRequest.objects.create(
+                order=order,
+                status=ExchangeStatus.REQUESTED,
+                reason=ExchangeReason.SIZE_OR_COLOR,
+            )
+        ids = self.list_ids(
+            {"customer": self.maria.id, "exchange_status": ExchangeStatus.REQUESTED}
+        )
+        self.assertEqual(ids, {str(self.maria_delivered.id)})
+
+    def test_vazio_nao_filtra(self):
+        ids = self.list_ids({"customer": ""})
+        self.assertEqual(len(ids), 3)
+
+    def test_exportacao_combina_cliente_e_busca(self):
+        code = str(self.maria_paid.id)[:8].upper()
+        rows = self.export_rows(
+            {"customer": self.maria.id, "search": f"#{code}", "file_format": "csv"}
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][3], "maria@x.com")
+        # A busca pelo código de um pedido de outro cliente não traz nada.
+        other = str(self.joao_paid.id)[:8]
+        self.assertEqual(
+            self.export_rows(
+                {"customer": self.maria.id, "search": other, "file_format": "csv"}
+            ),
+            [],
+        )
+
+    def test_exportacao_xlsx_respeita_o_filtro(self):
+        rows = self.export_rows({"customer": self.joao.id, "file_format": "xlsx"})
+        self.assertEqual([r[3] for r in rows], ["joao@x.com"])
+
+    def test_sem_permissao_de_pedidos_recebe_403(self):
+        token = RefreshToken.for_user(self.maria).access_token
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+        for url in (LIST_URL, EXPORT_URL):
+            with self.subTest(url=url):
+                response = self.client.get(url, {"customer": self.maria.id})
+                self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
