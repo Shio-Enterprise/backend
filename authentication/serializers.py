@@ -27,12 +27,14 @@ INACTIVE_ACCOUNT_MESSAGE = "Esta conta está desativada e não pode virar admini
 EMAIL_ERROR_MESSAGES = {
     "required": "Informe o e-mail.",
     "blank": "Informe o e-mail.",
+    "null": "Informe o e-mail.",
     "invalid": "Informe um e-mail válido, como nome@exemplo.com.",
     "max_length": "O e-mail pode ter no máximo {max_length} caracteres.",
 }
 PASSWORD_REQUIRED_MESSAGES = {
     "required": "Informe a senha.",
     "blank": "Informe a senha.",
+    "null": "Informe a senha.",
 }
 # Mensagens dos validadores de senha do Django, pelo código do erro (#96).
 PASSWORD_VALIDATOR_MESSAGES = {
@@ -323,6 +325,7 @@ class RegisterSerializer(serializers.ModelSerializer):
         error_messages={
             "required": "Informe o nome.",
             "blank": "Informe o nome.",
+            "null": "Informe o nome.",
             "max_length": "O nome pode ter no máximo {max_length} caracteres.",
         },
     )

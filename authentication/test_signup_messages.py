@@ -69,6 +69,13 @@ class CadastroMensagensTests(APITestCase):
         response = self._register(name="")
         self.assertEqual(response.data["name"], ["Informe o nome."])
 
+    def test_campos_nulos(self):
+        response = self._register(email=None, name=None, password=None)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data["email"], ["Informe o e-mail."])
+        self.assertEqual(response.data["name"], ["Informe o nome."])
+        self.assertEqual(response.data["password"], ["Informe a senha."])
+
     def test_varios_campos_com_erro_aparecem_juntos(self):
         response = self._register(email="joao@gmail", password="123")
         self.assertIn("email", response.data)
@@ -117,6 +124,9 @@ class NovaSenhaMensagensTests(TestCase):
 
     def test_nova_senha_em_branco(self):
         self.assertEqual(self._errors(""), ["Informe a senha."])
+
+    def test_nova_senha_nula(self):
+        self.assertEqual(self._errors(None), ["Informe a senha."])
 
 
 class ValidadorSemTraducaoTests(TestCase):
