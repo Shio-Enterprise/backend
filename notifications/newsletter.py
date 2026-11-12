@@ -19,6 +19,7 @@ from authentication.models import (
 )
 from notifications.email import send_email
 from notifications.marketing import Recipient, normalize_email
+from notifications.personalize import EXAMPLE_NAME, fill_name
 from notifications.unsubscribe import unsubscribe_url
 
 logger = logging.getLogger(__name__)
@@ -60,8 +61,7 @@ def _newsletter_context(
 ) -> dict:
     return {
         "subject": subject,
-        "nome": name,
-        "mensagem": message,
+        "mensagem": fill_name(message, name),
         "loja_url": settings.FRONTEND_URL,
         "unsubscribe_url": unsub_url,
         "year": timezone.localdate().year,
@@ -77,7 +77,7 @@ def render_newsletter_preview(
     context = _newsletter_context(
         subject=subject or "Newsletter — Shio",
         message=message,
-        name=name or "Cliente",
+        name=name or EXAMPLE_NAME,
         unsub_url=f"{settings.FRONTEND_URL}/descadastrar/exemplo",
     )
     return render_to_string("emails/newsletter.html", context)

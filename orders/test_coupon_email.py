@@ -1,3 +1,4 @@
+import re
 from datetime import timedelta
 from decimal import Decimal
 from unittest.mock import patch
@@ -155,13 +156,50 @@ class CouponCampaignTests(TestCase):
         self.assertIn("<br>", html)
         self.assertIn("Não quero receber promoções", html)
 
-    def test_saudacao_com_nome_e_sem_conta(self):
+    def test_sem_saudacao_fixa(self):
         self._audience()
         send_coupon_campaign(self.coupon, self.admin, "")
-        bodies = {m.to[0]: m.body for m in mail.outbox}
-        self.assertIn("Olá, Ana!", bodies["ana@x.com"])
-        self.assertIn("Olá!", bodies["bia@x.com"])
-        self.assertNotIn("Olá, !", bodies["bia@x.com"])
+        for message in mail.outbox:
+            self.assertNotIn("Olá", message.body)
+            self.assertNotIn("Olá", message.alternatives[0][0])
+            self.assertIn("Separamos um cupom para você usar na Shio.", message.body)
+
+    def test_marcador_nome_com_nome_e_sem_conta(self):
+        self._audience()
+        User.objects.filter(email="ana@x.com").update(name="Ana Souza")
+        send_coupon_campaign(self.coupon, self.admin, "Olá, {nome}! Corre que acaba.")
+        bodies = {m.to[0]: (m.body, m.alternatives[0][0]) for m in mail.outbox}
+        self.assertIn("Olá, Ana! Corre que acaba.", bodies["ana@x.com"][0])
+        self.assertIn("Olá, Ana! Corre que acaba.", bodies["ana@x.com"][1])
+        self.assertIn("Olá! Corre que acaba.", bodies["bia@x.com"][0])
+        self.assertIn("Olá! Corre que acaba.", bodies["bia@x.com"][1])
+        for text, html in bodies.values():
+            self.assertNotIn("{nome}", text)
+            self.assertNotIn("{nome}", html)
+
+    def test_email_de_teste_usa_o_nome_do_admin(self):
+        send_coupon_test(self.coupon, self.admin, "Olá, {nome}!")
+        first = self.admin.name.split()[0]
+        self.assertIn(f"Olá, {first}!", mail.outbox[0].body)
+
+    def test_previa_usa_nome_de_exemplo(self):
+        html = render_coupon_preview(self.coupon, "Olá, {nome}!")
+        self.assertIn("Olá, Maria!", html)
+        self.assertNotIn("{nome}", html)
+
+    def test_previa_igual_ao_email_enviado(self):
+        make_order(make_user("ana@x.com", name="Ana Souza"))
+        message = "Olá, {nome}!\nCorre que acaba."
+        send_coupon_campaign(self.coupon, self.admin, message)
+        sent = mail.outbox[0].alternatives[0][0]
+        preview = render_coupon_preview(self.coupon, message, name="Ana Souza")
+
+        def sem_link_de_descadastro(html):
+            return re.sub(r"/descadastrar/[^\"]+", "/descadastrar/X", html)
+
+        self.assertEqual(
+            sem_link_de_descadastro(preview), sem_link_de_descadastro(sent)
+        )
 
     def test_falha_conta_e_continua(self):
         self._audience()
