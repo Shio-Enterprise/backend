@@ -82,6 +82,14 @@ from .models import (
     PaymentStatus,
     RefundStatus,
 )
+from .order_email import (
+    is_customer_unsubscribed,
+    order_send_block_reason,
+    render_order_email_preview,
+    send_order_email_test,
+    send_order_recovery_email,
+    suggested_order_message,
+)
 from .refunds import (
     approve_refund,
     complete_refund,
@@ -110,6 +118,7 @@ from .serializers import (
     ExchangeReceiveSerializer,
     ExchangeRequestSerializer,
     OrderDetailSerializer,
+    OrderRecoveryEmailMessageSerializer,
     OrderStatusUpdateSerializer,
     PaymentReturnSerializer,
     PaymentWebhookSerializer,
@@ -628,9 +637,9 @@ class AdminOrderListView(APIView):
         exchange_status_q = request.query_params.get("exchange_status")
         qs = with_exchange_status(
             with_refund_status(
-                CustomerOrder.objects.select_related("user", "payment").order_by(
-                    "-created_at"
-                )
+                CustomerOrder.objects.select_related("user", "payment")
+                .prefetch_related("recovery_email_sends")
+                .order_by("-created_at")
             )
         )
         if status_q:
@@ -833,7 +842,9 @@ class AdminOrderDetailView(APIView):
         try:
             order = (
                 CustomerOrder.objects.select_related("user", "address", "payment")
-                .prefetch_related("items__variation__product")
+                .prefetch_related(
+                    "items__variation__product", "recovery_email_sends__sent_by"
+                )
                 .get(id=order_id)
             )
         except CustomerOrder.DoesNotExist:
@@ -918,7 +929,7 @@ class AdminOrderDetailView(APIView):
 def _order_for_detail(order_id):
     return (
         CustomerOrder.objects.select_related("user", "address", "payment")
-        .prefetch_related("items__variation__product")
+        .prefetch_related("items__variation__product", "recovery_email_sends__sent_by")
         .get(id=order_id)
     )
 
@@ -1960,6 +1971,104 @@ class CouponEmailSendView(_CouponEmailBaseView):
                 "sent_count": record.sent_count,
                 "failed_count": record.failed_count,
                 "sent_at": record.sent_at,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class _OrderRecoveryEmailBaseView(APIView):
+    permission_classes = [CanManageOrders]
+
+    def get_order(self, order_id):
+        from django.shortcuts import get_object_or_404
+
+        return get_object_or_404(
+            CustomerOrder.objects.select_related("user").prefetch_related("items"),
+            id=order_id,
+        )
+
+    def get_message(self, request) -> str:
+        serializer = OrderRecoveryEmailMessageSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        return serializer.validated_data.get("message", "")
+
+
+class OrderRecoveryEmailSummaryView(_OrderRecoveryEmailBaseView):
+    @extend_schema(responses=dict)
+    def get(self, request, order_id):
+        order = self.get_order(order_id)
+        customer_email = getattr(order.user, "email", None)
+        history = [
+            {
+                "id": str(send.id),
+                "sent_at": send.sent_at,
+                "sent_by_name": (
+                    (send.sent_by.name or send.sent_by.email) if send.sent_by else None
+                ),
+                "message": send.message,
+            }
+            for send in order.recovery_email_sends.select_related("sent_by")
+        ]
+        return Response(
+            {
+                "block_reason": order_send_block_reason(order),
+                "unsubscribed": is_customer_unsubscribed(customer_email),
+                "recipient": {
+                    "name": getattr(order.user, "name", None) or None,
+                    "email": customer_email,
+                },
+                "order_status": order.status,
+                "suggested_message": suggested_order_message(order),
+                "history": history,
+            }
+        )
+
+
+class OrderRecoveryEmailPreviewView(_OrderRecoveryEmailBaseView):
+    @extend_schema(request=OrderRecoveryEmailMessageSerializer, responses=dict)
+    def post(self, request, order_id):
+        order = self.get_order(order_id)
+        message = self.get_message(request)
+        return Response({"html": render_order_email_preview(order, message)})
+
+
+class OrderRecoveryEmailTestView(_OrderRecoveryEmailBaseView):
+    @extend_schema(request=OrderRecoveryEmailMessageSerializer, responses=dict)
+    def post(self, request, order_id):
+        order = self.get_order(order_id)
+        message = self.get_message(request)
+        if send_order_email_test(order, request.user, message):
+            return Response({"sent": True})
+        return Response(
+            {"error": "Não foi possível enviar o teste."},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
+class OrderRecoveryEmailSendView(_OrderRecoveryEmailBaseView):
+    @extend_schema(request=OrderRecoveryEmailMessageSerializer, responses=dict)
+    def post(self, request, order_id):
+        order = self.get_order(order_id)
+        message = self.get_message(request)
+        reason = order_send_block_reason(order)
+        if reason:
+            return Response({"error": reason}, status=status.HTTP_400_BAD_REQUEST)
+        record = send_order_recovery_email(order, request.user, message)
+        if record is None:
+            return Response(
+                {"error": "Não foi possível enviar o e-mail."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response(
+            {
+                "id": str(record.id),
+                "sent_at": record.sent_at,
+                "sent_by_name": (
+                    (record.sent_by.name or record.sent_by.email)
+                    if record.sent_by
+                    else None
+                ),
+                "recipient_email": order.user.email,
             },
             status=status.HTTP_201_CREATED,
         )

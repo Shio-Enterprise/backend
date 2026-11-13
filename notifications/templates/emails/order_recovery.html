@@ -1,0 +1,49 @@
+{% extends "emails/base.html" %}
+
+{% block content %}
+<p>{% if nome %}Olá, {{ nome }}!{% else %}Olá!{% endif %}</p>
+
+<p>{{ intro_text }}</p>
+
+{% if mensagem %}
+<p>{{ mensagem|linebreaksbr }}</p>
+{% endif %}
+
+{% if itens %}
+<div style="margin: 24px 0; border: 1px solid #e5e5e5; border-radius: 6px; padding: 16px;">
+    <p style="margin: 0 0 12px 0; font-size: 14px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.5px;">Resumo do pedido {{ codigo_pedido }}</p>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="font-size: 14px; color: #2d2d2d;">
+        {% for item in itens %}
+        <tr>
+            <td style="padding: 6px 0; border-bottom: 1px solid #f0f0f0;">
+                <strong>{{ item.product_name }}</strong>
+                {% if item.sku_snapshot %}<br><span style="font-size: 12px; color: #666666;">{{ item.sku_snapshot }}</span>{% endif %}
+                <br><span style="font-size: 12px; color: #666666;">Qtd: {{ item.quantity }} &times; {{ item.unit_price_brl }}</span>
+            </td>
+            <td align="right" valign="top" style="padding: 6px 0; border-bottom: 1px solid #f0f0f0; white-space: nowrap; font-weight: bold;">
+                {{ item.subtotal_brl }}
+            </td>
+        </tr>
+        {% endfor %}
+        <tr>
+            <td style="padding: 12px 0 0 0; font-size: 15px; font-weight: bold;">Total do pedido</td>
+            <td align="right" style="padding: 12px 0 0 0; font-size: 15px; font-weight: bold; white-space: nowrap;">{{ total_brl }}</td>
+        </tr>
+    </table>
+</div>
+{% else %}
+<p style="margin: 20px 0; font-size: 15px;"><strong>Total do pedido {{ codigo_pedido }}:</strong> {{ total_brl }}</p>
+{% endif %}
+
+<p style="text-align: center; margin: 30px 0;">
+    <a href="{{ loja_url }}" style="background-color: #000000; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 4px; display: inline-block; font-weight: bold;">Voltar para a loja</a>
+</p>
+
+{% if pedido_url %}
+<p style="text-align: center; margin: 0 0 24px 0; font-size: 14px;">
+    <a href="{{ pedido_url }}" style="color: #000000; text-decoration: underline;">Ver meu pedido</a>
+</p>
+{% endif %}
+
+<p style="font-size: 12px; color: #666666; text-align: center;"><a href="{{ unsubscribe_url }}" style="color: #666666;">Não quero receber comunicações</a></p>
+{% endblock %}
