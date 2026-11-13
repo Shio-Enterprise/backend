@@ -1,0 +1,20 @@
+{% extends "emails/base.txt" %}
+
+{% block content %}
+{% if nome %}Olá, {{ nome }}!{% else %}Olá!{% endif %}
+
+{{ intro_text }}
+{% if mensagem %}
+{{ mensagem }}
+{% endif %}
+{% if itens %}
+Resumo do pedido {{ codigo_pedido }}:
+{% for item in itens %}- {{ item.product_name }}{% if item.sku_snapshot %} ({{ item.sku_snapshot }}){% endif %} - Qtd: {{ item.quantity }} x {{ item.unit_price_brl }} = {{ item.subtotal_brl }}
+{% endfor %}{% endif %}
+Total do pedido {{ codigo_pedido }}: {{ total_brl }}
+
+Voltar para a loja: {{ loja_url }}
+{% if pedido_url %}Ver meu pedido: {{ pedido_url }}
+{% endif %}
+Não quero receber comunicações: {{ unsubscribe_url }}
+{% endblock %}

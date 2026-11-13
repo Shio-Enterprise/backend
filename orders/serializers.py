@@ -37,6 +37,7 @@ class DashboardRecentOrderSerializer(serializers.ModelSerializer):
         read_only=True, allow_null=True, default=None
     )
     revenue_value = serializers.SerializerMethodField()
+    last_recovery_email_sent_at = serializers.SerializerMethodField()
 
     class Meta:
         model = CustomerOrder
@@ -51,6 +52,7 @@ class DashboardRecentOrderSerializer(serializers.ModelSerializer):
             "paid_at",
             "created_at",
             "revenue_value",
+            "last_recovery_email_sent_at",
         ]
 
     def get_customer_name(self, obj) -> str:
@@ -60,6 +62,10 @@ class DashboardRecentOrderSerializer(serializers.ModelSerializer):
         from .metrics import revenue_value
 
         return f"{revenue_value(obj):.2f}"
+
+    def get_last_recovery_email_sent_at(self, obj):
+        sends = list(obj.recovery_email_sends.all())
+        return sends[0].sent_at if sends else None
 
 
 class DashboardLowStockSerializer(serializers.ModelSerializer):
@@ -533,9 +539,19 @@ class ExchangeEligibilitySerializer(serializers.Serializer):
     items = ExchangeEligibleItemSerializer(many=True)
 
 
-class OrderDetailSerializer(serializers.ModelSerializer):
-    """Detalhe administrativo do pedido."""
+class OrderRecoveryEmailSendSerializer(serializers.Serializer):
+    id = serializers.UUIDField(read_only=True)
+    sent_at = serializers.DateTimeField(read_only=True)
+    sent_by_name = serializers.SerializerMethodField()
+    message = serializers.CharField(read_only=True)
 
+    def get_sent_by_name(self, obj) -> str | None:
+        if not obj.sent_by:
+            return None
+        return obj.sent_by.name or obj.sent_by.email
+
+
+class _BaseOrderDetailSerializer(serializers.ModelSerializer):
     items = SimpleOrderItemSerializer(many=True)
     payment = PaymentSerializer(read_only=True)
     user = AdminUserSerializer(read_only=True)
@@ -597,7 +613,24 @@ class OrderDetailSerializer(serializers.ModelSerializer):
         ]
 
 
-class CustomerOrderDetailSerializer(OrderDetailSerializer):
+class OrderDetailSerializer(_BaseOrderDetailSerializer):
+    """Detalhe administrativo do pedido."""
+
+    recovery_email_sends = serializers.SerializerMethodField()
+
+    @extend_schema_field(OrderRecoveryEmailSendSerializer(many=True))
+    def get_recovery_email_sends(self, obj):
+        sends = obj.recovery_email_sends.select_related("sent_by").all()
+        return OrderRecoveryEmailSendSerializer(sends, many=True).data
+
+    class Meta(_BaseOrderDetailSerializer.Meta):
+        fields = [
+            *_BaseOrderDetailSerializer.Meta.fields,
+            "recovery_email_sends",
+        ]
+
+
+class CustomerOrderDetailSerializer(_BaseOrderDetailSerializer):
     """Detalhe do cliente: sem dados internos do reembolso."""
 
     refund_serializer_class = CustomerRefundSerializer
@@ -647,9 +680,9 @@ class CustomerOrderDetailSerializer(OrderDetailSerializer):
             }
         ).data
 
-    class Meta(OrderDetailSerializer.Meta):
+    class Meta(_BaseOrderDetailSerializer.Meta):
         fields = [
-            *OrderDetailSerializer.Meta.fields,
+            *_BaseOrderDetailSerializer.Meta.fields,
             "refund_eligibility",
             "exchange_eligibility",
         ]
@@ -980,3 +1013,13 @@ class CouponAdminSerializer(serializers.ModelSerializer):
 
 class CouponEmailMessageSerializer(serializers.Serializer):
     message = serializers.CharField(allow_blank=True, required=False, max_length=500)
+
+
+class OrderRecoveryEmailMessageSerializer(serializers.Serializer):
+    message = serializers.CharField(
+        max_length=500,
+        required=False,
+        allow_blank=True,
+        default="",
+        trim_whitespace=True,
+    )
