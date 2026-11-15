@@ -46,9 +46,33 @@ class FillNameTests(SimpleTestCase):
     def test_sem_nome_no_comeco_da_linha_leva_a_pontuacao(self):
         self.assertEqual(
             fill_name("{nome}, temos novidades.\nLinha 2", None),
-            "temos novidades.\nLinha 2",
+            "Temos novidades.\nLinha 2",
         )
-        self.assertEqual(fill_name("Topo\n{nome}!\nFim", None), "Topo\n\nFim")
+
+    def test_sem_nome_no_comeco_da_linha_deixa_a_frase_com_maiuscula(self):
+        self.assertEqual(fill_name("{nome}, veja!", ""), "Veja!")
+        self.assertEqual(
+            fill_name("{nome}! Chegou drop novo", None), "Chegou drop novo"
+        )
+        self.assertEqual(fill_name("  {nome}, ébano chegou", None), "Ébano chegou")
+
+    def test_sem_nome_sozinho_na_linha_sobe_a_pontuacao_para_a_saudacao(self):
+        self.assertEqual(fill_name("Olá,\n{nome}!", ""), "Olá!")
+        self.assertEqual(
+            fill_name("Olá,\n{nome}!\nTemos novidades.", None), "Olá!\nTemos novidades."
+        )
+        self.assertEqual(fill_name("Oi,\n{nome}.", None), "Oi.")
+        self.assertEqual(
+            fill_name("Olá,\n{nome},\nTemos novidades.", None), "Olá,\nTemos novidades."
+        )
+
+    def test_sem_nome_sozinho_na_linha_some_a_linha(self):
+        self.assertEqual(fill_name("Topo\n{nome}!\nFim", None), "Topo\nFim")
+        self.assertEqual(fill_name("{nome}!\nFim", None), "Fim")
+        self.assertEqual(fill_name("Topo\n\n{nome}\nFim", None), "Topo\n\nFim")
+
+    def test_sem_nome_preserva_quebras_de_linha_do_resto(self):
+        self.assertEqual(fill_name("Olá, {nome}!\n\nTexto", None), "Olá!\n\nTexto")
 
     def test_nome_de_exemplo_da_previa(self):
         self.assertEqual(EXAMPLE_NAME, "Maria")
