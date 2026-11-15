@@ -129,6 +129,10 @@ class DropListForCouponFormTests(APITestCase):
             launch_date=now + timedelta(days=5),
             is_public=False,
         )
+        # Criados no mesmo instante, empatariam em -created_at.
+        DropCampaign.objects.filter(pk=self.public.pk).update(
+            created_at=now - timedelta(minutes=1)
+        )
         self.url = reverse("products:drop-list-create")
 
     def names(self):
