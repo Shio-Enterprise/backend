@@ -71,6 +71,15 @@ class FillNameTests(SimpleTestCase):
         self.assertEqual(fill_name("{nome}!\nFim", None), "Fim")
         self.assertEqual(fill_name("Topo\n\n{nome}\nFim", None), "Topo\n\nFim")
 
+    def test_sem_nome_leva_reticencias_e_dois_pontos(self):
+        self.assertEqual(fill_name("{nome}... veja", None), "Veja")
+        self.assertEqual(fill_name("{nome}:\nveja", None), "veja")
+        self.assertEqual(fill_name("{nome}; veja", None), "Veja")
+        self.assertEqual(fill_name("Olá,\n{nome}...", None), "Olá...")
+
+    def test_sem_nome_sozinho_apos_linha_em_branco_ajusta_a_saudacao(self):
+        self.assertEqual(fill_name("Olá,\n\n{nome}!\nTexto", None), "Olá!\n\nTexto")
+
     def test_sem_nome_preserva_quebras_de_linha_do_resto(self):
         self.assertEqual(fill_name("Olá, {nome}!\n\nTexto", None), "Olá!\n\nTexto")
 

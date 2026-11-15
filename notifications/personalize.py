@@ -18,8 +18,9 @@ EXAMPLE_NAME = "Maria"
 
 _PLACEHOLDER = r"\{\s*nome\s*\}"
 _ANY = re.compile(_PLACEHOLDER, re.IGNORECASE)
-_ALONE = re.compile(rf"^[ \t]*{_PLACEHOLDER}[ \t]*([,.!?]?)[ \t\r]*$", re.IGNORECASE)
-_LINE_START = re.compile(rf"^[ \t]*{_PLACEHOLDER}[ \t]*[,.!?]?[ \t]*", re.IGNORECASE)
+_PUNCT = r"[,.!?:;…]*"
+_ALONE = re.compile(rf"^[ \t]*{_PLACEHOLDER}[ \t]*({_PUNCT})[ \t\r]*$", re.IGNORECASE)
+_LINE_START = re.compile(rf"^[ \t]*{_PLACEHOLDER}[ \t]*{_PUNCT}[ \t]*", re.IGNORECASE)
 _INLINE = re.compile(rf"[ \t]*,?[ \t]*{_PLACEHOLDER}", re.IGNORECASE)
 
 
@@ -33,10 +34,12 @@ def _drop_placeholder(text: str) -> str:
     for line in text.split("\n"):
         alone = _ALONE.match(line)
         if alone:
-            punct = alone.group(1)
-            prev = lines[-1].rstrip() if lines else ""
-            if punct in (".", "!", "?") and prev.endswith(","):
-                lines[-1] = prev[:-1] + punct
+            # Só pontuação que fecha frase toma o lugar da vírgula de cima
+            # (pulando linhas em branco).
+            punct = alone.group(1).strip(",:;")
+            filled = [i for i, prev in enumerate(lines) if prev.strip()]
+            if punct and filled and lines[filled[-1]].rstrip().endswith(","):
+                lines[filled[-1]] = lines[filled[-1]].rstrip()[:-1] + punct
             continue
         rest = _LINE_START.sub("", line, count=1)
         if rest != line and rest:
