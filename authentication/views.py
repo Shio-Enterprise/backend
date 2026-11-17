@@ -1053,7 +1053,7 @@ class NewsletterTestView(APIView):
         subject = serializer.validated_data["subject"]
         message = serializer.validated_data["message"]
         if send_newsletter_test(request.user, subject, message):
-            return Response({"sent": True})
+            return Response({"sent": True, "to": request.user.email})
         return Response(
             {"error": "Não foi possível enviar o teste."},
             status=status.HTTP_502_BAD_GATEWAY,

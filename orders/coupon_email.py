@@ -10,6 +10,7 @@ from django.utils import timezone
 
 from notifications.email import send_email
 from notifications.marketing import build_audience
+from notifications.personalize import EXAMPLE_NAME, fill_name
 from notifications.unsubscribe import unsubscribe_url
 from orders.coupons import count_coupon_uses
 from orders.models import Coupon, CouponDiscountType, CouponEmailSend
@@ -77,8 +78,7 @@ def coupon_conditions(coupon: Coupon) -> list[str]:
 
 def _context(coupon, message, name, unsub_url) -> dict:
     return {
-        "nome": name,
-        "mensagem": message,
+        "mensagem": fill_name(message, name),
         "codigo": coupon.code,
         "condicoes": coupon_conditions(coupon),
         "loja_url": settings.FRONTEND_URL,
@@ -90,7 +90,7 @@ def render_coupon_preview(coupon: Coupon, message: str, name: str | None = None)
     context = _context(
         coupon,
         message,
-        name,
+        name or EXAMPLE_NAME,
         f"{settings.FRONTEND_URL}/descadastrar/exemplo",
     )
     context["subject"] = COUPON_EMAIL_SUBJECT
