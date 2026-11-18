@@ -60,6 +60,13 @@ def validate_password_pt(value):
         raise serializers.ValidationError(messages) from None
 
 
+def format_cpf(cpf):
+    """CPF salvo só com dígitos aparece com pontuação; legado fica como está."""
+    if cpf and re.fullmatch(r"[0-9]{11}", cpf):
+        return f"{cpf[:3]}.{cpf[3:6]}.{cpf[6:9]}-{cpf[9:]}"
+    return cpf
+
+
 class UserSerializer(serializers.ModelSerializer):
     """Serializer completo do utilizador para respostas da API."""
 
@@ -129,9 +136,7 @@ class UserSerializer(serializers.ModelSerializer):
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
-        cpf = data.get("cpf")
-        if cpf and re.fullmatch(r"[0-9]{11}", cpf):
-            data["cpf"] = f"{cpf[:3]}.{cpf[3:6]}.{cpf[6:9]}-{cpf[9:]}"
+        data["cpf"] = format_cpf(data.get("cpf"))
         data["phone_number"] = format_phone(data.get("phone_number"))
         return data
 
@@ -151,6 +156,27 @@ class UserSerializer(serializers.ModelSerializer):
                 instance.profile = profile
 
         return instance
+
+
+class CustomerAdminUpdateSerializer(UserSerializer):
+    """Edição do cliente pelo admin (#100): só nome, telefone e CPF.
+
+    E-mail (login) e senha ficam fora; as validações são as do cadastro.
+    """
+
+    name = serializers.CharField(
+        max_length=255,
+        error_messages={
+            "required": "Informe o nome.",
+            "blank": "Informe o nome.",
+            "null": "Informe o nome.",
+            "max_length": "O nome pode ter no máximo {max_length} caracteres.",
+        },
+    )
+
+    class Meta(UserSerializer.Meta):
+        fields = ["id", "email", "name", "phone_number", "cpf"]
+        read_only_fields = ["id", "email"]
 
 
 class AdminAccountSerializer(serializers.ModelSerializer):
@@ -472,9 +498,26 @@ class CustomerCRMDetailSerializer(CustomerCRMSerializer):
     """Serializer dos detalhes do cliente, incluindo histórico completo."""
 
     order_history = serializers.SerializerMethodField()
+    # Telefone e CPF para preencher a edição do cliente no admin (#100).
+    phone_number = serializers.SerializerMethodField()
+    cpf = serializers.SerializerMethodField()
 
     class Meta(CustomerCRMSerializer.Meta):
-        fields = CustomerCRMSerializer.Meta.fields + ["order_history"]
+        fields = CustomerCRMSerializer.Meta.fields + [
+            "phone_number",
+            "cpf",
+            "order_history",
+        ]
+
+    def _profile_value(self, obj, field):
+        profile = getattr(obj, "profile", None)
+        return getattr(profile, field, None) if profile else None
+
+    def get_phone_number(self, obj) -> str | None:
+        return format_phone(self._profile_value(obj, "phone_number"))
+
+    def get_cpf(self, obj) -> str | None:
+        return format_cpf(self._profile_value(obj, "cpf"))
 
     def get_order_history(self, obj) -> list:
         orders = obj.orders.select_related("payment").all().order_by("-created_at")

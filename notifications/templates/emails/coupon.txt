@@ -1,8 +1,6 @@
 {% extends "emails/base.txt" %}
 
 {% block content %}
-{% if nome %}Olá, {{ nome }}!{% else %}Olá!{% endif %}
-
 Separamos um cupom para você usar na Shio.
 {% if mensagem %}
 {{ mensagem }}

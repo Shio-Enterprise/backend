@@ -1,3 +1,4 @@
+import re
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
@@ -164,12 +165,72 @@ class NewsletterCampaignTests(TestCase):
             name="Fulano",
         )
         self.assertIn("Novidades", html)
-        self.assertIn("Olá, Fulano!", html)
+        self.assertNotIn("Olá", html)
         self.assertIn("&lt;script&gt;", html)
         self.assertNotIn("<script>", html)
         self.assertIn("<br>", html)
         self.assertIn("Cancelar inscrição", html)
         self.assertIn("/descadastrar/exemplo", html)
+
+    def test_email_comeca_pelo_texto_do_admin_sem_saudacao_fixa(self):
+        User.objects.create_user(email="ana@x.com", name="Ana Souza", password="x")
+        self._setup_audience()
+        send_newsletter_campaign(self.admin, "Assunto", "Chegou a coleção nova.")
+        for message in mail.outbox:
+            self.assertNotIn("Olá", message.body)
+            self.assertNotIn("Olá", message.alternatives[0][0])
+            self.assertIn("Chegou a coleção nova.", message.body)
+
+    def test_marcador_nome_vira_primeiro_nome_de_cada_destinatario(self):
+        User.objects.create_user(email="ana@x.com", name="Ana Souza", password="x")
+        self._setup_audience()
+        record = send_newsletter_campaign(
+            self.admin, "Assunto", "Olá, {nome}!\nChegou a coleção nova."
+        )
+        bodies = {m.to[0]: (m.body, m.alternatives[0][0]) for m in mail.outbox}
+        self.assertIn("Olá, Ana!", bodies["ana@x.com"][0])
+        self.assertIn("Olá, Ana!", bodies["ana@x.com"][1])
+        self.assertNotIn("Souza", bodies["ana@x.com"][0])
+        # bia@x.com não tem conta: sem nome, o marcador some com a vírgula.
+        self.assertIn("Olá!", bodies["bia@x.com"][0])
+        self.assertIn("Olá!", bodies["bia@x.com"][1])
+        for text, html in bodies.values():
+            self.assertNotIn("{nome}", text)
+            self.assertNotIn("{nome}", html)
+        # O histórico guarda o texto como o admin escreveu.
+        self.assertEqual(record.message, "Olá, {nome}!\nChegou a coleção nova.")
+
+    def test_email_de_teste_usa_o_nome_do_admin(self):
+        send_newsletter_test(self.admin, "Assunto", "Olá, {nome}!")
+        self.assertIn("Olá, Admin!", mail.outbox[0].body)
+
+    def test_nome_com_html_e_escapado(self):
+        User.objects.create_user(email="ana@x.com", name="<b>Ana</b>", password="x")
+        self._setup_audience()
+        send_newsletter_campaign(self.admin, "Assunto", "Olá, {nome}!")
+        html = next(m for m in mail.outbox if m.to == ["ana@x.com"]).alternatives[0][0]
+        self.assertIn("&lt;b&gt;Ana&lt;/b&gt;", html)
+        self.assertNotIn("<b>Ana", html)
+
+    def test_previa_usa_nome_de_exemplo(self):
+        html = render_newsletter_preview(subject="Oi", message="Olá, {nome}!")
+        self.assertIn("Olá, Maria!", html)
+        self.assertNotIn("{nome}", html)
+
+    def test_previa_igual_ao_email_enviado(self):
+        User.objects.create_user(email="ana@x.com", name="Ana Souza", password="x")
+        NewsletterSubscriber.objects.create(email="ana@x.com", consent_lgpd=True)
+        message = "Olá, {nome}!\nChegou a coleção nova."
+        send_newsletter_campaign(self.admin, "Coleção", message)
+        sent = mail.outbox[0].alternatives[0][0]
+        preview = render_newsletter_preview("Coleção", message, name="Ana Souza")
+
+        def sem_link_de_descadastro(html):
+            return re.sub(r"/descadastrar/[^\"]+", "/descadastrar/X", html)
+
+        self.assertEqual(
+            sem_link_de_descadastro(preview), sem_link_de_descadastro(sent)
+        )
 
 
 class NewsletterSendStateTests(TestCase):
