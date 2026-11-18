@@ -37,7 +37,6 @@ class DashboardRecentOrderSerializer(serializers.ModelSerializer):
         read_only=True, allow_null=True, default=None
     )
     revenue_value = serializers.SerializerMethodField()
-    last_recovery_email_sent_at = serializers.SerializerMethodField()
 
     class Meta:
         model = CustomerOrder
@@ -52,7 +51,6 @@ class DashboardRecentOrderSerializer(serializers.ModelSerializer):
             "paid_at",
             "created_at",
             "revenue_value",
-            "last_recovery_email_sent_at",
         ]
 
     def get_customer_name(self, obj) -> str:
@@ -63,9 +61,21 @@ class DashboardRecentOrderSerializer(serializers.ModelSerializer):
 
         return f"{revenue_value(obj):.2f}"
 
-    def get_last_recovery_email_sent_at(self, obj):
-        sends = list(obj.recovery_email_sends.all())
-        return sends[0].sent_at if sends else None
+
+class AdminOrderListSerializer(DashboardRecentOrderSerializer):
+    """Lista administrativa de pedidos com campos internos de recuperação."""
+
+    last_recovery_email_sent_at = serializers.DateTimeField(
+        read_only=True, allow_null=True, default=None
+    )
+    email_unsubscribed = serializers.BooleanField(read_only=True, default=False)
+
+    class Meta(DashboardRecentOrderSerializer.Meta):
+        fields = [
+            *DashboardRecentOrderSerializer.Meta.fields,
+            "last_recovery_email_sent_at",
+            "email_unsubscribed",
+        ]
 
 
 class DashboardLowStockSerializer(serializers.ModelSerializer):
@@ -617,16 +627,23 @@ class OrderDetailSerializer(_BaseOrderDetailSerializer):
     """Detalhe administrativo do pedido."""
 
     recovery_email_sends = serializers.SerializerMethodField()
+    email_unsubscribed = serializers.SerializerMethodField()
 
     @extend_schema_field(OrderRecoveryEmailSendSerializer(many=True))
     def get_recovery_email_sends(self, obj):
         sends = obj.recovery_email_sends.select_related("sent_by").all()
         return OrderRecoveryEmailSendSerializer(sends, many=True).data
 
+    def get_email_unsubscribed(self, obj) -> bool:
+        from .order_email import is_customer_unsubscribed
+
+        return is_customer_unsubscribed(getattr(obj.user, "email", None))
+
     class Meta(_BaseOrderDetailSerializer.Meta):
         fields = [
             *_BaseOrderDetailSerializer.Meta.fields,
             "recovery_email_sends",
+            "email_unsubscribed",
         ]
 
 
@@ -1022,4 +1039,7 @@ class OrderRecoveryEmailMessageSerializer(serializers.Serializer):
         allow_blank=True,
         default="",
         trim_whitespace=True,
+        error_messages={
+            "max_length": "A mensagem deve ter no máximo 500 caracteres.",
+        },
     )

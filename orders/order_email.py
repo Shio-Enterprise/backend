@@ -18,12 +18,11 @@ MAX_MESSAGE_LENGTH = 500
 
 SUGGESTED_MESSAGES = {
     OrderStatus.AWAITING_PAYMENT: (
-        "Notamos que o pagamento do seu pedido ainda está pendente. "
-        "Se precisar de ajuda para concluir a compra, estamos à disposição!"
+        "Caso queira concluir a compra ou precise de ajuda, estamos à disposição!"
     ),
     OrderStatus.CANCELED: (
-        "Vimos que o seu pedido foi cancelado. "
-        "Os itens que você escolheu continuam esperando por você na nossa loja!"
+        "Se ainda tiver interesse, confira a disponibilidade dos itens na nossa loja "
+        "ou fale com a gente!"
     ),
 }
 
@@ -53,13 +52,21 @@ def is_customer_unsubscribed(email: str | None) -> bool:
     ).exists()
 
 
-def order_send_block_reason(order: CustomerOrder) -> str | None:
-    """Motivo de bloqueio para envio de recuperação do pedido, ou None."""
+def order_status_block_reason(order: CustomerOrder) -> str | None:
+    """Motivo de bloqueio pelo status do pedido, ou None."""
     if order.status not in RECOVERY_ALLOWED_STATUSES:
         return (
             "Só é possível enviar e-mail para pedidos aguardando pagamento "
             "ou cancelados."
         )
+    return None
+
+
+def order_send_block_reason(order: CustomerOrder) -> str | None:
+    """Motivo de bloqueio para envio de recuperação do pedido, ou None."""
+    status_reason = order_status_block_reason(order)
+    if status_reason:
+        return status_reason
     customer_email = getattr(order.user, "email", None)
     if not customer_email:
         return "Cliente sem e-mail cadastrado."
@@ -73,7 +80,7 @@ def _intro_text(order: CustomerOrder) -> str:
     if order.status == OrderStatus.AWAITING_PAYMENT:
         return f"Seu pedido {code} está aguardando pagamento na Shio."
     if order.status == OrderStatus.CANCELED:
-        return f"Notamos que o seu pedido {code} foi cancelado na Shio."
+        return f"Seu pedido {code} foi cancelado na Shio."
     return f"Sobre o seu pedido {code} na Shio."
 
 

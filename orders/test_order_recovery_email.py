@@ -4,7 +4,9 @@ from unittest.mock import patch
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
 from django.core import mail
+from django.db import connection
 from django.test import TestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework import status
@@ -275,6 +277,7 @@ class OrderRecoveryEmailApiTests(APITestCase):
             if str(row["id"]) == str(self.awaiting_order.id)
         )
         self.assertIsNotNone(item["last_recovery_email_sent_at"])
+        self.assertFalse(item["email_unsubscribed"])
 
         detail_resp = self.client.get(
             reverse("orders:admin_orders_detail", args=[self.awaiting_order.id])
@@ -285,13 +288,84 @@ class OrderRecoveryEmailApiTests(APITestCase):
             detail_resp.data["recovery_email_sends"][0]["sent_by_name"],
             "Admin Pedidos",
         )
+        self.assertFalse(detail_resp.data["email_unsubscribed"])
 
         self.client.force_authenticate(user=self.customer)
+        customer_list = self.client.get(reverse("orders:user_orders_list"))
+        self.assertEqual(customer_list.status_code, status.HTTP_200_OK)
+        for row in customer_list.data:
+            self.assertNotIn("last_recovery_email_sent_at", row)
+            self.assertNotIn("email_unsubscribed", row)
+
         customer_resp = self.client.get(
             reverse("orders:user_orders_detail", args=[self.awaiting_order.id])
         )
         self.assertEqual(customer_resp.status_code, status.HTTP_200_OK)
         self.assertNotIn("recovery_email_sends", customer_resp.data)
+        self.assertNotIn("email_unsubscribed", customer_resp.data)
+
+    def test_listagens_nao_fazem_n_mais_1_por_pedido(self):
+        # Aquece o cache de permissões no objeto de usuário antes de contar queries.
+        self.client.force_authenticate(user=self.admin)
+        self.client.get(reverse("orders:admin_orders_list"))
+
+        self.client.force_authenticate(user=self.customer)
+        with CaptureQueriesContext(connection) as base_ctx:
+            resp_initial = self.client.get(reverse("orders:user_orders_list"))
+        self.assertEqual(resp_initial.status_code, status.HTTP_200_OK)
+
+        self.client.force_authenticate(user=self.admin)
+        with CaptureQueriesContext(connection) as admin_base_ctx:
+            admin_initial = self.client.get(reverse("orders:admin_orders_list"))
+        self.assertEqual(admin_initial.status_code, status.HTTP_200_OK)
+
+        for i in range(4):
+            extra = make_order(self.customer, OrderStatus.AWAITING_PAYMENT)
+            OrderRecoveryEmailSend.objects.create(
+                order=extra, sent_by=self.admin, message=f"Msg {i}"
+            )
+
+        self.client.force_authenticate(user=self.customer)
+        with CaptureQueriesContext(connection) as more_ctx:
+            resp_more = self.client.get(reverse("orders:user_orders_list"))
+        self.assertEqual(resp_more.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(more_ctx), len(base_ctx))
+
+        self.client.force_authenticate(user=self.admin)
+        with CaptureQueriesContext(connection) as admin_more_ctx:
+            admin_more = self.client.get(reverse("orders:admin_orders_list"))
+        self.assertEqual(admin_more.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(admin_more_ctx), len(admin_base_ctx))
+
+    def test_admin_lista_e_detalhe_sinalizam_cliente_descadastrado(self):
+        NewsletterSubscriber.objects.create(
+            email="cliente@example.com",
+            consent_lgpd=True,
+            unsubscribed_at=timezone.now(),
+        )
+        list_resp = self.client.get(reverse("orders:admin_orders_list"))
+        item = next(
+            row
+            for row in list_resp.data
+            if str(row["id"]) == str(self.awaiting_order.id)
+        )
+        self.assertTrue(item["email_unsubscribed"])
+
+        detail_resp = self.client.get(
+            reverse("orders:admin_orders_detail", args=[self.awaiting_order.id])
+        )
+        self.assertTrue(detail_resp.data["email_unsubscribed"])
+
+    def test_teste_recusa_status_nao_permitido(self):
+        paid_order = make_order(self.customer, OrderStatus.PAID)
+        resp = self.client.post(
+            self.url("admin-order-email-test", paid_order),
+            {"message": "Teste"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("error", resp.data)
+        self.assertEqual(len(mail.outbox), 0)
 
     def test_preview_e_teste_e_falha_502(self):
         preview = self.client.post(
@@ -336,6 +410,10 @@ class OrderRecoveryEmailApiTests(APITestCase):
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            str(response.data["message"][0]),
+            "A mensagem deve ter no máximo 500 caracteres.",
+        )
 
     def test_exige_permissao_manage_orders(self):
         self.client.force_authenticate(user=None)

@@ -6,9 +6,20 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import DatabaseError, transaction
-from django.db.models import Count, DecimalField, ExpressionWrapper, F, Q, Sum
+from django.db.models import (
+    Count,
+    DecimalField,
+    Exists,
+    ExpressionWrapper,
+    F,
+    OuterRef,
+    Q,
+    Subquery,
+    Sum,
+)
 from django.db.models.functions import TruncDay, TruncMonth
 from django.http import Http404, HttpResponseRedirect
+from django.shortcuts import get_object_or_404
 from django.utils.decorators import method_decorator
 from drf_spectacular.utils import (
     OpenApiParameter,
@@ -24,6 +35,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from authentication.models import NewsletterSubscriber
 from authentication.permissions import (
     CanAccessAdminDashboard,
     CanManageOrders,
@@ -77,6 +89,7 @@ from .models import (
     Coupon,
     CustomerOrder,
     ExchangeStatus,
+    OrderRecoveryEmailSend,
     OrderStatus,
     PaymentMethod,
     PaymentStatus,
@@ -85,6 +98,7 @@ from .models import (
 from .order_email import (
     is_customer_unsubscribed,
     order_send_block_reason,
+    order_status_block_reason,
     render_order_email_preview,
     send_order_email_test,
     send_order_recovery_email,
@@ -98,6 +112,7 @@ from .refunds import (
     with_refund_status,
 )
 from .serializers import (
+    AdminOrderListSerializer,
     CartItemAddSerializer,
     CartItemUpdateSerializer,
     CartRepresentationSerializer,
@@ -119,6 +134,7 @@ from .serializers import (
     ExchangeRequestSerializer,
     OrderDetailSerializer,
     OrderRecoveryEmailMessageSerializer,
+    OrderRecoveryEmailSendSerializer,
     OrderStatusUpdateSerializer,
     PaymentReturnSerializer,
     PaymentWebhookSerializer,
@@ -629,16 +645,28 @@ class AdminOrderListView(APIView):
                 location=OpenApiParameter.QUERY,
             ),
         ],
-        responses={200: DashboardRecentOrderSerializer(many=True)},
+        responses={200: AdminOrderListSerializer(many=True)},
     )
     def get(self, request):
         status_q = request.query_params.get("status")
         refund_status_q = request.query_params.get("refund_status")
         exchange_status_q = request.query_params.get("exchange_status")
+        latest_recovery_send = OrderRecoveryEmailSend.objects.filter(
+            order=OuterRef("pk")
+        ).order_by("-sent_at")
+        unsubscribed_emails = NewsletterSubscriber.objects.filter(
+            email__iexact=OuterRef("user__email"),
+            unsubscribed_at__isnull=False,
+        )
         qs = with_exchange_status(
             with_refund_status(
                 CustomerOrder.objects.select_related("user", "payment")
-                .prefetch_related("recovery_email_sends")
+                .annotate(
+                    last_recovery_email_sent_at=Subquery(
+                        latest_recovery_send.values("sent_at")[:1]
+                    ),
+                    email_unsubscribed=Exists(unsubscribed_emails),
+                )
                 .order_by("-created_at")
             )
         )
@@ -655,7 +683,7 @@ class AdminOrderListView(APIView):
                 raise ValidationError({"exchange_status": "Status de troca inválido."})
             qs = qs.filter(exchange_status=exchange_status_q)
 
-        data = DashboardRecentOrderSerializer(qs, many=True).data
+        data = AdminOrderListSerializer(qs, many=True).data
         return Response(data, status=status.HTTP_200_OK)
 
 
@@ -1980,8 +2008,6 @@ class _OrderRecoveryEmailBaseView(APIView):
     permission_classes = [CanManageOrders]
 
     def get_order(self, order_id):
-        from django.shortcuts import get_object_or_404
-
         return get_object_or_404(
             CustomerOrder.objects.select_related("user").prefetch_related("items"),
             id=order_id,
@@ -1998,17 +2024,9 @@ class OrderRecoveryEmailSummaryView(_OrderRecoveryEmailBaseView):
     def get(self, request, order_id):
         order = self.get_order(order_id)
         customer_email = getattr(order.user, "email", None)
-        history = [
-            {
-                "id": str(send.id),
-                "sent_at": send.sent_at,
-                "sent_by_name": (
-                    (send.sent_by.name or send.sent_by.email) if send.sent_by else None
-                ),
-                "message": send.message,
-            }
-            for send in order.recovery_email_sends.select_related("sent_by")
-        ]
+        history = OrderRecoveryEmailSendSerializer(
+            order.recovery_email_sends.select_related("sent_by"), many=True
+        ).data
         return Response(
             {
                 "block_reason": order_send_block_reason(order),
@@ -2037,6 +2055,9 @@ class OrderRecoveryEmailTestView(_OrderRecoveryEmailBaseView):
     def post(self, request, order_id):
         order = self.get_order(order_id)
         message = self.get_message(request)
+        reason = order_status_block_reason(order)
+        if reason:
+            return Response({"error": reason}, status=status.HTTP_400_BAD_REQUEST)
         if send_order_email_test(order, request.user, message):
             return Response({"sent": True})
         return Response(
@@ -2061,13 +2082,7 @@ class OrderRecoveryEmailSendView(_OrderRecoveryEmailBaseView):
             )
         return Response(
             {
-                "id": str(record.id),
-                "sent_at": record.sent_at,
-                "sent_by_name": (
-                    (record.sent_by.name or record.sent_by.email)
-                    if record.sent_by
-                    else None
-                ),
+                **OrderRecoveryEmailSendSerializer(record).data,
                 "recipient_email": order.user.email,
             },
             status=status.HTTP_201_CREATED,
