@@ -1,9 +1,10 @@
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import generics, serializers, status
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -12,10 +13,30 @@ from authentication.permissions import IsStaffOrSuperUser
 
 from .models import SiteEvent
 from .periods import ANUAL, MENSAL, PERIODS, resolve_period
-from .serializers import SiteEventCreateSerializer
-from .services import build_overview, link_anonymous_events
+from .serializers import (
+    ANONYMOUS_ID_REQUIRED,
+    AnalyticsConsentCreateSerializer,
+    SiteEventCreateSerializer,
+)
+from .services import (
+    build_overview,
+    current_consent,
+    has_analytics_consent,
+    link_anonymous_events,
+    record_analytics_consent,
+)
 
 User = get_user_model()
+
+CONSENT_REQUIRED_MESSAGE = "Registro de navegação não autorizado pelo visitante."
+
+
+def _require_consent(user, anonymous_id):
+    if settings.ANALYTICS_CONSENT_ENFORCED and not has_analytics_consent(
+        user, anonymous_id
+    ):
+        raise PermissionDenied(CONSENT_REQUIRED_MESSAGE)
+
 
 PERIOD_PARAMETER = OpenApiParameter(
     name="period",
@@ -45,12 +66,15 @@ class SiteEventCreateView(APIView):
         description=(
             "Registra um evento de navegação (visualização de página, de produto, "
             "carrinho e checkout). Não exige login. Visitantes sem login devem enviar "
-            "`anonymous_id`. Usuários autenticados têm o evento associado à conta."
+            "`anonymous_id`. Usuários autenticados têm o evento associado à conta. "
+            "Com `ANALYTICS_CONSENT_ENFORCED` ativo, exige aceite registrado na "
+            "versão vigente do banner."
         ),
         request=SiteEventCreateSerializer,
         responses={
             201: OpenApiResponse(description="Evento registrado."),
             400: OpenApiResponse(description="Dados inválidos."),
+            403: OpenApiResponse(description="Sem consentimento de navegação."),
         },
     )
     def post(self, request):
@@ -59,6 +83,7 @@ class SiteEventCreateView(APIView):
         )
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+        _require_consent(request.user, data.get("anonymous_id"))
         SiteEvent.objects.create(
             event_type=data["event_type"],
             user=request.user if request.user.is_authenticated else None,
@@ -84,23 +109,96 @@ class LinkAnonymousEventsView(APIView):
         summary="Vincular eventos anônimos à conta",
         description=(
             "Chamado logo após o login. Associa à conta autenticada os eventos que foram "
-            "registrados antes do login com o mesmo `anonymous_id`. Só deve ser chamado "
-            "quando o visitante consentiu com o registro de navegação."
+            "registrados antes do login com o mesmo `anonymous_id`, junto com o "
+            "histórico de consentimento desse navegador. Só deve ser chamado quando o "
+            "visitante consentiu com o registro de navegação; com "
+            "`ANALYTICS_CONSENT_ENFORCED` ativo, o aceite é conferido aqui."
         ),
         request=LinkAnonymousEventsSerializer,
         responses={
             200: OpenApiResponse(description="Quantidade de eventos vinculados."),
             400: OpenApiResponse(description="Identificador inválido."),
             401: OpenApiResponse(description="Login necessário."),
+            403: OpenApiResponse(description="Sem consentimento de navegação."),
         },
     )
     def post(self, request):
         serializer = LinkAnonymousEventsSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        linked = link_anonymous_events(
-            request.user, serializer.validated_data["anonymous_id"]
-        )
+        anonymous_id = serializer.validated_data["anonymous_id"]
+        _require_consent(request.user, anonymous_id)
+        linked = link_anonymous_events(request.user, anonymous_id)
         return Response({"linked": linked})
+
+
+ANONYMOUS_ID_PARAMETER = OpenApiParameter(
+    name="anonymous_id",
+    description="Identificador anônimo do navegador. Obrigatório para visitantes sem login.",
+    required=False,
+    type=str,
+)
+
+
+def _consent_payload(consent):
+    return {
+        "choice": consent.choice if consent else None,
+        "version": consent.version if consent else None,
+        "current_version": settings.ANALYTICS_CONSENT_VERSION,
+        "created_at": consent.created_at.isoformat() if consent else None,
+    }
+
+
+class AnalyticsConsentView(APIView):
+    """Consulta e registra a escolha do banner de privacidade (navegação)."""
+
+    permission_classes = [AllowAny]
+
+    @extend_schema(
+        tags=["Analytics"],
+        summary="Consultar consentimento de navegação",
+        description=(
+            "Retorna a escolha mais recente da conta autenticada ou, para visitantes, "
+            "do `anonymous_id` informado. `choice` é `null` quando não há escolha "
+            "registrada. Se `version` for diferente de `current_version`, o banner "
+            "deve ser exibido de novo."
+        ),
+        parameters=[ANONYMOUS_ID_PARAMETER],
+        responses={
+            200: OpenApiResponse(description="Escolha vigente."),
+            400: OpenApiResponse(description="Identificador anônimo ausente."),
+        },
+    )
+    def get(self, request):
+        anonymous_id = request.query_params.get("anonymous_id", "").strip()
+        if not request.user.is_authenticated and not anonymous_id:
+            raise ValidationError(ANONYMOUS_ID_REQUIRED)
+        consent = current_consent(request.user, anonymous_id or None)
+        return Response(_consent_payload(consent))
+
+    @extend_schema(
+        tags=["Analytics"],
+        summary="Registrar consentimento de navegação",
+        description=(
+            "Registra `granted` (aceito) ou `denied` (recusado) na versão vigente do "
+            "banner, mantendo o histórico. Ao recusar, os eventos já gravados da conta "
+            "e deste navegador são anonimizados."
+        ),
+        request=AnalyticsConsentCreateSerializer,
+        responses={
+            201: OpenApiResponse(description="Escolha registrada."),
+            400: OpenApiResponse(description="Dados inválidos."),
+        },
+    )
+    def post(self, request):
+        serializer = AnalyticsConsentCreateSerializer(
+            data=request.data, context={"request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        consent = record_analytics_consent(
+            data["choice"], request.user, data.get("anonymous_id") or None
+        )
+        return Response(_consent_payload(consent), status=status.HTTP_201_CREATED)
 
 
 class SiteEventOverviewView(APIView):

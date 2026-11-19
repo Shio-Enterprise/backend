@@ -270,6 +270,13 @@ CORREIOS_REMETENTE_BAIRRO = config("CORREIOS_REMETENTE_BAIRRO", default="")
 CORREIOS_REMETENTE_CIDADE = config("CORREIOS_REMETENTE_CIDADE", default="")
 CORREIOS_REMETENTE_UF = config("CORREIOS_REMETENTE_UF", default="")
 
+# Consentimento de navegação (analytics): liga a verificação nos eventos e define a
+# versão vigente do texto do banner.
+ANALYTICS_CONSENT_ENFORCED = config(
+    "ANALYTICS_CONSENT_ENFORCED", default=False, cast=bool
+)
+ANALYTICS_CONSENT_VERSION = config("ANALYTICS_CONSENT_VERSION", default="1")
+
 # E-mail — Resend via django-anymail (API HTTPS; Railway Hobby bloqueia SMTP).
 # Sem RESEND_API_KEY, os e-mails vão para o console/log e nada é enviado.
 RESEND_API_KEY = config("RESEND_API_KEY", default="").strip()
