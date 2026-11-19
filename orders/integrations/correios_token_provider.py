@@ -1,6 +1,8 @@
 import threading
 import time
 
+_EMPTY = (None, 0.0)
+
 
 class CorreiosTokenProvider:
     """Guarda o token dos Correios na memória do processo até ele expirar."""
@@ -8,13 +10,14 @@ class CorreiosTokenProvider:
     def __init__(self, token_loader, clock=time.monotonic):
         self.token_loader = token_loader
         self.clock = clock
-        self._token = None
-        self._expires_at = 0.0
+        # Token e validade numa tupla só: leitura sem lock nunca vê par misturado.
+        self._state = _EMPTY
         self._refresh_lock = threading.Lock()
 
     def _current_token(self):
-        if self._token and self.clock() < self._expires_at:
-            return self._token
+        token, expires_at = self._state
+        if token and self.clock() < expires_at:
+            return token
         return None
 
     def get_token(self):
@@ -34,19 +37,13 @@ class CorreiosTokenProvider:
 
     def _load_token(self):
         token, ttl = self.token_loader()
-        if ttl > 0:
-            self._token = token
-            self._expires_at = self.clock() + ttl
-        else:
-            self._token = None
-            self._expires_at = 0.0
+        self._state = (token, self.clock() + ttl) if ttl > 0 else _EMPTY
         return token
 
     def invalidate_if_current(self, rejected_token):
         with self._refresh_lock:
-            if self._token != rejected_token:
+            if self._state[0] != rejected_token:
                 return False
             # Só apaga se ainda for o token recusado: um token novo fica.
-            self._token = None
-            self._expires_at = 0.0
+            self._state = _EMPTY
             return True
