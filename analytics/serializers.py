@@ -2,7 +2,11 @@ from rest_framework import serializers
 
 from products.models import Product, ProductVariation
 
-from .models import SiteEventType
+from .models import AnalyticsConsentChoice, SiteEventType
+
+ANONYMOUS_ID_REQUIRED = {
+    "anonymous_id": "Informe o identificador anônimo para visitantes não autenticados."
+}
 
 
 class SiteEventCreateSerializer(serializers.Serializer):
@@ -21,9 +25,18 @@ class SiteEventCreateSerializer(serializers.Serializer):
     def validate(self, attrs):
         request = self.context["request"]
         if not request.user.is_authenticated and not attrs.get("anonymous_id"):
-            raise serializers.ValidationError(
-                {
-                    "anonymous_id": "Informe o identificador anônimo para visitantes não autenticados."
-                }
-            )
+            raise serializers.ValidationError(ANONYMOUS_ID_REQUIRED)
+        return attrs
+
+
+class AnalyticsConsentCreateSerializer(serializers.Serializer):
+    choice = serializers.ChoiceField(choices=AnalyticsConsentChoice.choices)
+    anonymous_id = serializers.CharField(
+        max_length=64, required=False, allow_blank=True, allow_null=True
+    )
+
+    def validate(self, attrs):
+        request = self.context["request"]
+        if not request.user.is_authenticated and not attrs.get("anonymous_id"):
+            raise serializers.ValidationError(ANONYMOUS_ID_REQUIRED)
         return attrs

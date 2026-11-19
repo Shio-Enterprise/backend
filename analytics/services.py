@@ -1,10 +1,12 @@
 from datetime import timedelta
 
+from django.conf import settings
+from django.db import transaction
 from django.db.models import Count, Q
 from django.db.models.functions import TruncDay, TruncMonth
 from django.utils import timezone
 
-from .models import SiteEvent, SiteEventType
+from .models import AnalyticsConsent, AnalyticsConsentChoice, SiteEvent, SiteEventType
 from .periods import BUSINESS_TIMEZONE, resolve_period
 
 TOP_PRODUCTS_LIMIT = 5
@@ -15,9 +17,60 @@ ADMIN_PATH_FILTER = Q(path="/admin") | Q(path__startswith="/admin/")
 
 def link_anonymous_events(user, anonymous_id):
     """Vincula os eventos anônimos deste identificador à conta que acabou de fazer login."""
+    AnalyticsConsent.objects.filter(
+        anonymous_id=anonymous_id, user__isnull=True
+    ).update(user=user)
     return SiteEvent.objects.filter(
         anonymous_id=anonymous_id, user__isnull=True
     ).update(user=user)
+
+
+def _owner_filter(user, anonymous_id):
+    """Registros da conta ou, se ainda não vinculados a ninguém, deste navegador."""
+    owner = Q(pk__in=[])
+    if user is not None and user.is_authenticated:
+        owner |= Q(user=user)
+    if anonymous_id:
+        owner |= Q(anonymous_id=anonymous_id, user__isnull=True)
+    return owner
+
+
+def current_consent(user=None, anonymous_id=None):
+    return (
+        AnalyticsConsent.objects.filter(_owner_filter(user, anonymous_id))
+        .order_by("-created_at")
+        .first()
+    )
+
+
+def has_analytics_consent(user=None, anonymous_id=None):
+    """Indica se a escolha vigente é um aceite na versão atual do banner."""
+    consent = current_consent(user, anonymous_id)
+    return (
+        consent is not None
+        and consent.choice == AnalyticsConsentChoice.GRANTED
+        and consent.version == settings.ANALYTICS_CONSENT_VERSION
+    )
+
+
+def anonymize_site_events(user=None, anonymous_id=None):
+    return SiteEvent.objects.filter(_owner_filter(user, anonymous_id)).update(
+        user=None, anonymous_id=None
+    )
+
+
+@transaction.atomic
+def record_analytics_consent(choice, user=None, anonymous_id=None):
+    """Registra a escolha; ao recusar, a navegação já gravada deixa de identificar a pessoa."""
+    consent = AnalyticsConsent.objects.create(
+        user=user if user is not None and user.is_authenticated else None,
+        anonymous_id=anonymous_id or None,
+        choice=choice,
+        version=settings.ANALYTICS_CONSENT_VERSION,
+    )
+    if choice == AnalyticsConsentChoice.DENIED:
+        anonymize_site_events(user, anonymous_id)
+    return consent
 
 
 def _buckets(start, group_by):
