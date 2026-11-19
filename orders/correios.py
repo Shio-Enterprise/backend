@@ -6,7 +6,6 @@ from datetime import datetime
 import requests
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
-from redis.exceptions import RedisError
 
 from . import correios_mock
 from .integrations.correios_client import CorreiosClient
@@ -14,7 +13,6 @@ from .integrations.correios_token_provider import CorreiosTokenProvider
 
 logger = logging.getLogger(__name__)
 
-CORREIOS_TOKEN_CACHE_KEY = "correios_access_token"
 correios_client = CorreiosClient(transport=requests)
 
 
@@ -87,17 +85,11 @@ correios_token_provider = CorreiosTokenProvider(_load_new_correios_access_token)
 
 
 def request_new_correios_access_token() -> str:
-    try:
-        return correios_token_provider.refresh_token()
-    except RedisError as exc:
-        raise CorreiosAuthenticationError("Cache dos Correios indisponível.") from exc
+    return correios_token_provider.refresh_token()
 
 
 def get_valid_correios_access_token() -> str:
-    try:
-        return correios_token_provider.get_token()
-    except RedisError as exc:
-        raise CorreiosAuthenticationError("Cache dos Correios indisponível.") from exc
+    return correios_token_provider.get_token()
 
 
 def _authenticated_request(method: str, path: str, **kwargs):

@@ -2,7 +2,8 @@ import re
 
 from django.contrib.auth import authenticate
 from django.contrib.auth.password_validation import validate_password
-from django.db import transaction
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import IntegrityError, transaction
 from rest_framework import serializers
 
 from notifications.marketing import opt_in
@@ -15,12 +16,55 @@ from .models import Address, NewsletterSend, User, UserProfile
 from .phone import format_phone, normalize_phone
 
 CPF_IN_USE_MESSAGE = "Este CPF já está cadastrado em outra conta."
+EMAIL_IN_USE_MESSAGE = "Este e-mail já está em uso."
 EMPTY_ADMIN_PERMISSIONS_MESSAGE = (
     "Selecione ao menos uma permissão para a conta administrativa."
 )
 ALREADY_ADMIN_MESSAGE = "Este e-mail já pertence a um administrador."
 SUPERUSER_LOCKED_MESSAGE = "Superusuários não podem ser alterados pelo painel."
 INACTIVE_ACCOUNT_MESSAGE = "Esta conta está desativada e não pode virar administradora."
+
+EMAIL_ERROR_MESSAGES = {
+    "required": "Informe o e-mail.",
+    "blank": "Informe o e-mail.",
+    "null": "Informe o e-mail.",
+    "invalid": "Informe um e-mail válido, como nome@exemplo.com.",
+    "max_length": "O e-mail pode ter no máximo {max_length} caracteres.",
+}
+PASSWORD_REQUIRED_MESSAGES = {
+    "required": "Informe a senha.",
+    "blank": "Informe a senha.",
+    "null": "Informe a senha.",
+}
+# Mensagens dos validadores de senha do Django, pelo código do erro (#96).
+PASSWORD_VALIDATOR_MESSAGES = {
+    "password_too_short": "A senha precisa ter pelo menos {min_length} caracteres.",
+    "password_too_common": "Essa senha é muito comum.",
+    "password_entirely_numeric": "A senha não pode ter só números.",
+    "password_too_similar": "A senha está muito parecida com seus dados.",
+}
+
+
+def validate_password_pt(value):
+    """`validate_password` com as mensagens em português, uma por motivo."""
+    try:
+        validate_password(value)
+    except DjangoValidationError as exc:
+        messages = []
+        for error in exc.error_list:
+            template = PASSWORD_VALIDATOR_MESSAGES.get(error.code)
+            if template is None:
+                messages.extend(error.messages)
+            else:
+                messages.append(template.format(**(error.params or {})))
+        raise serializers.ValidationError(messages) from None
+
+
+def format_cpf(cpf):
+    """CPF salvo só com dígitos aparece com pontuação; legado fica como está."""
+    if cpf and re.fullmatch(r"[0-9]{11}", cpf):
+        return f"{cpf[:3]}.{cpf[3:6]}.{cpf[6:9]}-{cpf[9:]}"
+    return cpf
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -92,9 +136,7 @@ class UserSerializer(serializers.ModelSerializer):
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
-        cpf = data.get("cpf")
-        if cpf and re.fullmatch(r"[0-9]{11}", cpf):
-            data["cpf"] = f"{cpf[:3]}.{cpf[3:6]}.{cpf[6:9]}-{cpf[9:]}"
+        data["cpf"] = format_cpf(data.get("cpf"))
         data["phone_number"] = format_phone(data.get("phone_number"))
         return data
 
@@ -114,6 +156,27 @@ class UserSerializer(serializers.ModelSerializer):
                 instance.profile = profile
 
         return instance
+
+
+class CustomerAdminUpdateSerializer(UserSerializer):
+    """Edição do cliente pelo admin (#100): só nome, telefone e CPF.
+
+    E-mail (login) e senha ficam fora; as validações são as do cadastro.
+    """
+
+    name = serializers.CharField(
+        max_length=255,
+        error_messages={
+            "required": "Informe o nome.",
+            "blank": "Informe o nome.",
+            "null": "Informe o nome.",
+            "max_length": "O nome pode ter no máximo {max_length} caracteres.",
+        },
+    )
+
+    class Meta(UserSerializer.Meta):
+        fields = ["id", "email", "name", "phone_number", "cpf"]
+        read_only_fields = ["id", "email"]
 
 
 class AdminAccountSerializer(serializers.ModelSerializer):
@@ -273,10 +336,25 @@ class PasswordLoginSerializer(serializers.Serializer):
 
 
 class RegisterSerializer(serializers.ModelSerializer):
+    # Declarado à mão para trocar o UniqueValidator do modelo, que compara o
+    # e-mail exatamente igual, por uma busca que ignora maiúsculas (#97).
+    email = serializers.EmailField(max_length=254, error_messages=EMAIL_ERROR_MESSAGES)
     password = serializers.CharField(
-        write_only=True, required=True, validators=[validate_password]
+        write_only=True,
+        required=True,
+        validators=[validate_password_pt],
+        error_messages=PASSWORD_REQUIRED_MESSAGES,
     )
-    name = serializers.CharField(required=True)
+    name = serializers.CharField(
+        required=True,
+        max_length=255,
+        error_messages={
+            "required": "Informe o nome.",
+            "blank": "Informe o nome.",
+            "null": "Informe o nome.",
+            "max_length": "O nome pode ter no máximo {max_length} caracteres.",
+        },
+    )
     marketing_opt_in = serializers.BooleanField(
         required=False, default=False, write_only=True
     )
@@ -285,14 +363,27 @@ class RegisterSerializer(serializers.ModelSerializer):
         model = User
         fields = ["email", "name", "password", "marketing_opt_in"]
 
+    def validate_email(self, value):
+        email = normalize_email(value)
+        if User.objects.filter(email__iexact=email).exists():
+            raise serializers.ValidationError(EMAIL_IN_USE_MESSAGE, code="unique")
+        return email
+
     def create(self, validated_data):
         marketing_opt_in = validated_data.pop("marketing_opt_in", False)
-        user = User.objects.create_user(
-            email=validated_data["email"],
-            name=validated_data["name"],
-            password=validated_data["password"],
-            is_new_user=True,
-        )
+        try:
+            with transaction.atomic():
+                user = User.objects.create_user(
+                    email=validated_data["email"],
+                    name=validated_data["name"],
+                    password=validated_data["password"],
+                    is_new_user=True,
+                )
+        except IntegrityError:
+            # Outra requisição criou a mesma conta depois da validação.
+            raise serializers.ValidationError(
+                {"email": [EMAIL_IN_USE_MESSAGE]}, code="unique"
+            ) from None
         if marketing_opt_in:
             opt_in(user.email)
         return user
@@ -407,9 +498,26 @@ class CustomerCRMDetailSerializer(CustomerCRMSerializer):
     """Serializer dos detalhes do cliente, incluindo histórico completo."""
 
     order_history = serializers.SerializerMethodField()
+    # Telefone e CPF para preencher a edição do cliente no admin (#100).
+    phone_number = serializers.SerializerMethodField()
+    cpf = serializers.SerializerMethodField()
 
     class Meta(CustomerCRMSerializer.Meta):
-        fields = CustomerCRMSerializer.Meta.fields + ["order_history"]
+        fields = CustomerCRMSerializer.Meta.fields + [
+            "phone_number",
+            "cpf",
+            "order_history",
+        ]
+
+    def _profile_value(self, obj, field):
+        profile = getattr(obj, "profile", None)
+        return getattr(profile, field, None) if profile else None
+
+    def get_phone_number(self, obj) -> str | None:
+        return format_phone(self._profile_value(obj, "phone_number"))
+
+    def get_cpf(self, obj) -> str | None:
+        return format_cpf(self._profile_value(obj, "cpf"))
 
     def get_order_history(self, obj) -> list:
         orders = obj.orders.select_related("payment").all().order_by("-created_at")
@@ -434,12 +542,18 @@ class NewsletterSubscribeSerializer(serializers.Serializer):
 class PasswordResetRequestSerializer(serializers.Serializer):
     email = serializers.EmailField(required=True)
 
+    def validate_email(self, value):
+        return normalize_email(value)
+
 
 class PasswordResetConfirmSerializer(serializers.Serializer):
     uidb64 = serializers.CharField(required=True)
     token = serializers.CharField(required=True)
     new_password = serializers.CharField(
-        required=True, write_only=True, validators=[validate_password]
+        required=True,
+        write_only=True,
+        validators=[validate_password_pt],
+        error_messages=PASSWORD_REQUIRED_MESSAGES,
     )
 
 

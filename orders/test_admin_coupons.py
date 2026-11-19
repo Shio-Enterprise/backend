@@ -1,4 +1,5 @@
 from decimal import Decimal
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.urls import reverse
@@ -6,6 +7,7 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 
 from .models import Coupon, CouponDiscountType
+from .serializers import CouponAdminSerializer
 
 User = get_user_model()
 
@@ -136,3 +138,77 @@ class AdminCouponViewSetTests(APITestCase):
         response = self.client.delete(self.detail_url)
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
         self.assertFalse(Coupon.objects.filter(id=self.coupon.id).exists())
+
+
+class CouponDuplicateCodeMessageTests(APITestCase):
+    """Código repetido responde em português, digitado igual ou não."""
+
+    def setUp(self):
+        self.client.force_authenticate(
+            User.objects.create_superuser(email="adm@shio.com", password="x")
+        )
+        self.url = reverse("orders:admin-coupons-list")
+        self.existing = Coupon.objects.create(
+            code="TESTE10",
+            discount_type=CouponDiscountType.PERCENTAGE,
+            discount_value=Decimal("10.00"),
+        )
+        self.other = Coupon.objects.create(
+            code="OUTRO5",
+            discount_type=CouponDiscountType.PERCENTAGE,
+            discount_value=Decimal("5.00"),
+        )
+
+    def payload(self, code):
+        return {"code": code, "discount_type": "PERCENTAGE", "discount_value": "10"}
+
+    def test_criar_com_codigo_repetido(self):
+        for code in ["TESTE10", "teste10", " Teste10 "]:
+            with self.subTest(code=code):
+                response = self.client.post(self.url, self.payload(code), format="json")
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assertEqual(response.json()["code"], ["Este código já existe."])
+
+    def test_editar_para_codigo_de_outro_cupom(self):
+        url = reverse("orders:admin-coupons-detail", args=[self.other.id])
+        response = self.client.patch(url, {"code": "TESTE10"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["code"], ["Este código já existe."])
+
+    def test_editar_mantendo_o_proprio_codigo(self):
+        url = reverse("orders:admin-coupons-detail", args=[self.existing.id])
+        response = self.client.patch(url, {"code": "TESTE10"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def racing_validate(self):
+        """Outro admin salva o mesmo código entre a validação e o INSERT/UPDATE."""
+        original = CouponAdminSerializer.validate
+
+        def validate(serializer, data):
+            data = original(serializer, data)
+            Coupon.objects.create(
+                code=data["code"],
+                discount_type=CouponDiscountType.PERCENTAGE,
+                discount_value=Decimal("1.00"),
+            )
+            return data
+
+        return patch.object(CouponAdminSerializer, "validate", validate)
+
+    def test_corrida_ao_criar_responde_400_em_portugues(self):
+        with self.racing_validate():
+            response = self.client.post(
+                self.url, self.payload("CORRIDA1"), format="json"
+            )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["code"], ["Este código já existe."])
+        self.assertEqual(Coupon.objects.filter(code="CORRIDA1").count(), 1)
+
+    def test_corrida_ao_editar_responde_400_em_portugues(self):
+        url = reverse("orders:admin-coupons-detail", args=[self.other.id])
+        with self.racing_validate():
+            response = self.client.patch(url, {"code": "CORRIDA2"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["code"], ["Este código já existe."])
+        self.other.refresh_from_db()
+        self.assertEqual(self.other.code, "OUTRO5")

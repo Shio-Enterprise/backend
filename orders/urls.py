@@ -30,6 +30,10 @@ from .views import (
     DashboardDropRevenueView,
     InfinitePayWebhookView,
     OrderDispatchView,
+    OrderRecoveryEmailPreviewView,
+    OrderRecoveryEmailSendView,
+    OrderRecoveryEmailSummaryView,
+    OrderRecoveryEmailTestView,
     OrderTrackingView,
     PaymentSuccessRedirectView,
     UserExchangeRequestView,
@@ -115,6 +119,26 @@ urlpatterns = [
         "admin/<uuid:order_id>/",
         AdminOrderDetailView.as_view(),
         name="admin_orders_detail",
+    ),
+    path(
+        "admin/<uuid:order_id>/email/",
+        OrderRecoveryEmailSummaryView.as_view(),
+        name="admin-order-email",
+    ),
+    path(
+        "admin/<uuid:order_id>/email/preview/",
+        OrderRecoveryEmailPreviewView.as_view(),
+        name="admin-order-email-preview",
+    ),
+    path(
+        "admin/<uuid:order_id>/email/test/",
+        OrderRecoveryEmailTestView.as_view(),
+        name="admin-order-email-test",
+    ),
+    path(
+        "admin/<uuid:order_id>/email/send/",
+        OrderRecoveryEmailSendView.as_view(),
+        name="admin-order-email-send",
     ),
     path(
         "admin/<uuid:order_id>/refund/",

@@ -14,7 +14,7 @@ class Command(BaseCommand):
         name = config("ADMIN_NAME")
         password = config("ADMIN_PASS")
 
-        if User.objects.filter(email=email).exists():
+        if User.objects.filter(email__iexact=email.strip()).exists():
             self.stdout.write(self.style.WARNING("Conta de administrador já existe!"))
             return
 

@@ -6,9 +6,20 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import DatabaseError, transaction
-from django.db.models import Count, DecimalField, ExpressionWrapper, F, Q, Sum
+from django.db.models import (
+    Count,
+    DecimalField,
+    Exists,
+    ExpressionWrapper,
+    F,
+    OuterRef,
+    Q,
+    Subquery,
+    Sum,
+)
 from django.db.models.functions import TruncDay, TruncMonth
 from django.http import Http404, HttpResponseRedirect
+from django.shortcuts import get_object_or_404
 from django.utils.decorators import method_decorator
 from drf_spectacular.utils import (
     OpenApiParameter,
@@ -24,10 +35,10 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from authentication.models import NewsletterSubscriber
 from authentication.permissions import (
     CanAccessAdminDashboard,
     CanManageOrders,
-    IsStaffOrSuperUser,
     user_has_admin_permission,
 )
 from core.exports import export_data_response
@@ -77,10 +88,20 @@ from .models import (
     Coupon,
     CustomerOrder,
     ExchangeStatus,
+    OrderRecoveryEmailSend,
     OrderStatus,
     PaymentMethod,
     PaymentStatus,
     RefundStatus,
+)
+from .order_email import (
+    is_customer_unsubscribed,
+    order_send_block_reason,
+    order_status_block_reason,
+    render_order_email_preview,
+    send_order_email_test,
+    send_order_recovery_email,
+    suggested_order_message,
 )
 from .refunds import (
     approve_refund,
@@ -90,6 +111,7 @@ from .refunds import (
     with_refund_status,
 )
 from .serializers import (
+    AdminOrderListSerializer,
     CartItemAddSerializer,
     CartItemUpdateSerializer,
     CartRepresentationSerializer,
@@ -110,6 +132,8 @@ from .serializers import (
     ExchangeReceiveSerializer,
     ExchangeRequestSerializer,
     OrderDetailSerializer,
+    OrderRecoveryEmailMessageSerializer,
+    OrderRecoveryEmailSendSerializer,
     OrderStatusUpdateSerializer,
     PaymentReturnSerializer,
     PaymentWebhookSerializer,
@@ -589,10 +613,43 @@ class UserOrderDetailView(APIView):
         )
 
 
+def filter_by_customer(qs, raw):
+    """Filtra pedidos pelo ID do cliente; valor inválido vira 400 (#88)."""
+    if raw in (None, ""):
+        return qs
+    try:
+        customer_id = int(raw)
+    except (TypeError, ValueError):
+        customer_id = 0
+    if customer_id < 1:
+        raise ValidationError({"customer": "customer deve ser um ID inteiro válido."})
+    return qs.filter(user_id=customer_id)
+
+
+def filter_by_after_sales(qs, params):
+    """Filtra pelo reembolso/troca mais recentes; status inválido vira 400.
+
+    Usado pela lista e pela exportação, para o arquivo bater com a tela.
+    """
+    qs = with_exchange_status(with_refund_status(qs))
+    refund_status_q = params.get("refund_status")
+    exchange_status_q = params.get("exchange_status")
+    if refund_status_q:
+        if refund_status_q not in RefundStatus.values:
+            raise ValidationError({"refund_status": "Status de reembolso inválido."})
+        qs = qs.filter(refund_status=refund_status_q)
+    if exchange_status_q:
+        if exchange_status_q not in ExchangeStatus.values:
+            raise ValidationError({"exchange_status": "Status de troca inválido."})
+        qs = qs.filter(exchange_status=exchange_status_q)
+    return qs
+
+
 class AdminOrderListView(APIView):
     """
     GET /api/orders/admin/
-    Lista pedidos para o painel admin com filtro por `status`.
+    Lista pedidos para o painel admin com filtros por `status`, `refund_status`,
+    `exchange_status` e `customer`.
     """
 
     permission_classes = [CanManageOrders]
@@ -619,41 +676,49 @@ class AdminOrderListView(APIView):
                 description="Filtra pelo status da troca mais recente do pedido",
                 location=OpenApiParameter.QUERY,
             ),
+            OpenApiParameter(
+                name="customer",
+                type=OpenApiTypes.INT,
+                description="Filtra pelos pedidos de um cliente (ID do usuário)",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
         ],
-        responses={200: DashboardRecentOrderSerializer(many=True)},
+        responses={200: AdminOrderListSerializer(many=True)},
     )
     def get(self, request):
         status_q = request.query_params.get("status")
-        refund_status_q = request.query_params.get("refund_status")
-        exchange_status_q = request.query_params.get("exchange_status")
-        qs = with_exchange_status(
-            with_refund_status(
-                CustomerOrder.objects.select_related("user", "payment").order_by(
-                    "-created_at"
-                )
-            )
+        latest_recovery_send = OrderRecoveryEmailSend.objects.filter(
+            order=OuterRef("pk")
+        ).order_by("-sent_at")
+        unsubscribed_emails = NewsletterSubscriber.objects.filter(
+            email__iexact=OuterRef("user__email"),
+            unsubscribed_at__isnull=False,
         )
+        qs = (
+            CustomerOrder.objects.select_related("user", "payment")
+            .annotate(
+                last_recovery_email_sent_at=Subquery(
+                    latest_recovery_send.values("sent_at")[:1]
+                ),
+                email_unsubscribed=Exists(unsubscribed_emails),
+            )
+            .order_by("-created_at")
+        )
+        qs = filter_by_customer(qs, request.query_params.get("customer"))
+        qs = filter_by_after_sales(qs, request.query_params)
         if status_q:
             qs = qs.filter(status=status_q)
-        if refund_status_q:
-            if refund_status_q not in RefundStatus.values:
-                raise ValidationError(
-                    {"refund_status": "Status de reembolso inválido."}
-                )
-            qs = qs.filter(refund_status=refund_status_q)
-        if exchange_status_q:
-            if exchange_status_q not in ExchangeStatus.values:
-                raise ValidationError({"exchange_status": "Status de troca inválido."})
-            qs = qs.filter(exchange_status=exchange_status_q)
 
-        data = DashboardRecentOrderSerializer(qs, many=True).data
+        data = AdminOrderListSerializer(qs, many=True).data
         return Response(data, status=status.HTTP_200_OK)
 
 
 class AdminOrderExportView(APIView):
     """
     GET /api/orders/admin/export/
-    Exporta pedidos para CSV ou Excel (.xlsx) respeitando filtros de busca e status.
+    Exporta pedidos para CSV ou Excel (.xlsx) respeitando os mesmos filtros da tela
+    (busca, status, cliente, reembolso e troca).
     Requer a permissão CanManageOrders.
     """
 
@@ -684,6 +749,29 @@ class AdminOrderExportView(APIView):
                 location=OpenApiParameter.QUERY,
                 required=False,
             ),
+            OpenApiParameter(
+                name="customer",
+                type=OpenApiTypes.INT,
+                description="Filtra pelos pedidos de um cliente (ID do usuário)",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
+            OpenApiParameter(
+                name="refund_status",
+                type=OpenApiTypes.STR,
+                enum=RefundStatus.values,
+                description="Filtra pelo status do reembolso mais recente do pedido",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
+            OpenApiParameter(
+                name="exchange_status",
+                type=OpenApiTypes.STR,
+                enum=ExchangeStatus.values,
+                description="Filtra pelo status da troca mais recente do pedido",
+                location=OpenApiParameter.QUERY,
+                required=False,
+            ),
         ],
         responses={
             200: OpenApiResponse(description="Arquivo exportado (CSV ou XLSX)"),
@@ -701,6 +789,8 @@ class AdminOrderExportView(APIView):
             .prefetch_related("items__variation__product")
             .order_by("-created_at")
         )
+        qs = filter_by_customer(qs, request.query_params.get("customer"))
+        qs = filter_by_after_sales(qs, request.query_params)
         if status_q:
             qs = qs.filter(status=status_q)
         if search_q:
@@ -833,7 +923,9 @@ class AdminOrderDetailView(APIView):
         try:
             order = (
                 CustomerOrder.objects.select_related("user", "address", "payment")
-                .prefetch_related("items__variation__product")
+                .prefetch_related(
+                    "items__variation__product", "recovery_email_sends__sent_by"
+                )
                 .get(id=order_id)
             )
         except CustomerOrder.DoesNotExist:
@@ -918,7 +1010,7 @@ class AdminOrderDetailView(APIView):
 def _order_for_detail(order_id):
     return (
         CustomerOrder.objects.select_related("user", "address", "payment")
-        .prefetch_related("items__variation__product")
+        .prefetch_related("items__variation__product", "recovery_email_sends__sent_by")
         .get(id=order_id)
     )
 
@@ -1768,7 +1860,7 @@ class CartItemDetailAPIView(APIView):
 
 
 class CouponListCreateView(APIView):
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageOrders]
 
     @extend_schema(responses=CouponAdminSerializer(many=True))
     def get(self, request):
@@ -1820,7 +1912,7 @@ class CouponListCreateView(APIView):
 
 
 class CouponDetailView(APIView):
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageOrders]
 
     def get_object(self, pk):
         valid_orders = valid_order_q("orders__")
@@ -1878,7 +1970,7 @@ class CouponDetailView(APIView):
 
 
 class _CouponEmailBaseView(APIView):
-    permission_classes = [IsStaffOrSuperUser]
+    permission_classes = [CanManageOrders]
 
     def get_coupon(self, uuid):
         from django.shortcuts import get_object_or_404
@@ -1934,7 +2026,7 @@ class CouponEmailTestView(_CouponEmailBaseView):
         coupon = self.get_coupon(uuid)
         message = self.get_message(request)
         if send_coupon_test(coupon, request.user, message):
-            return Response({"sent": True})
+            return Response({"sent": True, "to": request.user.email})
         return Response(
             {"error": "Não foi possível enviar o teste."},
             status=status.HTTP_502_BAD_GATEWAY,
@@ -1960,6 +2052,91 @@ class CouponEmailSendView(_CouponEmailBaseView):
                 "sent_count": record.sent_count,
                 "failed_count": record.failed_count,
                 "sent_at": record.sent_at,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class _OrderRecoveryEmailBaseView(APIView):
+    permission_classes = [CanManageOrders]
+
+    def get_order(self, order_id):
+        return get_object_or_404(
+            CustomerOrder.objects.select_related("user").prefetch_related("items"),
+            id=order_id,
+        )
+
+    def get_message(self, request) -> str:
+        serializer = OrderRecoveryEmailMessageSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        return serializer.validated_data.get("message", "")
+
+
+class OrderRecoveryEmailSummaryView(_OrderRecoveryEmailBaseView):
+    @extend_schema(responses=dict)
+    def get(self, request, order_id):
+        order = self.get_order(order_id)
+        customer_email = getattr(order.user, "email", None)
+        history = OrderRecoveryEmailSendSerializer(
+            order.recovery_email_sends.select_related("sent_by"), many=True
+        ).data
+        return Response(
+            {
+                "block_reason": order_send_block_reason(order),
+                "unsubscribed": is_customer_unsubscribed(customer_email),
+                "recipient": {
+                    "name": getattr(order.user, "name", None) or None,
+                    "email": customer_email,
+                },
+                "order_status": order.status,
+                "suggested_message": suggested_order_message(order),
+                "history": history,
+            }
+        )
+
+
+class OrderRecoveryEmailPreviewView(_OrderRecoveryEmailBaseView):
+    @extend_schema(request=OrderRecoveryEmailMessageSerializer, responses=dict)
+    def post(self, request, order_id):
+        order = self.get_order(order_id)
+        message = self.get_message(request)
+        return Response({"html": render_order_email_preview(order, message)})
+
+
+class OrderRecoveryEmailTestView(_OrderRecoveryEmailBaseView):
+    @extend_schema(request=OrderRecoveryEmailMessageSerializer, responses=dict)
+    def post(self, request, order_id):
+        order = self.get_order(order_id)
+        message = self.get_message(request)
+        reason = order_status_block_reason(order)
+        if reason:
+            return Response({"error": reason}, status=status.HTTP_400_BAD_REQUEST)
+        if send_order_email_test(order, request.user, message):
+            return Response({"sent": True})
+        return Response(
+            {"error": "Não foi possível enviar o teste."},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
+class OrderRecoveryEmailSendView(_OrderRecoveryEmailBaseView):
+    @extend_schema(request=OrderRecoveryEmailMessageSerializer, responses=dict)
+    def post(self, request, order_id):
+        order = self.get_order(order_id)
+        message = self.get_message(request)
+        reason = order_send_block_reason(order)
+        if reason:
+            return Response({"error": reason}, status=status.HTTP_400_BAD_REQUEST)
+        record = send_order_recovery_email(order, request.user, message)
+        if record is None:
+            return Response(
+                {"error": "Não foi possível enviar o e-mail."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response(
+            {
+                **OrderRecoveryEmailSendSerializer(record).data,
+                "recipient_email": order.user.email,
             },
             status=status.HTTP_201_CREATED,
         )

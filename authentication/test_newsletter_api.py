@@ -112,7 +112,7 @@ class NewsletterApiTests(APITestCase):
             format="json",
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
-        self.assertEqual(resp.data, {"sent": True})
+        self.assertEqual(resp.data, {"sent": True, "to": "admin@shio.com"})
         self.assertEqual(len(mail.outbox), 1)
         self.assertEqual(mail.outbox[0].to, ["admin@shio.com"])
         self.assertEqual(mail.outbox[0].subject, "[Teste] Teste Drop")
