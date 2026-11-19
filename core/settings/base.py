@@ -192,30 +192,6 @@ SIMPLE_JWT = {
 
 GOOGLE_CLIENT_ID = config("GOOGLE_CLIENT_ID")
 
-REDIS_URL = config("REDIS_URL", default="")
-CACHES = {
-    "default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"},
-    "correios": {
-        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
-        "LOCATION": "correios-local",
-    },
-}
-if REDIS_URL:
-    from redis.backoff import NoBackoff
-    from redis.retry import Retry
-
-    CACHES["correios"] = {
-        "BACKEND": "django.core.cache.backends.redis.RedisCache",
-        "LOCATION": REDIS_URL,
-        "KEY_PREFIX": "shio:correios",
-        "OPTIONS": {
-            "socket_connect_timeout": 2,
-            "socket_timeout": 2,
-            "max_connections": 5,
-            "retry": Retry(NoBackoff(), 0),
-        },
-    }
-
 INFINITEPAY_HANDLE = config("INFINITEPAY_HANDLE", default="")
 INFINITEPAY_RETURN_URL = config(
     "INFINITEPAY_RETURN_URL", default="http://localhost:5173/pix"

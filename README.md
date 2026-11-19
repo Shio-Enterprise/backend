@@ -152,50 +152,12 @@ snapshot deixa de corresponder aos parâmetros atuais.
 A rota `/api/orders/correios/frete/` exige autenticação e recebe `cep_destino`.
 Enviar `cep_origem`, `peso` ou `codigo_servico` retorna `400`.
 
-### Redis compartilhado — Render Key Value Free
+### Token dos Correios
 
-A Sprint 1 usa o backend nativo `RedisCache` do Django no alias `correios` e um
-lock Redis para coordenar a renovação do token entre os workers. O cache padrão
-da aplicação continua separado, para que uma falha da integração não indisponibilize
-as demais funções do catálogo.
-
-No Render, crie uma instância **Key Value / Free**, na mesma região do backend,
-selecione a política **`noeviction`** e defina `REDIS_URL` com a URL interna
-fornecida pelo serviço. Bloqueie acesso externo se ele não for necessário.
-O frontend na Vercel não recebe essa URL. A produção exige
-`SETTINGS_FILE_PATH=core.settings.prod` e uma `REDIS_URL` válida; não há fallback
-para cache local em produção.
-
-O orçamento considera 25 MB e 50 conexões. Cada worker utiliza até cinco conexões
-para cache e cinco para locks: até 30 para os três workers atuais. As chaves de
-token expiram conforme a validade informada pelos Correios; o lock expira em
-30 segundos e a espera por ele é limitada a 12 segundos. Indisponibilidade,
-memória esgotada ou falha de lock resultam em erro da integração, sem uma chamada
-externa de renovação desprotegida.
-
-O Docker Compose inclui um Redis descartável limitado a 25 MB, 50 conexões e
-`noeviction`, sem persistência. Em desenvolvimento fora do Compose, configure
-`REDIS_URL=redis://127.0.0.1:6379/0`; sem URL, apenas desenvolvimento/testes podem
-usar o cache local.
-
-Para testar a integração, use somente Redis descartável:
-
-```bash
-TEST_REDIS_URL=redis://127.0.0.1:6379/0 pytest -q orders/test_redis_shipping.py
-```
-
-A CI sobe Redis e executa esses testes, incluindo concorrência entre processos,
-perda do cache, invalidação e falhas controladas. Sem `TEST_REDIS_URL`, os quatro
-testes que dependem do serviço são ignorados; os testes unitários continuam rodando.
-
-O Free pode reiniciar e perder todas as chaves. Tokens são regenerados, mas locks
-não oferecem exclusão durante reinícios/perda de dados do serviço. Pedidos,
-pagamentos e idempotência continuam no PostgreSQL. Quotas comerciais duráveis,
-throttling e observabilidade seguem para as próximas etapas da O10; não devem
-depender exclusivamente de contadores voláteis do Redis Free.
-
-Referências: [limites do Free](https://render.com/docs/free#free-key-value) e
-[Key Value](https://render.com/docs/key-value).
+O token de acesso dos Correios fica na memória de cada worker até expirar
+(com um minuto de folga). Se os Correios recusarem o token (`401`), ele é
+descartado e um novo é pedido. Não há Redis nem cache compartilhado: cada
+worker pede o próprio token.
 
 ### Modo mock
 
