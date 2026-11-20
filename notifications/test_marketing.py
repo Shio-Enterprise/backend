@@ -53,12 +53,16 @@ class MarketingAudienceTests(TestCase):
     def test_normalize_email(self):
         self.assertEqual(normalize_email("  Ana@X.COM "), "ana@x.com")
 
-    def test_comprador_pago_recebe(self):
+    def test_comprador_sem_aceite_nao_recebe(self):
         make_order(make_user("ana@x.com"))
+        self.assertEqual(build_audience().total, 0)
+
+    def test_comprador_com_aceite_recebe(self):
+        make_order(make_user("ana@x.com"))
+        make_subscriber("ana@x.com")
         audience = build_audience()
         self.assertEqual(emails(audience), ["ana@x.com"])
-        self.assertEqual(audience.buyers, 1)
-        self.assertEqual(audience.total, 1)
+        self.assertEqual(audience.subscribers, 1)
 
     def test_pedido_aguardando_ou_cancelado_nao_conta(self):
         user = make_user("ana@x.com")
@@ -89,10 +93,9 @@ class MarketingAudienceTests(TestCase):
 
     def test_deduplica_e_bloqueia_ignorando_maiusculas(self):
         make_order(make_user("Ana@X.com"))
-        make_subscriber("ana@x.com")
+        make_subscriber("ANA@x.com")
         audience = build_audience()
-        self.assertEqual(audience.total, 1)
-        self.assertEqual(audience.overlap, 1)
+        self.assertEqual(emails(audience), ["ana@x.com"])
         opt_out("ANA@x.com")
         self.assertEqual(build_audience().total, 0)
 
@@ -126,6 +129,8 @@ class MarketingAudienceTests(TestCase):
 
     def test_is_receiving(self):
         make_order(make_user("ana@x.com"))
+        self.assertFalse(is_receiving("ana@x.com"))  # comprar não é aceitar
+        opt_in("ana@x.com")
         self.assertTrue(is_receiving("ana@x.com"))
         opt_out("ana@x.com")
         self.assertFalse(is_receiving("ANA@x.com"))

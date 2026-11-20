@@ -2002,9 +2002,7 @@ class CouponEmailSummaryView(_CouponEmailBaseView):
                 "block_reason": coupon_send_block_reason(coupon),
                 "audience": {
                     "total": audience.total,
-                    "buyers": audience.buyers,
                     "subscribers": audience.subscribers,
-                    "overlap": audience.overlap,
                     "suppressed": audience.suppressed,
                 },
                 "history": history,

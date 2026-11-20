@@ -57,8 +57,8 @@ class CouponEmailApiTests(APITestCase):
         self.assertIsNone(data["block_reason"])
         self.assertEqual(data["audience"]["total"], 2)
         self.assertEqual(data["audience"]["subscribers"], 2)
-        for key in ("buyers", "overlap", "suppressed"):
-            self.assertIn(key, data["audience"])
+        self.assertIn("suppressed", data["audience"])
+        self.assertNotIn("buyers", data["audience"])
         self.assertEqual(len(data["history"]), 1)
         self.assertEqual(data["history"][0]["sent_by_name"], "Admin Shio")
         self.assertEqual(data["history"][0]["sent_count"], 2)
