@@ -124,6 +124,7 @@ class CouponCampaignTests(TestCase):
 
     def _audience(self):
         make_order(make_user("ana@x.com", name="Ana"))
+        NewsletterSubscriber.objects.create(email="ana@x.com", consent_lgpd=True)
         NewsletterSubscriber.objects.create(email="bia@x.com", consent_lgpd=True)
 
     def test_envia_um_email_por_pessoa_com_link_proprio(self):
@@ -189,6 +190,7 @@ class CouponCampaignTests(TestCase):
 
     def test_previa_igual_ao_email_enviado(self):
         make_order(make_user("ana@x.com", name="Ana Souza"))
+        NewsletterSubscriber.objects.create(email="ana@x.com", consent_lgpd=True)
         message = "Olá, {nome}!\nCorre que acaba."
         send_coupon_campaign(self.coupon, self.admin, message)
         sent = mail.outbox[0].alternatives[0][0]

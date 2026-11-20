@@ -4,6 +4,7 @@ from django.contrib.auth import authenticate
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from notifications.marketing import opt_in
@@ -501,13 +502,29 @@ class CustomerCRMDetailSerializer(CustomerCRMSerializer):
     # Telefone e CPF para preencher a edição do cliente no admin (#100).
     phone_number = serializers.SerializerMethodField()
     cpf = serializers.SerializerMethodField()
+    # Aceite de e-mails (#103), só leitura: vem das anotações do CRMViewSet.
+    accepts_emails = serializers.BooleanField(read_only=True)
+    email_consent_at = serializers.SerializerMethodField()
+    email_unsubscribed_at = serializers.DateTimeField(
+        source="newsletter_unsubscribed_at", read_only=True
+    )
 
     class Meta(CustomerCRMSerializer.Meta):
         fields = CustomerCRMSerializer.Meta.fields + [
             "phone_number",
             "cpf",
+            "accepts_emails",
+            "email_consent_at",
+            "email_unsubscribed_at",
             "order_history",
         ]
+
+    @extend_schema_field(serializers.DateTimeField(allow_null=True))
+    def get_email_consent_at(self, obj):
+        if not getattr(obj, "accepts_emails", False):
+            return None
+        value = obj.newsletter_subscribed_at
+        return serializers.DateTimeField().to_representation(value) if value else None
 
     def _profile_value(self, obj, field):
         profile = getattr(obj, "profile", None)
