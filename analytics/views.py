@@ -13,7 +13,15 @@ from authentication.permissions import IsStaffOrSuperUser
 from .models import SiteEvent
 from .periods import ANUAL, MENSAL, PERIODS, resolve_period
 from .serializers import SiteEventCreateSerializer
-from .services import build_overview, link_anonymous_events
+from .services import (
+    build_overview,
+    build_product_access,
+    build_shared_interest,
+    build_user_products,
+    build_user_timeline,
+    link_anonymous_events,
+    search_products,
+)
 
 User = get_user_model()
 
@@ -27,11 +35,65 @@ PERIOD_PARAMETER = OpenApiParameter(
 )
 
 
+YEAR_PARAMETER = OpenApiParameter(
+    name="year",
+    description="Ano do calendário. No anual, define o ano inteiro. No mensal, acompanha `month`.",
+    required=False,
+    type=int,
+)
+MONTH_PARAMETER = OpenApiParameter(
+    name="month",
+    description="Mês de 1 a 12. Com `year`, o mensal passa a ser esse mês, agrupado por dia.",
+    required=False,
+    type=int,
+)
+CALENDAR_PARAMETERS = [PERIOD_PARAMETER, YEAR_PARAMETER, MONTH_PARAMETER]
+
+
 def _get_period(request):
     period_name = request.query_params.get("period", MENSAL)
     if period_name not in PERIODS:
         raise ValidationError({"period": "Use `mensal` ou `anual`."})
     return period_name
+
+
+def _optional_int(request, name):
+    raw = request.query_params.get(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        raise ValidationError({name: "Valor inválido."})
+
+
+def _selection(request):
+    period_name = _get_period(request)
+    year = _optional_int(request, "year")
+    month = _optional_int(request, "month")
+    try:
+        resolve_period(period_name, year=year, month=month)
+    except ValueError as exc:
+        message = str(exc)
+        if message.startswith("Mês") or message.startswith("Esse"):
+            field = "month"
+        elif message.startswith("Ano"):
+            field = "year"
+        else:
+            field = "period"
+        raise ValidationError({field: message})
+    return period_name, year, month
+
+
+def _get_page(request):
+    raw = request.query_params.get("page", "1")
+    try:
+        page = int(raw)
+    except (TypeError, ValueError):
+        raise ValidationError({"page": "Página inválida."})
+    if page < 1:
+        raise ValidationError({"page": "Página inválida."})
+    return page
 
 
 class SiteEventCreateView(APIView):
@@ -117,7 +179,7 @@ class SiteEventOverviewView(APIView):
             "Mensal: 30 dias agrupados por dia. Anual: 365 dias agrupados por mês. "
             "Período calculado no fuso America/Sao_Paulo."
         ),
-        parameters=[PERIOD_PARAMETER],
+        parameters=CALENDAR_PARAMETERS,
         responses={
             200: OpenApiResponse(description="Métricas consolidadas do período."),
             400: OpenApiResponse(description="Período inválido."),
@@ -125,7 +187,116 @@ class SiteEventOverviewView(APIView):
         },
     )
     def get(self, request):
-        return Response(build_overview(_get_period(request)))
+        period_name, year, month = _selection(request)
+        return Response(build_overview(period_name, year=year, month=month))
+
+
+class SharedProductInterestView(APIView):
+    """Produtos que reuniram as mesmas contas, pela navegação do período."""
+
+    permission_classes = [IsStaffOrSuperUser]
+
+    @extend_schema(
+        tags=["Analytics"],
+        summary="Interesse em comum por produto",
+        description=(
+            "Agrupa as contas que viram, colocaram no carrinho, iniciaram o checkout "
+            "ou compraram o mesmo produto no período. Cada conta aparece com o sinal mais forte. "
+            "Visitantes sem conta entram só na contagem."
+        ),
+        parameters=CALENDAR_PARAMETERS,
+        responses={
+            200: OpenApiResponse(
+                description="Produtos e as contas reunidas em cada um."
+            ),
+            400: OpenApiResponse(description="Período inválido."),
+            403: OpenApiResponse(description="Apenas administradores."),
+        },
+    )
+    def get(self, request):
+        period_name, year, month = _selection(request)
+        return Response(
+            {"products": build_shared_interest(period_name, year=year, month=month)}
+        )
+
+
+class ProductSearchView(APIView):
+    """Busca produtos pelo nome para o filtro de acessos."""
+
+    permission_classes = [IsStaffOrSuperUser]
+
+    @extend_schema(
+        tags=["Analytics"],
+        summary="Buscar produtos pelo nome",
+        parameters=[
+            OpenApiParameter(
+                name="q",
+                description="Trecho do nome do produto.",
+                required=True,
+                type=str,
+            )
+        ],
+        responses={
+            200: OpenApiResponse(description="Até 10 produtos, com id e nome."),
+            400: OpenApiResponse(description="Texto de busca curto demais."),
+            403: OpenApiResponse(description="Apenas administradores."),
+        },
+    )
+    def get(self, request):
+        query = request.query_params.get("q", "").strip()
+        if len(query) < 2:
+            raise ValidationError({"q": "Informe pelo menos 2 caracteres."})
+        return Response(search_products(query))
+
+
+class ProductAccessView(APIView):
+    """Acessos de um produto no período: ação, horário, conta e variação."""
+
+    permission_classes = [IsStaffOrSuperUser]
+
+    @extend_schema(
+        tags=["Analytics"],
+        summary="Acessos de um produto",
+        parameters=CALENDAR_PARAMETERS,
+        responses={
+            200: OpenApiResponse(description="Totais por ação e a página de acessos."),
+            400: OpenApiResponse(description="Período ou página inválidos."),
+            403: OpenApiResponse(description="Apenas administradores."),
+            404: OpenApiResponse(description="Produto não encontrado."),
+        },
+    )
+    def get(self, request, product_id):
+        period_name, year, month = _selection(request)
+        payload = build_product_access(
+            product_id, period_name, _get_page(request), year=year, month=month
+        )
+        if payload is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        return Response(payload)
+
+
+class UserProductAccessView(APIView):
+    """Produtos que uma conta acessou no período."""
+
+    permission_classes = [IsStaffOrSuperUser]
+
+    @extend_schema(
+        tags=["Analytics"],
+        summary="Produtos acessados por uma conta",
+        parameters=CALENDAR_PARAMETERS,
+        responses={
+            200: OpenApiResponse(description="Produtos com a contagem de cada ação."),
+            400: OpenApiResponse(description="Período inválido."),
+            403: OpenApiResponse(description="Apenas administradores."),
+            404: OpenApiResponse(description="Usuário não encontrado."),
+        },
+    )
+    def get(self, request, user_id):
+        user = get_object_or_404(User, pk=user_id)
+        period_name, year, month = _selection(request)
+        return Response(
+            {"products": build_user_products(user, period_name, year=year, month=month)}
+        )
 
 
 class SiteEventTimelineSerializer(serializers.ModelSerializer):
@@ -160,7 +331,7 @@ class UserSiteEventTimelineView(generics.ListAPIView):
             "Lista os eventos de navegação de um usuário cadastrado no período, do "
             "mais recente para o mais antigo, com paginação."
         ),
-        parameters=[PERIOD_PARAMETER],
+        parameters=CALENDAR_PARAMETERS,
         responses={
             200: SiteEventTimelineSerializer(many=True),
             400: OpenApiResponse(description="Período inválido."),
@@ -171,13 +342,28 @@ class UserSiteEventTimelineView(generics.ListAPIView):
     def get(self, request, *args, **kwargs):
         return super().get(request, *args, **kwargs)
 
+    def list(self, request, *args, **kwargs):
+        if getattr(self, "swagger_fake_view", False):
+            return Response([])
+        user = get_object_or_404(User, pk=self.kwargs["user_id"])
+        period_name, year, month = _selection(request)
+        start, end, _group_by = resolve_period(period_name, year=year, month=month)
+        rows = build_user_timeline(user, start, end)
+        page = self.paginate_queryset(rows)
+        if page is not None:
+            return self.get_paginated_response(page)
+        return Response(rows)
+
     def get_queryset(self):
         if getattr(self, "swagger_fake_view", False):
             return SiteEvent.objects.none()
         user = get_object_or_404(User, pk=self.kwargs["user_id"])
-        start, _end, _group_by = resolve_period(_get_period(self.request))
+        period_name, year, month = _selection(self.request)
+        start, end, _group_by = resolve_period(period_name, year=year, month=month)
         return (
-            SiteEvent.objects.filter(user=user, occurred_at__gte=start)
+            SiteEvent.objects.filter(
+                user=user, occurred_at__gte=start, occurred_at__lte=end
+            )
             .select_related("product", "variation")
             .order_by("-occurred_at")
         )
