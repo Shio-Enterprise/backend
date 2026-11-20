@@ -1,7 +1,10 @@
 """#103: perfil do cliente no admin mostra se ele aceitou receber e-mails."""
 
+import csv
+import io
 from datetime import timedelta
 
+import openpyxl
 from django.contrib.auth.models import Permission
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
@@ -104,6 +107,61 @@ class CustomerEmailConsentTests(APITestCase):
         self.assertIn(self.accepted.email, body)
         self.assertNotIn(self.never.email, body)
         self.assertNotIn(self.unsubscribed.email, body)
+
+    def _export_rows(self, file_format, **params):
+        response = self.client.get(
+            f"{URL}export/", {"file_format": file_format, **params}
+        )
+        self.assertEqual(response.status_code, 200)
+        if file_format == "csv":
+            content = response.content.decode("utf-8-sig")
+            rows = list(csv.reader(io.StringIO(content), delimiter=";"))
+        else:
+            ws = openpyxl.load_workbook(io.BytesIO(response.content)).active
+            rows = [[c.value for c in row] for row in ws.iter_rows()]
+        col = rows[0].index("Inscrito na Newsletter")
+        return {row[1]: row[col] for row in rows[1:]}
+
+    def test_export_column_values_csv_and_xlsx(self):
+        expected = {
+            self.accepted.email: "Sim",
+            self.unsubscribed.email: "Não",
+            self.never.email: "Não",
+        }
+        self.assertEqual(self._export_rows("csv"), expected)
+        self.assertEqual(self._export_rows("xlsx"), expected)
+
+    def test_export_xlsx_respects_filter(self):
+        self.assertEqual(
+            self._export_rows("xlsx", accepts_emails="false"),
+            {self.unsubscribed.email: "Não", self.never.email: "Não"},
+        )
+
+    def test_filter_combines_with_search(self):
+        other = make_customer("aceitou-tambem@example.com", name="Outra")
+        opt_in(other.email)
+        response = self.client.get(URL, {"accepts_emails": "true", "search": "outra"})
+        self.assertEqual([c["email"] for c in response.data["results"]], [other.email])
+        response = self.client.get(URL, {"accepts_emails": "false", "search": "outra"})
+        self.assertEqual(response.data["count"], 0)
+
+    def test_filter_combines_with_ordering(self):
+        other = make_customer("segundo@example.com")
+        opt_in(other.email)
+        User.objects.filter(email=other.email).update(
+            created_at=timezone.now() - timedelta(days=10)
+        )
+        response = self.client.get(
+            URL, {"accepts_emails": "true", "ordering": "created_at"}
+        )
+        self.assertEqual(
+            [c["email"] for c in response.data["results"]],
+            [other.email, self.accepted.email],
+        )
+
+    def test_export_combines_filter_and_search(self):
+        rows = self._export_rows("csv", accepts_emails="false", search="nunca")
+        self.assertEqual(rows, {self.never.email: "Não"})
 
 
 class ReacceptUpdatesDateTests(APITestCase):
