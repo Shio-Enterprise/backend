@@ -124,9 +124,13 @@ def opt_in(email: str) -> None:
     if sub is None:
         NewsletterSubscriber.objects.create(email=email, consent_lgpd=True)
         return
+    if sub.consent_lgpd and sub.unsubscribed_at is None:
+        return
+    # Novo aceite: a data passa a ser a de agora (o perfil no admin mostra, #103).
     sub.consent_lgpd = True
     sub.unsubscribed_at = None
-    sub.save(update_fields=["consent_lgpd", "unsubscribed_at"])
+    sub.subscribed_at = timezone.now()
+    sub.save(update_fields=["consent_lgpd", "unsubscribed_at", "subscribed_at"])
 
 
 def opt_out(email: str) -> None:
