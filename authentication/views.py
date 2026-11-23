@@ -699,7 +699,6 @@ class CustomerCRMViewSet(mixins.UpdateModelMixin, viewsets.ReadOnlyModelViewSet)
         )
         qs = qs.annotate(
             newsletter_consent=Subquery(subscriber.values("consent_lgpd")[:1]),
-            newsletter_subscribed_at=Subquery(subscriber.values("subscribed_at")[:1]),
             newsletter_unsubscribed_at=Subquery(
                 subscriber.values("unsubscribed_at")[:1]
             ),
@@ -714,6 +713,15 @@ class CustomerCRMViewSet(mixins.UpdateModelMixin, viewsets.ReadOnlyModelViewSet)
                 output_field=BooleanField(),
             )
         )
+
+        # A data do aceite só aparece no "Ver perfil"; lista, exportação e
+        # edição não a usam.
+        if self.action == "retrieve":
+            qs = qs.annotate(
+                newsletter_subscribed_at=Subquery(
+                    subscriber.values("subscribed_at")[:1]
+                )
+            )
 
         if self.request.query_params.get("customer"):
             qs = qs.filter(id=self.request.query_params["customer"])

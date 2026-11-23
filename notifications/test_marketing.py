@@ -64,15 +64,44 @@ class MarketingAudienceTests(TestCase):
         self.assertEqual(emails(audience), ["ana@x.com"])
         self.assertEqual(audience.subscribers, 1)
 
-    def test_pedido_aguardando_ou_cancelado_nao_conta(self):
-        user = make_user("ana@x.com")
-        make_order(user, OrderStatus.AWAITING_PAYMENT)
-        make_order(user, OrderStatus.CANCELED)
-        self.assertEqual(build_audience().total, 0)
+    def test_primeira_compra_pedido_cancelado_nao_conta_como_compra(self):
+        make_subscriber("ana@x.com")
+        make_order(make_user("ana@x.com"), OrderStatus.CANCELED)
+        make_subscriber("bia@x.com")
+        make_order(make_user("bia@x.com"), OrderStatus.AWAITING_PAYMENT)
+        audience = build_audience(first_purchase_only=True)
+        self.assertEqual(emails(audience), ["ana@x.com"])
 
-    def test_usuario_inativo_nao_recebe(self):
-        make_order(make_user("ana@x.com", is_active=False))
+    def test_usuario_inativo_com_inscricao_ativa_recebe(self):
+        # O aceite é do e-mail (como o de quem não tem conta); conta desativada
+        # só impede o login. Para parar de receber, vale o descadastro.
+        make_user("ana@x.com", name="Ana", is_active=False)
+        make_subscriber("ana@x.com")
+        self.assertEqual(build_audience().recipients, [Recipient("ana@x.com", None)])
+        self.assertTrue(is_receiving("ana@x.com"))
+
+    def test_usuario_inativo_descadastrado_nao_recebe(self):
+        make_user("ana@x.com", is_active=False)
+        make_subscriber("ana@x.com", unsubscribed=True)
         self.assertEqual(build_audience().total, 0)
+        self.assertFalse(is_receiving("ana@x.com"))
+
+    def test_primeira_compra_suprimidos_so_entre_quem_nao_tem_pedido(self):
+        make_subscriber("com-pedido@x.com", unsubscribed=True)
+        make_order(make_user("com-pedido@x.com"))
+        make_subscriber("cancelado@x.com", unsubscribed=True)
+        make_order(make_user("cancelado@x.com"), OrderStatus.CANCELED)
+        make_subscriber("sem-pedido@x.com", unsubscribed=True)
+        make_subscriber("ativo@x.com")
+        self.assertEqual(build_audience().suppressed, 3)
+        audience = build_audience(first_purchase_only=True)
+        self.assertEqual(emails(audience), ["ativo@x.com"])
+        self.assertEqual(audience.suppressed, 2)
+
+    def test_suprimidos_sem_consentimento_nao_contam(self):
+        make_subscriber("ana@x.com", consent=False, unsubscribed=True)
+        make_subscriber("bia@x.com", unsubscribed=True)
+        self.assertEqual(build_audience().suppressed, 1)
 
     def test_inscrito_com_consentimento_recebe_sem_conta(self):
         make_subscriber("bia@x.com")

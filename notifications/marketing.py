@@ -46,7 +46,12 @@ def build_audience(*, first_purchase_only: bool = False) -> Audience:
             "email", flat=True
         )
     }
-    suppressed = consented.filter(unsubscribed_at__isnull=False).count()
+    suppressed = {
+        normalize_email(e)
+        for e in consented.filter(unsubscribed_at__isnull=False).values_list(
+            "email", flat=True
+        )
+    }
 
     if first_purchase_only:
         has_order = {
@@ -55,7 +60,10 @@ def build_audience(*, first_purchase_only: bool = False) -> Audience:
                 "user__email", flat=True
             )
         }
+        # Quem já tem pedido válido não entra no cupom de primeira compra,
+        # então também não conta como suprimido.
         accepted -= has_order
+        suppressed -= has_order
 
     names = {
         normalize_email(e): n or None
@@ -66,7 +74,7 @@ def build_audience(*, first_purchase_only: bool = False) -> Audience:
     return Audience(
         recipients=recipients,
         subscribers=len(recipients),
-        suppressed=suppressed,
+        suppressed=len(suppressed),
     )
 
 

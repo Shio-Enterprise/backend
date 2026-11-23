@@ -198,3 +198,28 @@ class ReacceptUpdatesDateTests(APITestCase):
         self.assertEqual(response.status_code, 200, response.data)
         sub = NewsletterSubscriber.objects.get(email=self.email)
         self.assertGreater(sub.subscribed_at, self.old)
+
+
+class CustomerConsentAnnotationTests(APITestCase):
+    """A data do aceite só é anotada no detalhe (review do backend#64)."""
+
+    def queryset_for(self, action):
+        from rest_framework.request import Request
+        from rest_framework.test import APIRequestFactory
+
+        from authentication.views import CustomerCRMViewSet
+
+        view = CustomerCRMViewSet()
+        view.action = action
+        view.request = Request(APIRequestFactory().get(URL))
+        return view.get_queryset()
+
+    def test_data_do_aceite_so_no_retrieve(self):
+        self.assertIn(
+            "newsletter_subscribed_at", self.queryset_for("retrieve").query.annotations
+        )
+        for action in ("list", "export", "partial_update"):
+            with self.subTest(action=action):
+                annotations = self.queryset_for(action).query.annotations
+                self.assertNotIn("newsletter_subscribed_at", annotations)
+                self.assertIn("accepts_emails", annotations)
