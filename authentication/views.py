@@ -6,6 +6,8 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.tokens import default_token_generator
 from django.db import IntegrityError, models
 from django.db.models import (
+    BooleanField,
+    Case,
     Count,
     IntegerField,
     Max,
@@ -14,8 +16,10 @@ from django.db.models import (
     Subquery,
     Sum,
     Value,
+    When,
 )
 from django.db.models.functions import Coalesce
+from django.utils import timezone
 from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from drf_spectacular.utils import (
@@ -626,6 +630,18 @@ class AddressDetailView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+ACCEPTS_EMAILS_PARAM = OpenApiParameter(
+    name="accepts_emails",
+    type=OpenApiTypes.STR,
+    description=(
+        "'true' só quem aceitou receber e-mails (newsletter e cupons); "
+        "'false' quem não aceitou ou se descadastrou"
+    ),
+    location=OpenApiParameter.QUERY,
+    required=False,
+)
+
+
 class CustomerCRMViewSet(mixins.UpdateModelMixin, viewsets.ReadOnlyModelViewSet):
     """UC07 – Gerenciar Clientes (CRM)
 
@@ -676,10 +692,49 @@ class CustomerCRMViewSet(mixins.UpdateModelMixin, viewsets.ReadOnlyModelViewSet)
             ),
         )
 
+        # Aceite de e-mails (#103): mesma linha de NewsletterSubscriber usada
+        # pela newsletter e pelos cupons. Aceita = consentiu e não se descadastrou.
+        subscriber = NewsletterSubscriber.objects.filter(
+            email__iexact=OuterRef("email")
+        )
+        qs = qs.annotate(
+            newsletter_consent=Subquery(subscriber.values("consent_lgpd")[:1]),
+            newsletter_unsubscribed_at=Subquery(
+                subscriber.values("unsubscribed_at")[:1]
+            ),
+        ).annotate(
+            accepts_emails=Case(
+                When(
+                    newsletter_consent=True,
+                    newsletter_unsubscribed_at__isnull=True,
+                    then=Value(True),
+                ),
+                default=Value(False),
+                output_field=BooleanField(),
+            )
+        )
+
+        # A data do aceite só aparece no "Ver perfil"; lista, exportação e
+        # edição não a usam.
+        if self.action == "retrieve":
+            qs = qs.annotate(
+                newsletter_subscribed_at=Subquery(
+                    subscriber.values("subscribed_at")[:1]
+                )
+            )
+
         if self.request.query_params.get("customer"):
             qs = qs.filter(id=self.request.query_params["customer"])
 
+        accepts = self.request.query_params.get("accepts_emails")
+        if accepts in ("true", "false"):
+            qs = qs.filter(accepts_emails=accepts == "true")
+
         return qs
+
+    @extend_schema(tags=["CRM Clientes"], parameters=[ACCEPTS_EMAILS_PARAM])
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
 
     def get_serializer_class(self):
         if self.action == "retrieve":
@@ -737,6 +792,7 @@ class CustomerCRMViewSet(mixins.UpdateModelMixin, viewsets.ReadOnlyModelViewSet)
                 location=OpenApiParameter.QUERY,
                 required=False,
             ),
+            ACCEPTS_EMAILS_PARAM,
         ],
         responses={
             200: OpenApiResponse(description="Arquivo exportado (CSV ou XLSX)"),
@@ -750,13 +806,6 @@ class CustomerCRMViewSet(mixins.UpdateModelMixin, viewsets.ReadOnlyModelViewSet)
         queryset = self.filter_queryset(self.get_queryset())
 
         customers = list(queryset)
-        emails = [c.email.strip().lower() for c in customers]
-        subscribed_emails = set(
-            NewsletterSubscriber.objects.filter(
-                email__in=emails,
-                unsubscribed_at__isnull=True,
-            ).values_list("email", flat=True)
-        )
 
         headers = [
             "Nome",
@@ -782,9 +831,7 @@ class CustomerCRMViewSet(mixins.UpdateModelMixin, viewsets.ReadOnlyModelViewSet)
             total_orders = getattr(c, "total_orders", 0) or 0
             total_spent = getattr(c, "total_spent", Decimal("0.00")) or Decimal("0.00")
             last_purchase = getattr(c, "last_purchase_date", None)
-            is_subscribed = (
-                "Sim" if c.email.strip().lower() in subscribed_emails else "Não"
-            )
+            is_subscribed = "Sim" if c.accepts_emails else "Não"
 
             rows.append(
                 [
@@ -953,7 +1000,10 @@ class NewsletterSubscribeView(APIView):
             if changed:
                 subscriber.consent_lgpd = True
                 subscriber.unsubscribed_at = None
-                subscriber.save(update_fields=["consent_lgpd", "unsubscribed_at"])
+                subscriber.subscribed_at = timezone.now()
+                subscriber.save(
+                    update_fields=["consent_lgpd", "unsubscribed_at", "subscribed_at"]
+                )
             return Response(
                 {"message": "E-mail já inscrito."}, status=status.HTTP_200_OK
             )

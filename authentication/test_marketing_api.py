@@ -3,7 +3,7 @@ from django.urls import reverse
 from rest_framework.test import APITestCase
 
 from authentication.models import NewsletterSubscriber
-from notifications.marketing import is_receiving
+from notifications.marketing import is_receiving, opt_in
 from notifications.test_marketing import make_order
 from notifications.unsubscribe import make_unsubscribe_token
 
@@ -27,7 +27,7 @@ class UnsubscribeApiTests(APITestCase):
             email="ana@x.com", password="senha-forte-123", name="Ana"
         )
         make_order(user)
-        self.assertTrue(is_receiving("ana@x.com"))
+        self.assertFalse(is_receiving("ana@x.com"))  # sem aceite não recebe
         resp = self.client.post(unsub_url(make_unsubscribe_token("ana@x.com")))
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(
@@ -84,7 +84,9 @@ class MeMarketingTests(APITestCase):
         self.client.force_authenticate(self.user)
         resp = self.client.get(self.url)
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.json(), {"receives": True})
+        self.assertEqual(resp.json(), {"receives": False})  # comprou, sem aceite
+        opt_in(self.user.email)
+        self.assertEqual(self.client.get(self.url).json(), {"receives": True})
 
     def test_me_marketing_put_false_bloqueia_e_true_reativa(self):
         self.client.force_authenticate(self.user)
