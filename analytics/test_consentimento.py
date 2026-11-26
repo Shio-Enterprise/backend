@@ -183,8 +183,9 @@ class ConsentRevocationTests(APITestCase):
         )
 
         event.refresh_from_db()
-        self.assertIsNone(event.anonymous_id)
         self.assertIsNone(event.user)
+        self.assertIsNotNone(event.anonymous_id)
+        self.assertNotEqual(event.anonymous_id, "visitante-abc")
 
     def test_usuario_recusa_e_eventos_da_conta_e_do_navegador_sao_anonimizados(self):
         account_event = self._event(user=self.user, anonymous_id="celular")
@@ -197,10 +198,13 @@ class ConsentRevocationTests(APITestCase):
             format="json",
         )
 
-        for event in (account_event, browser_event):
-            event.refresh_from_db()
-            self.assertIsNone(event.user)
-            self.assertIsNone(event.anonymous_id)
+        account_event.refresh_from_db()
+        browser_event.refresh_from_db()
+        self.assertIsNone(account_event.user)
+        self.assertIsNone(browser_event.user)
+        self.assertNotEqual(account_event.anonymous_id, "celular")
+        self.assertNotEqual(browser_event.anonymous_id, "notebook")
+        self.assertEqual(account_event.anonymous_id, browser_event.anonymous_id)
 
     def test_eventos_anonimizados_continuam_contando_no_total(self):
         self._event(user=self.user)
@@ -211,6 +215,32 @@ class ConsentRevocationTests(APITestCase):
 
         self.assertEqual(SiteEvent.objects.count(), 2)
         self.assertFalse(SiteEvent.objects.filter(user=self.user).exists())
+
+    def test_recusas_de_pessoas_diferentes_geram_identificadores_distintos(self):
+        first = self._event(anonymous_id="visitante-a")
+        second = self._event(anonymous_id="visitante-b")
+
+        self.client.post(
+            CONSENT_URL,
+            {"choice": "denied", "anonymous_id": "visitante-a"},
+            format="json",
+        )
+        self.client.post(
+            CONSENT_URL,
+            {"choice": "denied", "anonymous_id": "visitante-b"},
+            format="json",
+        )
+
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertNotEqual(first.anonymous_id, second.anonymous_id)
+        self.assertEqual(
+            SiteEvent.objects.filter(user__isnull=True)
+            .values("anonymous_id")
+            .distinct()
+            .count(),
+            2,
+        )
 
     def test_recusa_nao_altera_eventos_de_outras_pessoas(self):
         other_account = self._event(user=self.other_user, anonymous_id="visitante-abc")
@@ -387,7 +417,9 @@ class ConsentEnforcedLinkTests(APITestCase):
         self.event.refresh_from_db()
         self.assertIsNone(self.event.user)
 
-    def test_vinculo_com_aceite_do_navegador_vincula_eventos_e_consentimento(self):
+    def test_vinculo_com_aceite_do_navegador_vincula_eventos_sem_transferir_consentimento(
+        self,
+    ):
         consent = _consent(AnalyticsConsentChoice.GRANTED, anonymous_id="visitante-abc")
 
         response = self.client.post(
@@ -399,4 +431,5 @@ class ConsentEnforcedLinkTests(APITestCase):
         self.event.refresh_from_db()
         consent.refresh_from_db()
         self.assertEqual(self.event.user, self.user)
-        self.assertEqual(consent.user, self.user)
+        self.assertIsNone(consent.user)
+        self.assertEqual(consent.anonymous_id, "visitante-abc")

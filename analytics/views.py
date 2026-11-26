@@ -109,10 +109,10 @@ class LinkAnonymousEventsView(APIView):
         summary="Vincular eventos anônimos à conta",
         description=(
             "Chamado logo após o login. Associa à conta autenticada os eventos que foram "
-            "registrados antes do login com o mesmo `anonymous_id`, junto com o "
-            "histórico de consentimento desse navegador. Só deve ser chamado quando o "
-            "visitante consentiu com o registro de navegação; com "
-            "`ANALYTICS_CONSENT_ENFORCED` ativo, o aceite é conferido aqui."
+            "registrados antes do login com o mesmo `anonymous_id`. Só deve ser chamado "
+            "quando o visitante consentiu com o registro de navegação; com "
+            "`ANALYTICS_CONSENT_ENFORCED` ativo, o aceite é conferido aqui. O "
+            "consentimento da conta é registrado à parte em `/consent/`."
         ),
         request=LinkAnonymousEventsSerializer,
         responses={

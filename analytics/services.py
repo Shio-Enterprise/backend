@@ -1,3 +1,4 @@
+import uuid
 from datetime import timedelta
 
 from django.conf import settings
@@ -16,10 +17,7 @@ ADMIN_PATH_FILTER = Q(path="/admin") | Q(path__startswith="/admin/")
 
 
 def link_anonymous_events(user, anonymous_id):
-    """Vincula os eventos anônimos deste identificador à conta que acabou de fazer login."""
-    AnalyticsConsent.objects.filter(
-        anonymous_id=anonymous_id, user__isnull=True
-    ).update(user=user)
+    """Vincula à conta só os eventos anônimos. O consentimento da conta vem do POST /consent/."""
     return SiteEvent.objects.filter(
         anonymous_id=anonymous_id, user__isnull=True
     ).update(user=user)
@@ -54,8 +52,9 @@ def has_analytics_consent(user=None, anonymous_id=None):
 
 
 def anonymize_site_events(user=None, anonymous_id=None):
+    """Troca conta e identificador por um UUID novo, único por pessoa recusada."""
     return SiteEvent.objects.filter(_owner_filter(user, anonymous_id)).update(
-        user=None, anonymous_id=None
+        user=None, anonymous_id=str(uuid.uuid4())
     )
 
 
