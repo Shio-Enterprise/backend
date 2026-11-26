@@ -105,7 +105,7 @@ class GoogleAuthService:
         google_payload = cls.verify_google_token(id_token_str)
 
         google_id = google_payload.get("sub")  # ID único do Google
-        email = google_payload.get("email", "").lower()
+        email = User.objects.normalize_email(google_payload.get("email"))
         name = google_payload.get("name", "")
         avatar_url = google_payload.get("picture", "")
 

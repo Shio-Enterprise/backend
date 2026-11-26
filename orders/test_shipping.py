@@ -3,9 +3,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
-from django.core.cache.backends.locmem import LocMemCache
 from django.test import SimpleTestCase, override_settings
 
 from orders.integrations.correios_client import CorreiosClient
@@ -56,8 +55,7 @@ class ShippingFoundationTests(SimpleTestCase):
 
     def test_rejected_old_token_cannot_evict_a_refreshed_token(self):
         tokens = iter((("old-token", 60), ("new-token", 60)))
-        cache = LocMemCache("test-correios-token-provider", {})
-        provider = CorreiosTokenProvider(lambda: next(tokens), cache_backend=cache)
+        provider = CorreiosTokenProvider(lambda: next(tokens))
 
         self.assertEqual(provider.get_token(), "old-token")
         self.assertEqual(provider.refresh_token(), "new-token")
@@ -66,8 +64,7 @@ class ShippingFoundationTests(SimpleTestCase):
 
     def test_concurrent_reads_share_one_refresh_in_this_process(self):
         loader = Mock(side_effect=lambda: (time.sleep(0.02) or "shared-token", 60))
-        cache = LocMemCache("test-correios-token-refresh", {})
-        provider = CorreiosTokenProvider(loader, cache_backend=cache)
+        provider = CorreiosTokenProvider(loader)
         start = threading.Barrier(8)
 
         def read_token(_):
@@ -79,3 +76,60 @@ class ShippingFoundationTests(SimpleTestCase):
 
         self.assertEqual(tokens, ["shared-token"] * 8)
         loader.assert_called_once_with()
+
+    def test_token_is_reused_until_it_expires(self):
+        now = [0.0]
+        tokens = iter((("first-token", 60), ("second-token", 60)))
+        provider = CorreiosTokenProvider(lambda: next(tokens), clock=lambda: now[0])
+
+        self.assertEqual(provider.get_token(), "first-token")
+        now[0] = 59.9
+        self.assertEqual(provider.get_token(), "first-token")
+        now[0] = 60.0
+        self.assertEqual(provider.get_token(), "second-token")
+
+    def test_zero_ttl_token_is_not_kept(self):
+        loader = Mock(return_value=("short-token", 0))
+        provider = CorreiosTokenProvider(loader)
+
+        self.assertEqual(provider.get_token(), "short-token")
+        self.assertEqual(provider.get_token(), "short-token")
+        self.assertEqual(loader.call_count, 2)
+
+    def test_rejected_current_token_is_dropped(self):
+        tokens = iter((("old-token", 60), ("new-token", 60)))
+        provider = CorreiosTokenProvider(lambda: next(tokens))
+
+        self.assertEqual(provider.get_token(), "old-token")
+        self.assertTrue(provider.invalidate_if_current("old-token"))
+        self.assertEqual(provider.get_token(), "new-token")
+
+    def test_loader_failure_releases_lock(self):
+        provider = CorreiosTokenProvider(
+            Mock(side_effect=RuntimeError("Token endpoint unavailable"))
+        )
+
+        with self.assertRaises(RuntimeError):
+            provider.refresh_token()
+        self.assertFalse(provider._refresh_lock.locked())
+
+    def test_token_failure_returns_503_without_calling_correios(self):
+        from rest_framework.test import APIRequestFactory, force_authenticate
+
+        from orders.correios_views import ShippingOptionsView
+
+        request = APIRequestFactory().get(
+            "/api/orders/correios/frete/", {"cep_destino": "71000000"}
+        )
+        force_authenticate(request, user=SimpleNamespace(is_authenticated=True))
+        with (
+            patch(
+                "orders.correios.correios_token_provider.get_token",
+                side_effect=ConnectionError("Token endpoint unavailable"),
+            ),
+            patch("orders.correios.correios_client.request") as transport,
+        ):
+            response = ShippingOptionsView.as_view()(request)
+
+        self.assertEqual(response.status_code, 503)
+        transport.assert_not_called()

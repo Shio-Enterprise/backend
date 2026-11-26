@@ -591,3 +591,29 @@ class ExchangeItem(models.Model):
 
     def __str__(self):
         return f"ExchangeItem(item={self.order_item_id}, qty={self.quantity})"
+
+
+class OrderRecoveryEmailSend(models.Model):
+    """Histórico de envios de e-mail de recuperação de um pedido."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    order = models.ForeignKey(
+        CustomerOrder,
+        on_delete=models.CASCADE,
+        related_name="recovery_email_sends",
+    )
+    sent_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="order_recovery_email_sends",
+    )
+    sent_at = models.DateTimeField(auto_now_add=True)
+    message = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["-sent_at"]
+
+    def __str__(self):
+        return f"OrderRecoveryEmailSend(order={self.order_id}, sent_at={self.sent_at})"
