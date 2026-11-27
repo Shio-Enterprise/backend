@@ -1,0 +1,37 @@
+name: Smoke Test Produção
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  smoke-prod:
+    name: Smoke Test Produção (Backend)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Verificar URL pública de produção
+        env:
+          PROD_API_URL: ${{ vars.PROD_API_URL }}
+        run: |
+          if [ -z "$PROD_API_URL" ]; then
+            echo "::notice::Variável PROD_API_URL não configurada em Settings > Variables > Actions. Smoke test ignorado."
+            exit 0
+          fi
+
+          BASE_URL="${PROD_API_URL%/}"
+          echo "Aguardando saúde de $BASE_URL/health/..."
+          for i in $(seq 1 18); do
+            BODY=$(curl -fsS --max-time 10 "$BASE_URL/health/" || true)
+            if echo "$BODY" | grep -q '"status": *"ok"'; then
+              echo "Healthcheck OK: $BODY"
+              curl -fsS --max-time 10 "$BASE_URL/api/catalog/products/" | python3 -c "import sys, json; data = json.load(sys.stdin); assert 'results' in data or isinstance(data, list)"
+              echo "Catálogo público respondeu JSON válido."
+              exit 0
+            fi
+            sleep 10
+          done
+
+          echo "::error::Smoke test falhou para $BASE_URL/health/"
+          exit 1

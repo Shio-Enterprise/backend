@@ -1,0 +1,158 @@
+name: Backend E2E
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: E2E (Playwright + Django + Postgres)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: shio_ci
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d shio_ci"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      DJANGO_SECRET_KEY: ci-e2e-secret-key-not-for-production-very-long-key-123456
+      GOOGLE_CLIENT_ID: ci-e2e-google-client-id
+      SETTINGS_FILE_PATH: core.settings.e2e_ci
+      CI_DB_NAME: shio_ci
+      CI_DB_USER: postgres
+      CI_DB_PASSWORD: postgres
+      CI_DB_HOST: 127.0.0.1
+      CI_DB_PORT: "5432"
+      E2E_ADMIN_EMAIL: admin-e2e@shio.test
+      E2E_ADMIN_PASSWORD: ShioE2EAdmin!2026
+      E2E_USER_EMAIL: cliente-e2e@shio.test
+      E2E_USER_PASSWORD: ShioE2EUser!2026
+      E2E_BASE_URL: http://127.0.0.1:4173
+      E2E_API_URL: http://127.0.0.1:8000
+
+    steps:
+      - name: Checkout do backend
+        uses: actions/checkout@v7
+        with:
+          path: backend
+
+      - name: Resolver branch companheira do frontend
+        id: fe_ref
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref || github.ref_name }}
+        run: |
+          TARGET="main"
+          if [ -n "$HEAD_REF" ] && git ls-remote --exit-code --heads https://github.com/Shio-Enterprise/frontend.git "$HEAD_REF" >/dev/null 2>&1; then
+            TARGET="$HEAD_REF"
+          elif [ -n "$BASE_REF" ] && git ls-remote --exit-code --heads https://github.com/Shio-Enterprise/frontend.git "$BASE_REF" >/dev/null 2>&1; then
+            TARGET="$BASE_REF"
+          fi
+          echo "ref=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "Usando Shio-Enterprise/frontend@$TARGET"
+
+      - name: Checkout do frontend
+        uses: actions/checkout@v7
+        with:
+          repository: Shio-Enterprise/frontend
+          ref: ${{ steps.fe_ref.outputs.ref }}
+          path: frontend
+
+      - name: Configurar Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Instalar dependências do backend
+        working-directory: backend
+        run: pip install -r requirements.txt
+
+      - name: Aplicar migrations e seed E2E no PostgreSQL
+        working-directory: backend
+        run: |
+          python manage.py migrate --noinput --settings=core.settings.e2e_ci
+          python manage.py shell --settings=core.settings.e2e_ci < scripts/seed_e2e_ci.py
+
+      - name: Subir API Django (Gunicorn)
+        working-directory: backend
+        run: |
+          DJANGO_SETTINGS_MODULE=core.settings.e2e_ci \
+          gunicorn core.wsgi:application \
+            --bind 127.0.0.1:8000 \
+            --workers 2 \
+            --log-level info \
+            > /tmp/django-e2e.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/health/ >/dev/null; then
+              echo "Backend E2E pronto."
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/django-e2e.log
+          exit 1
+
+      - name: Configurar Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build de produção do frontend e subir Vite preview
+        working-directory: frontend
+        env:
+          VITE_API_URL: http://127.0.0.1:8000
+          VITE_GOOGLE_CLIENT_ID: ci-e2e-google-client-id
+        run: |
+          npm ci
+          npm run build
+          npx vite preview --host 127.0.0.1 --port 4173 --strictPort > /tmp/vite-e2e.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:4173/ >/dev/null; then
+              echo "Frontend preview E2E pronto."
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/vite-e2e.log
+          exit 1
+
+      - name: Instalar Chromium do Playwright
+        working-directory: frontend
+        run: npx playwright install chromium --with-deps
+
+      - name: Executar suíte E2E (Playwright)
+        working-directory: frontend
+        run: npm run test:e2e
+
+      - name: Anexar evidências e logs em caso de falha
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-failure-backend
+          path: |
+            frontend/playwright-report
+            frontend/test-results
+            /tmp/django-e2e.log
+            /tmp/vite-e2e.log
+          if-no-files-found: ignore
