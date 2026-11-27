@@ -6,40 +6,165 @@ on:
   pull_request:
     branches: [main, dev]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  ci:
-    name: Lint + Testes + Check
+  lint-and-checks:
+    name: Lint, Checks e OpenAPI
     runs-on: ubuntu-latest
 
     env:
-      DJANGO_SECRET_KEY: ci-test-secret-key-not-for-production
+      DJANGO_SECRET_KEY: ci-test-secret-key-not-for-production-very-long-key-123456
       GOOGLE_CLIENT_ID: ci-test-google-client-id
-      SETTINGS_FILE_PATH: core.settings.test
 
     steps:
-      - name: checkout do codigo
-        uses: actions/checkout@v4
+      - name: Checkout do código
+        uses: actions/checkout@v7
 
-      - name: configurar python 3.12
-        uses: actions/setup-python@v5
+      - name: Configurar Python 3.12
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
 
-      - name: instalar dependencias
+      - name: Instalar dependências
         run: pip install -r requirements.txt
 
       - name: Lint com ruff
         run: ruff check .
 
-      - name: Verificar formatacao com ruff
+      - name: Verificar formatação com ruff
         run: ruff format --check .
 
-      - name: Django system check
+      - name: Django system check (test)
+        env:
+          SETTINGS_FILE_PATH: core.settings.test
         run: python manage.py check --settings=core.settings.test
 
-      - name: verificar migrations pendentes
+      - name: Verificar migrations pendentes
+        env:
+          SETTINGS_FILE_PATH: core.settings.test
         run: python manage.py makemigrations --check --dry-run --settings=core.settings.test
 
-      - name: rodar testes com Pytest
-        run: pytest --tb=short -q
+      - name: Django deploy check (prod)
+        env:
+          SETTINGS_FILE_PATH: core.settings.prod
+          DATABASE_URL: postgres://ci:ci@localhost:5432/ci?sslmode=require
+          ALLOWED_HOSTS: api.example.com
+          CORS_ALLOWED_ORIGINS: https://example.com
+        run: python manage.py check --deploy --settings=core.settings.prod
+
+      - name: Validar collectstatic de produção
+        env:
+          SETTINGS_FILE_PATH: core.settings.prod
+          DATABASE_URL: postgres://ci:ci@localhost:5432/ci?sslmode=require
+          ALLOWED_HOSTS: api.example.com
+          CORS_ALLOWED_ORIGINS: https://example.com
+        run: python manage.py collectstatic --noinput --settings=core.settings.prod
+
+      - name: Validar schema OpenAPI (drf-spectacular)
+        env:
+          SETTINGS_FILE_PATH: core.settings.test
+        run: python manage.py spectacular --validate --file /tmp/schema.yaml --settings=core.settings.test
+
+  test-postgres:
+    name: Testes (PostgreSQL)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: shio_ci
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d shio_ci"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      DJANGO_SECRET_KEY: ci-test-secret-key-not-for-production-very-long-key-123456
+      GOOGLE_CLIENT_ID: ci-test-google-client-id
+      SETTINGS_FILE_PATH: core.settings.ci
+      CI_DB_NAME: shio_ci
+      CI_DB_USER: postgres
+      CI_DB_PASSWORD: postgres
+      CI_DB_HOST: 127.0.0.1
+      CI_DB_PORT: "5432"
+
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v7
+
+      - name: Configurar Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Rodar Pytest contra PostgreSQL 16 + Cobertura
+        run: |
+          pytest --ds=core.settings.ci \
+            --cov=. \
+            --cov-report=term-missing:skip-covered \
+            --cov-report=xml \
+            --cov-fail-under=70 \
+            --tb=short -q
+
+      - name: Publicar resumo da cobertura
+        if: always()
+        run: |
+          python -c "
+          import xml.etree.ElementTree as ET, os
+          if os.path.exists('coverage.xml'):
+              rate = float(ET.parse('coverage.xml').getroot().attrib.get('line-rate', 0)) * 100
+              print(f'### Cobertura de Testes (PostgreSQL 16): **{rate:.2f}%**')
+          " >> "$GITHUB_STEP_SUMMARY"
+
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v7
+
+      - name: Build da imagem de produção (Dockerfile)
+        run: docker build -t shio-backend:ci .
+
+  security:
+    name: Segurança (pip-audit + Bandit)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v7
+
+      - name: Configurar Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar ferramentas de segurança
+        run: pip install pip-audit bandit
+
+      - name: SAST com Bandit (severidade média/alta)
+        run: bandit -r authentication core products orders reviews notifications analytics -ll -q
+
+      - name: Auditoria de dependências (pip-audit)
+        continue-on-error: true
+        run: |
+          pip-audit -r requirements.txt || {
+            echo "::warning::pip-audit encontrou vulnerabilidades em requirements.txt; revise no Job Summary."
+            exit 1
+          }
