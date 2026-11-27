@@ -6,7 +6,7 @@ gunicorn==22.0.0
 djangorestframework==3.16.1
 djangorestframework-simplejwt==5.5.1
 google-auth==2.38.0
-requests==2.31.0
+requests==2.33.0
 django-cors-headers==4.9.0
 whitenoise==6.5.0
 drf-spectacular==0.27.2
